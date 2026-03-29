@@ -759,7 +759,7 @@ static void gen_expr(Node *node) {
       // Extract the bitfield: shift right by bit_offset, mask to bit_width
       if (bo > 0)
         println("lsr x0, x0, #%d", bo);
-      if (node->member->ty->is_unsigned) {
+      if (node->member->ty->is_unsigned || node->member->ty->kind == TY_ENUM) {
         println("and x0, x0, #%llu", (unsigned long long)((1ULL << bw) - 1));
       } else {
         // Sign extend: shift left then arithmetic shift right
@@ -1778,6 +1778,10 @@ static void emit_text(Obj *prog) {
 
     // Epilogue
     printlabel(".L.return.%s:", fn->name);
+
+    // C99 5.1.2.2.3: implicit return 0 from main()
+    if (!strcmp(fn->name, "main"))
+      println("mov x0, #0");
 
     // Restore stack
     println("mov sp, x29");
