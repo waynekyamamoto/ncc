@@ -278,6 +278,18 @@ void add_type(Node *node) {
     return;
   case ND_MEMBER:
     node->ty = node->member->ty;
+    if (node->member->is_bitfield) {
+      int bw = node->member->bit_width;
+      if (node->ty->is_unsigned) {
+        if (bw < 32)
+          node->ty = ty_int;
+        else if (bw == 32)
+          node->ty = ty_uint;
+      } else {
+        if (bw <= 32)
+          node->ty = ty_int;
+      }
+    }
     return;
   case ND_ADDR: {
     Type *ty = node->lhs->ty;

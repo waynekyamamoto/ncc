@@ -422,7 +422,10 @@ static void gen_funcall(Node *node) {
         println("ldr x0, [x9]");
         push();
       } else if (is_struct) {
-        println("ldr x0, [x0]");
+        if (aty->size <= 4)
+          println("ldr w0, [x0]");
+        else
+          println("ldr x0, [x0]");
         push();
       } else if (arg_dest[i] >= 100) {
         pushf();
@@ -1236,7 +1239,10 @@ static void emit_text(Obj *prog) {
           fp++;
         }
       } else if (param->ty->kind == TY_STRUCT || param->ty->kind == TY_UNION) {
-        if (param->ty->size <= 8 && gp < 8) {
+        if (param->ty->size <= 4 && gp < 8) {
+          println("str %s, [x9]", argreg8[gp]);
+          gp++;
+        } else if (param->ty->size <= 8 && gp < 8) {
           println("str %s, [x9]", argreg64[gp]);
           gp++;
         } else if (param->ty->size <= 16 && gp + 1 < 8) {
