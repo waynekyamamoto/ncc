@@ -26,6 +26,21 @@ static void pop(char *reg);
 static void pushf(void);
 static void popf(int reg);
 
+// Generate a boolean condition test for a node.
+// After gen_expr, the value is in x0 (integer) or d0 (float).
+// This emits cmp/fcmp and the caller can use b.eq/b.ne.
+static void gen_cond(Node *node) {
+  gen_expr(node);
+  add_type(node);
+  if (is_flonum(node->ty)) {
+    println("fcmp d0, #0.0");
+    println("cset w0, ne");
+    println("cmp x0, #0");
+  } else {
+    println("cmp x0, #0");
+  }
+}
+
 //
 // Stack operations — we use x0 as accumulator, stack for intermediate values
 //
@@ -261,11 +276,18 @@ static void cast(Type *from, Type *to) {
   }
 
   if (is_integer(from) && is_flonum(to)) {
-    // x0 → d0
-    if (from->is_unsigned)
-      println("ucvtf d0, x0");
-    else
-      println("scvtf d0, x0");
+    // x0/w0 → d0
+    if (from->size <= 4) {
+      if (from->is_unsigned)
+        println("ucvtf d0, w0");
+      else
+        println("scvtf d0, w0");
+    } else {
+      if (from->is_unsigned)
+        println("ucvtf d0, x0");
+      else
+        println("scvtf d0, x0");
+    }
     return;
   }
 
@@ -367,6 +389,9 @@ static void gen_funcall(Node *node) {
       arg_dest[i] = -1;
       arg_stack_off[i] = cur_stack_off;
       cur_stack_off += is_struct ? align_to(aty->size, 8) : 8;
+    } else if (is_struct && aty->size > 16 && gp_reg < 8) {
+      // Large struct (>16 bytes): passed by indirect reference (pointer in GP reg)
+      arg_dest[i] = gp_reg++;
     } else if (is_struct && aty->size <= 16 && gp_reg + gp_needed <= 8) {
       // Small struct: 1-2 GP registers
       arg_dest[i] = gp_reg;
@@ -401,7 +426,33 @@ static void gen_funcall(Node *node) {
   for (int i = 0; i < nargs; i++) {
     if (arg_dest[i] == -1) {
       gen_expr(args[i]);
-      if (is_flonum(args[i]->ty))
+      Type *aty = args[i]->ty;
+      bool is_struct_arg = aty && (aty->kind == TY_STRUCT || aty->kind == TY_UNION);
+      if (is_struct_arg) {
+        // x0 is the address of the struct; copy its contents to the stack
+        for (int j = 0; j + 7 < aty->size; j += 8) {
+          println("ldr x9, [x0, #%d]", j);
+          println("str x9, [sp, #%d]", arg_stack_off[i] + j);
+        }
+        int rem = aty->size % 8;
+        int base = aty->size - rem;
+        if (rem >= 4) {
+          println("ldr w9, [x0, #%d]", base);
+          println("str w9, [sp, #%d]", arg_stack_off[i] + base);
+          base += 4;
+          rem -= 4;
+        }
+        if (rem >= 2) {
+          println("ldrh w9, [x0, #%d]", base);
+          println("strh w9, [sp, #%d]", arg_stack_off[i] + base);
+          base += 2;
+          rem -= 2;
+        }
+        if (rem >= 1) {
+          println("ldrb w9, [x0, #%d]", base);
+          println("strb w9, [sp, #%d]", arg_stack_off[i] + base);
+        }
+      } else if (is_flonum(aty))
         println("str d0, [sp, #%d]", arg_stack_off[i]);
       else
         println("str x0, [sp, #%d]", arg_stack_off[i]);
@@ -415,16 +466,43 @@ static void gen_funcall(Node *node) {
       Type *aty = args[i]->ty;
       bool is_struct = aty && (aty->kind == TY_STRUCT || aty->kind == TY_UNION);
 
-      if (is_struct && aty->size > 8) {
+      if (is_struct && aty->size > 16) {
+        // Large struct: pass by indirect reference (pointer in GP reg).
+        // gen_expr gives us the struct address in x0; pass it directly.
+        // The callee will copy it to local storage.
+        push();
+      } else if (is_struct && aty->size > 8) {
         println("mov x9, x0");
         println("ldr x0, [x9, #8]");
         push();
         println("ldr x0, [x9]");
         push();
       } else if (is_struct) {
-        if (aty->size <= 4)
+        if (aty->size == 1)
+          println("ldrb w0, [x0]");
+        else if (aty->size == 2)
+          println("ldrh w0, [x0]");
+        else if (aty->size == 3) {
+          println("ldrb w9, [x0, #2]");
+          println("ldrh w0, [x0]");
+          println("orr w0, w0, w9, lsl #16");
+        } else if (aty->size <= 4)
           println("ldr w0, [x0]");
-        else
+        else if (aty->size == 5) {
+          println("ldrb w9, [x0, #4]");
+          println("ldr w0, [x0]");
+          println("orr x0, x0, x9, lsl #32");
+        } else if (aty->size == 6) {
+          println("ldrh w9, [x0, #4]");
+          println("ldr w0, [x0]");
+          println("orr x0, x0, x9, lsl #32");
+        } else if (aty->size == 7) {
+          println("ldrh w9, [x0, #4]");
+          println("ldrb w10, [x0, #6]");
+          println("ldr w0, [x0]");
+          println("orr x9, x9, x10, lsl #16");
+          println("orr x0, x0, x9, lsl #32");
+        } else
           println("ldr x0, [x0]");
         push();
       } else if (arg_dest[i] >= 100) {
@@ -443,6 +521,9 @@ static void gen_funcall(Node *node) {
 
     if (arg_dest[i] >= 100) {
       popf(arg_dest[i] - 100);
+    } else if (is_struct && aty->size > 16) {
+      // Large struct: single pointer in one GP register
+      pop(argreg64[arg_dest[i]]);
     } else if (is_struct && aty->size > 8) {
       pop(argreg64[arg_dest[i]]);
       pop(argreg64[arg_dest[i] + 1]);
@@ -554,7 +635,12 @@ static void gen_expr(Node *node) {
 
   case ND_MEMBER:
     gen_addr(node);
-    load(node->ty);
+    // For bitfields, load the underlying storage unit (e.g., long long),
+    // not the promoted type (which may be int after integer promotion).
+    if (node->member->is_bitfield)
+      load(node->member->ty);
+    else
+      load(node->ty);
 
     // Handle bitfield
     if (node->member->is_bitfield) {
@@ -593,7 +679,9 @@ static void gen_expr(Node *node) {
       // Bitfield assignment
       int bw = node->lhs->member->bit_width;
       int bo = node->lhs->member->bit_offset;
-      int sz = node->lhs->member->ty->size; // storage unit size (1, 2, or 4)
+      int sz = node->lhs->member->ty->size; // storage unit size (1, 2, 4, or 8)
+      bool is64 = (sz == 8);
+      char *wr = is64 ? "x" : "w"; // register prefix
 
       println("mov x10, x0");  // save new value
       pop("x1"); // struct member address
@@ -601,27 +689,52 @@ static void gen_expr(Node *node) {
       // Load old storage unit value
       if (sz == 1) println("ldrb w2, [x1]");
       else if (sz == 2) println("ldrh w2, [x1]");
-      else println("ldr w2, [x1]");
+      else if (sz == 4) println("ldr w2, [x1]");
+      else println("ldr x2, [x1]");
 
       // Clear the bitfield bits in old value
-      // mask = ((1 << bw) - 1) << bo
       uint64_t field_mask = ((1ULL << bw) - 1) << bo;
-      uint64_t clear_mask = ~field_mask & ((sz == 4) ? 0xFFFFFFFFULL : (sz == 2) ? 0xFFFFULL : 0xFFULL);
-      println("mov w3, #%u", (unsigned)(clear_mask & 0xFFFF));
-      if ((clear_mask >> 16) & 0xFFFF)
-        println("movk w3, #%u, lsl #16", (unsigned)((clear_mask >> 16) & 0xFFFF));
-      println("and w2, w2, w3");
+      uint64_t unit_mask = (sz == 8) ? ~0ULL : (sz == 4) ? 0xFFFFFFFFULL : (sz == 2) ? 0xFFFFULL : 0xFFULL;
+      uint64_t clear_mask = ~field_mask & unit_mask;
+      if (is64) {
+        println("mov x3, #%llu", (unsigned long long)(clear_mask & 0xFFFF));
+        if ((clear_mask >> 16) & 0xFFFF)
+          println("movk x3, #%llu, lsl #16", (unsigned long long)((clear_mask >> 16) & 0xFFFF));
+        if ((clear_mask >> 32) & 0xFFFF)
+          println("movk x3, #%llu, lsl #32", (unsigned long long)((clear_mask >> 32) & 0xFFFF));
+        if ((clear_mask >> 48) & 0xFFFF)
+          println("movk x3, #%llu, lsl #48", (unsigned long long)((clear_mask >> 48) & 0xFFFF));
+        println("and x2, x2, x3");
+      } else {
+        println("mov w3, #%u", (unsigned)(clear_mask & 0xFFFF));
+        if ((clear_mask >> 16) & 0xFFFF)
+          println("movk w3, #%u, lsl #16", (unsigned)((clear_mask >> 16) & 0xFFFF));
+        println("and w2, w2, w3");
+      }
 
       // Mask and shift new value, OR into old
-      println("and w0, w10, #%u", (unsigned)((1U << bw) - 1));
+      uint64_t val_mask = (1ULL << bw) - 1;
+      if (is64) {
+        println("mov x3, #%llu", (unsigned long long)(val_mask & 0xFFFF));
+        if ((val_mask >> 16) & 0xFFFF)
+          println("movk x3, #%llu, lsl #16", (unsigned long long)((val_mask >> 16) & 0xFFFF));
+        if ((val_mask >> 32) & 0xFFFF)
+          println("movk x3, #%llu, lsl #32", (unsigned long long)((val_mask >> 32) & 0xFFFF));
+        if ((val_mask >> 48) & 0xFFFF)
+          println("movk x3, #%llu, lsl #48", (unsigned long long)((val_mask >> 48) & 0xFFFF));
+        println("and x0, x10, x3");
+      } else {
+        println("and w0, w10, #%u", (unsigned)(val_mask & 0xFFFFFFFF));
+      }
       if (bo > 0)
-        println("lsl w0, w0, #%d", bo);
-      println("orr w2, w2, w0");
+        println("lsl %s0, %s0, #%d", wr, wr, bo);
+      println("orr %s2, %s2, %s0", wr, wr, wr);
 
       // Store back
       if (sz == 1) println("strb w2, [x1]");
       else if (sz == 2) println("strh w2, [x1]");
-      else println("str w2, [x1]");
+      else if (sz == 4) println("str w2, [x1]");
+      else println("str x2, [x1]");
 
       println("mov x0, x10"); // return the assigned value
       return;
@@ -675,8 +788,7 @@ static void gen_expr(Node *node) {
 
   case ND_COND: {
     int c = label_cnt++;
-    gen_expr(node->cond);
-    println("cmp x0, #0");
+    gen_cond(node->cond);
     println("b.eq .L.else.%d", c);
     gen_expr(node->then);
     println("b .L.end.%d", c);
@@ -688,22 +800,29 @@ static void gen_expr(Node *node) {
 
   case ND_NOT:
     gen_expr(node->lhs);
-    println("cmp x0, #0");
-    println("cset w0, eq");
+    add_type(node->lhs);
+    if (is_flonum(node->lhs->ty)) {
+      println("fcmp d0, #0.0");
+      println("cset w0, eq");
+    } else {
+      println("cmp x0, #0");
+      println("cset w0, eq");
+    }
     return;
 
   case ND_BITNOT:
     gen_expr(node->lhs);
-    println("mvn x0, x0");
+    if (node->ty->size <= 4)
+      println("mvn w0, w0");
+    else
+      println("mvn x0, x0");
     return;
 
   case ND_LOGAND: {
     int c = label_cnt++;
-    gen_expr(node->lhs);
-    println("cmp x0, #0");
+    gen_cond(node->lhs);
     println("b.eq .L.false.%d", c);
-    gen_expr(node->rhs);
-    println("cmp x0, #0");
+    gen_cond(node->rhs);
     println("b.eq .L.false.%d", c);
     println("mov x0, #1");
     println("b .L.end.%d", c);
@@ -715,11 +834,9 @@ static void gen_expr(Node *node) {
 
   case ND_LOGOR: {
     int c = label_cnt++;
-    gen_expr(node->lhs);
-    println("cmp x0, #0");
+    gen_cond(node->lhs);
     println("b.ne .L.true.%d", c);
-    gen_expr(node->rhs);
-    println("cmp x0, #0");
+    gen_cond(node->rhs);
     println("b.ne .L.true.%d", c);
     println("mov x0, #0");
     println("b .L.end.%d", c);
@@ -918,8 +1035,7 @@ static void gen_stmt(Node *node) {
   switch (node->kind) {
   case ND_IF: {
     int c = label_cnt++;
-    gen_expr(node->cond);
-    println("cmp x0, #0");
+    gen_cond(node->cond);
     println("b.eq .L.else.%d", c);
     gen_stmt(node->then);
     println("b .L.end.%d", c);
@@ -936,8 +1052,7 @@ static void gen_stmt(Node *node) {
       gen_stmt(node->init);
     printlabel(".L.begin.%d:", c);
     if (node->cond) {
-      gen_expr(node->cond);
-      println("cmp x0, #0");
+      gen_cond(node->cond);
       println("b.eq %s", node->unique_label);
     }
     gen_stmt(node->then);
@@ -956,8 +1071,7 @@ static void gen_stmt(Node *node) {
     gen_stmt(node->then);
     if (node->cont_label)
       printlabel("%s:", node->cont_label);
-    gen_expr(node->cond);
-    println("cmp x0, #0");
+    gen_cond(node->cond);
     println("b.ne .L.begin.%d", c);
     printlabel("%s:", node->unique_label);
     return;
@@ -1069,7 +1183,8 @@ static void assign_lvar_offsets(Obj *fn) {
     if (is_fp && fp2 < 8) {
       fp2++;
     } else if (!is_fp && gp2 < 8) {
-      if (is_struct) gp2 += (param->ty->size > 8) ? 2 : 1;
+      if (is_struct && param->ty->size > 16) gp2 += 1;  // indirect reference
+      else if (is_struct) gp2 += (param->ty->size > 8) ? 2 : 1;
       else gp2++;
     } else {
       // This param comes from caller's stack
@@ -1222,6 +1337,8 @@ static void emit_text(Obj *prog) {
       // Skip stack-passed params (positive offset = on caller's stack)
       if (param->offset > 0) {
         if (is_flonum(param->ty)) fp++;
+        else if ((param->ty->kind == TY_STRUCT || param->ty->kind == TY_UNION) && param->ty->size > 16)
+          gp += 1;  // indirect reference
         else if (param->ty->kind == TY_STRUCT || param->ty->kind == TY_UNION)
           gp += (param->ty->size > 8) ? 2 : 1;
         else gp++;
@@ -1239,8 +1356,61 @@ static void emit_text(Obj *prog) {
           fp++;
         }
       } else if (param->ty->kind == TY_STRUCT || param->ty->kind == TY_UNION) {
-        if (param->ty->size <= 4 && gp < 8) {
+        if (param->ty->size > 16 && gp < 8) {
+          // Large struct: passed by indirect reference (pointer in GP reg).
+          // Copy from the pointer to local storage.
+          println("mov x10, %s", argreg64[gp]);
+          for (int j = 0; j + 7 < param->ty->size; j += 8) {
+            println("ldr x11, [x10, #%d]", j);
+            println("str x11, [x9, #%d]", j);
+          }
+          int rem2 = param->ty->size % 8;
+          int base2 = param->ty->size - rem2;
+          if (rem2 >= 4) {
+            println("ldr w11, [x10, #%d]", base2);
+            println("str w11, [x9, #%d]", base2);
+            base2 += 4; rem2 -= 4;
+          }
+          if (rem2 >= 2) {
+            println("ldrh w11, [x10, #%d]", base2);
+            println("strh w11, [x9, #%d]", base2);
+            base2 += 2; rem2 -= 2;
+          }
+          if (rem2 >= 1) {
+            println("ldrb w11, [x10, #%d]", base2);
+            println("strb w11, [x9, #%d]", base2);
+          }
+          gp++;
+        } else if (param->ty->size == 1 && gp < 8) {
+          println("strb %s, [x9]", argreg8[gp]);
+          gp++;
+        } else if (param->ty->size == 2 && gp < 8) {
+          println("strh %s, [x9]", argreg8[gp]);
+          gp++;
+        } else if (param->ty->size == 3 && gp < 8) {
+          println("strh %s, [x9]", argreg8[gp]);
+          println("ubfx w10, %s, #16, #8", argreg8[gp]);
+          println("strb w10, [x9, #2]");
+          gp++;
+        } else if (param->ty->size <= 4 && gp < 8) {
           println("str %s, [x9]", argreg8[gp]);
+          gp++;
+        } else if (param->ty->size == 5 && gp < 8) {
+          println("str %s, [x9]", argreg8[gp]);
+          println("ubfx x10, %s, #32, #8", argreg64[gp]);
+          println("strb w10, [x9, #4]");
+          gp++;
+        } else if (param->ty->size == 6 && gp < 8) {
+          println("str %s, [x9]", argreg8[gp]);
+          println("ubfx x10, %s, #32, #16", argreg64[gp]);
+          println("strh w10, [x9, #4]");
+          gp++;
+        } else if (param->ty->size == 7 && gp < 8) {
+          println("str %s, [x9]", argreg8[gp]);
+          println("ubfx x10, %s, #32, #16", argreg64[gp]);
+          println("strh w10, [x9, #4]");
+          println("ubfx x10, %s, #48, #8", argreg64[gp]);
+          println("strb w10, [x9, #6]");
           gp++;
         } else if (param->ty->size <= 8 && gp < 8) {
           println("str %s, [x9]", argreg64[gp]);

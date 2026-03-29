@@ -2208,8 +2208,17 @@ static Node *stmt(Token **rest, Token *tok) {
     tok = tok->next;
 
     if (!consume(&tok, tok, ";")) {
-      node->lhs = expr(&tok, tok);
+      Node *exp = expr(&tok, tok);
       tok = skip(tok, ";");
+
+      // Cast return expression to the function's return type
+      if (current_fn && current_fn->ty && current_fn->ty->return_ty) {
+        Type *ret_ty = current_fn->ty->return_ty;
+        add_type(exp);
+        if (ret_ty->kind != TY_VOID)
+          exp = new_cast(exp, ret_ty);
+      }
+      node->lhs = exp;
     }
     *rest = tok;
     return node;
@@ -3060,9 +3069,29 @@ static void write_gvar_data(Initializer *init, Type *ty, char *buf, int offset, 
 
   if (ty->kind == TY_STRUCT) {
     int i = 0;
-    for (Member *mem = ty->members; mem; mem = mem->next, i++)
-      if (!mem->is_bitfield)
+    for (Member *mem = ty->members; mem; mem = mem->next, i++) {
+      if (mem->is_bitfield) {
+        if (!init->children[i]->expr)
+          continue;
+        Node *expr = init->children[i]->expr;
+        add_type(expr);
+        int64_t val = eval2(expr, NULL);
+        // Mask to bit_width
+        uint64_t mask = (mem->bit_width == 64) ? ~(uint64_t)0 : ((uint64_t)1 << mem->bit_width) - 1;
+        uint64_t bits = (uint64_t)val & mask;
+        // OR into the correct position in the storage unit
+        int byte_off = offset + mem->offset;
+        int bo = mem->bit_offset;
+        // Read current value at byte_off (up to 8 bytes)
+        int sz = mem->ty->size;
+        uint64_t cur = 0;
+        memcpy(&cur, buf + byte_off, sz);
+        cur |= (bits << bo);
+        memcpy(buf + byte_off, &cur, sz);
+      } else {
         write_gvar_data(init->children[i], mem->ty, buf, offset + mem->offset, rel_tail);
+      }
+    }
     return;
   }
 
