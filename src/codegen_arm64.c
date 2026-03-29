@@ -1454,12 +1454,16 @@ static void assign_lvar_offsets(Obj *fn) {
     bool is_fp = is_flonum(param->ty);
     bool is_struct = (param->ty->kind == TY_STRUCT || param->ty->kind == TY_UNION || param->ty->kind == TY_COMPLEX);
 
+    int gp_needed = is_struct ? ((param->ty->size > 16) ? 1 : (param->ty->size > 8) ? 2 : 1) : 1;
+
     if (is_fp && fp2 < 8) {
       fp2++;
-    } else if (!is_fp && gp2 < 8) {
-      if (is_struct && param->ty->size > 16) gp2 += 1;  // indirect reference
-      else if (is_struct) gp2 += (param->ty->size > 8) ? 2 : 1;
-      else gp2++;
+    } else if (!is_fp && !is_struct && gp2 < 8) {
+      gp2++;
+    } else if (is_struct && param->ty->size > 16 && gp2 < 8) {
+      gp2++;  // indirect reference
+    } else if (is_struct && param->ty->size <= 16 && gp2 + gp_needed <= 8) {
+      gp2 += gp_needed;
     } else {
       // This param comes from caller's stack
       param->offset = stack_param_offset;

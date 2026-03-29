@@ -153,6 +153,8 @@ static Node *new_var_node(Obj *var, Token *tok) {
 static Node *new_real(Node *expr, Token *tok);
 static Node *new_imag(Node *expr, Token *tok);
 static Node *new_complex_val(Node *real_part, Node *imag_part, Type *cty, Token *tok);
+static Node *new_complex_mul(Node *lhs, Node *rhs, Token *tok);
+static Node *new_complex_div(Node *lhs, Node *rhs, Token *tok);
 
 Node *new_cast(Node *expr, Type *ty) {
   add_type(expr);
@@ -1551,8 +1553,18 @@ static void eval_complex(Node *node, double *re, double *im) {
 static Node *assign(Token **rest, Token *tok) {
   Node *node = cond_expr(&tok, tok);
 
-  if (equal(tok, "="))
-    return new_binary(ND_ASSIGN, node, assign(rest, tok->next), tok);
+  if (equal(tok, "=")) {
+    Node *rhs = assign(rest, tok->next);
+    add_type(node);
+    add_type(rhs);
+    // For complex assignments, explicitly cast the rhs
+    if (is_complex(node->ty) && rhs->ty && rhs->ty->kind != node->ty->kind)
+      rhs = new_cast(rhs, node->ty);
+    else if (is_complex(node->ty) && is_complex(rhs->ty) &&
+             node->ty->base->kind != rhs->ty->base->kind)
+      rhs = new_cast(rhs, node->ty);
+    return new_binary(ND_ASSIGN, node, rhs, tok);
+  }
 
   // Compound assignment operators.
   // For bitfield members, we can't use to_assign() because the pointer
@@ -1587,6 +1599,22 @@ static Node *assign(Token **rest, Token *tok) {
           val = new_sub(node, rhs, optok);
         else
           val = new_binary(op, node, rhs, optok);
+        return new_binary(ND_ASSIGN, node, val, optok);
+      }
+
+      // Complex compound assignment: x op= y → x = x op y
+      if (is_complex(node->ty)) {
+        Node *val;
+        if (op == ND_ADD)
+          val = new_add(node, rhs, optok);
+        else if (op == ND_SUB)
+          val = new_sub(node, rhs, optok);
+        else if (op == ND_MUL)
+          val = new_complex_mul(node, rhs, optok);
+        else if (op == ND_DIV)
+          val = new_complex_div(node, rhs, optok);
+        else
+          error_tok(optok, "invalid complex compound assignment");
         return new_binary(ND_ASSIGN, node, val, optok);
       }
 
@@ -3541,7 +3569,19 @@ static Node *create_lvar_init(Initializer *init, Type *ty, InitDesig *desig, Tok
 
   // Build the lvalue designator chain
   Node *lhs = init_desig_expr(desig, tok);
-  return new_binary(ND_ASSIGN, lhs, init->expr, tok);
+  Node *rhs = init->expr;
+
+  // For complex types, explicitly cast the rhs to match the lhs type
+  // (add_type won't auto-cast for complex assignments)
+  add_type(lhs);
+  add_type(rhs);
+  if (is_complex(lhs->ty) && is_complex(rhs->ty) &&
+      lhs->ty->base->kind != rhs->ty->base->kind)
+    rhs = new_cast(rhs, lhs->ty);
+  else if (is_complex(lhs->ty) && !is_complex(rhs->ty))
+    rhs = new_cast(rhs, lhs->ty);
+
+  return new_binary(ND_ASSIGN, lhs, rhs, tok);
 }
 
 static Node *init_desig_expr(InitDesig *desig, Token *tok) {
@@ -3578,10 +3618,18 @@ static Node *lvar_initializer(Token **rest, Token *tok, Obj *var) {
 
   Node *rhs = create_lvar_init(init, var->ty, &desig, tok);
 
-  // Special case: struct assignment
+  // Special case: struct/complex assignment from single expression
   if (init->expr) {
+    Node *init_val = init->expr;
+    add_type(init_val);
+    // Cast complex to target type if needed
+    if (is_complex(var->ty) && is_complex(init_val->ty) &&
+        var->ty->base->kind != init_val->ty->base->kind)
+      init_val = new_cast(init_val, var->ty);
+    else if (is_complex(var->ty) && !is_complex(init_val->ty))
+      init_val = new_cast(init_val, var->ty);
     return new_binary(ND_COMMA, lhs,
-                      new_binary(ND_ASSIGN, new_var_node(var, tok), init->expr, tok), tok);
+                      new_binary(ND_ASSIGN, new_var_node(var, tok), init_val, tok), tok);
   }
 
   if (!rhs)
