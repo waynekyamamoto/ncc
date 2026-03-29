@@ -98,6 +98,7 @@ static void load_imm(char *reg, uint64_t val) {
 }
 
 // Emit a double constant into d-register.
+__attribute__((unused))
 static void emit_double_const(int dreg, double val) {
   union { double d; uint64_t u; } v;
   v.d = val;
@@ -511,7 +512,7 @@ static void gen_funcall(Node *node) {
     if (arg_dest[i] == -1) {
       gen_expr(args[i]);
       Type *aty = args[i]->ty;
-      bool is_struct_arg = aty && (aty->kind == TY_STRUCT || aty->kind == TY_UNION);
+      bool is_struct_arg = aty && (aty->kind == TY_STRUCT || aty->kind == TY_UNION || aty->kind == TY_COMPLEX);
       if (is_struct_arg) {
         // x0 is the address of the struct; copy its contents to the stack
         for (int j = 0; j + 7 < aty->size; j += 8) {
@@ -548,7 +549,7 @@ static void gen_funcall(Node *node) {
     if (arg_dest[i] >= 0) {
       gen_expr(args[i]);
       Type *aty = args[i]->ty;
-      bool is_struct = aty && (aty->kind == TY_STRUCT || aty->kind == TY_UNION);
+      bool is_struct = aty && (aty->kind == TY_STRUCT || aty->kind == TY_UNION || aty->kind == TY_COMPLEX);
 
       if (is_struct && aty->size > 16) {
         // Large struct: pass by indirect reference (pointer in GP reg).
@@ -601,7 +602,7 @@ static void gen_funcall(Node *node) {
   for (int i = nargs - 1; i >= 0; i--) {
     if (arg_dest[i] < 0) continue;
     Type *aty = args[i]->ty;
-    bool is_struct = aty && (aty->kind == TY_STRUCT || aty->kind == TY_UNION);
+    bool is_struct = aty && (aty->kind == TY_STRUCT || aty->kind == TY_UNION || aty->kind == TY_COMPLEX);
 
     if (arg_dest[i] >= 100) {
       popf(arg_dest[i] - 100);

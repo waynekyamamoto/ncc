@@ -149,8 +149,39 @@ static Node *new_var_node(Obj *var, Token *tok) {
   return node;
 }
 
+// Forward declarations for complex number helpers
+static Node *new_real(Node *expr, Token *tok);
+static Node *new_imag(Node *expr, Token *tok);
+static Node *new_complex_val(Node *real_part, Node *imag_part, Type *cty, Token *tok);
+
 Node *new_cast(Node *expr, Type *ty) {
   add_type(expr);
+
+  // Cast to complex from non-complex: create complex with real=expr, imag=0
+  if (ty->kind == TY_COMPLEX && expr->ty->kind != TY_COMPLEX) {
+    Node *zero = new_node(ND_NUM, expr->tok);
+    zero->fval = 0.0;
+    zero->val = 0;
+    zero->ty = ty->base;
+    // Cast the expression to the base type first
+    Node *real_part = new_cast(expr, ty->base);
+    return new_complex_val(real_part, zero, ty, expr->tok);
+  }
+
+  // Cast from complex to non-complex: extract real part and cast
+  if (ty->kind != TY_COMPLEX && expr->ty->kind == TY_COMPLEX) {
+    Node *real_part = new_real(expr, expr->tok);
+    return new_cast(real_part, ty);
+  }
+
+  // Cast between complex types: cast each part
+  if (ty->kind == TY_COMPLEX && expr->ty->kind == TY_COMPLEX) {
+    if (ty->base->kind == expr->ty->base->kind)
+      return expr;  // same base type, no-op
+    Node *real_part = new_cast(new_real(expr, expr->tok), ty->base);
+    Node *imag_part = new_cast(new_imag(expr, expr->tok), ty->base);
+    return new_complex_val(real_part, imag_part, ty, expr->tok);
+  }
 
   Node *node = calloc_checked(1, sizeof(Node));
   node->kind = ND_CAST;
@@ -173,11 +204,6 @@ static Node *new_imag(Node *expr, Token *tok) {
   add_type(node);
   return node;
 }
-
-// Helper: create a complex value from real and imaginary parts.
-// Creates an anonymous local variable, assigns real and imag parts to it,
-// and returns a comma expression that evaluates to the complex variable.
-static Node *new_complex_val(Node *real_part, Node *imag_part, Type *cty, Token *tok);
 
 //
 // Variable creation
@@ -669,15 +695,17 @@ static Type *array_dimensions(Token **rest, Token *tok, Type *ty) {
   // Simple check: does the tree contain any ND_VAR or ND_FUNCALL?
   {
     bool is_const = true;
-    // Walk the tree to check for non-constant nodes
+    // Walk the tree to check for non-constant nodes.
+    // ND_ADDR, ND_MEMBER, and ND_DEREF are allowed because they appear
+    // in offsetof() patterns like &((type*)0)->member, which are
+    // compile-time constants.
     Node *stack[64];
     int sp = 0;
     stack[sp++] = expr_node;
     while (sp > 0 && is_const) {
       Node *n = stack[--sp];
       if (!n) continue;
-      if (n->kind == ND_VAR || n->kind == ND_FUNCALL || n->kind == ND_DEREF ||
-          n->kind == ND_ADDR || n->kind == ND_MEMBER)
+      if (n->kind == ND_VAR || n->kind == ND_FUNCALL)
         is_const = false;
       if (sp < 62) {
         if (n->lhs) stack[sp++] = n->lhs;
@@ -1375,8 +1403,15 @@ static int64_t eval2(Node *node, char ***label) {
     *label = &node->var->name;
     return 0;
   case ND_MEMBER:
-    if (!label)
-      error_tok(node->tok, "not a compile-time constant");
+    if (!label) {
+      // Allow offsetof-like patterns: &((type*)0)->member
+      // where the base is a pure numeric constant (no relocation needed)
+      char **dummy_label = NULL;
+      int64_t val = eval_rval(node->lhs, &dummy_label) + node->member->offset;
+      if (dummy_label)
+        error_tok(node->tok, "not a compile-time constant");
+      return val;
+    }
     return eval_rval(node->lhs, label) + node->member->offset;
   case ND_LABEL_VAL:
     if (!label)
@@ -1393,7 +1428,7 @@ static int64_t eval_rval(Node *node, char ***label) {
   case ND_VAR:
     if (node->var->is_local)
       error_tok(node->tok, "not a compile-time constant");
-    *label = &node->var->name;
+    if (label) *label = &node->var->name;
     return 0;
   case ND_DEREF:
     return eval2(node->lhs, label);
@@ -1401,10 +1436,17 @@ static int64_t eval_rval(Node *node, char ***label) {
     return eval_rval(node->lhs, label) + node->member->offset;
   case ND_CAST:
     return eval_rval(node->lhs, label);
+  case ND_NUM:
+    // For offsetof-like patterns: (type*)0 -> base address is a constant
+    return node->val;
   default:
     error_tok(node->tok, "not a compile-time constant");
   }
 }
+
+// Evaluate a complex expression and return its real+imaginary parts.
+// This handles the lowered form: (tmp.__real__ = R, tmp.__imag__ = I, tmp)
+static void eval_complex(Node *node, double *re, double *im);
 
 static double eval_double(Node *node) {
   add_type(node);
@@ -1413,6 +1455,13 @@ static double eval_double(Node *node) {
     if (node->ty->is_unsigned)
       return (unsigned long)eval(node);
     return eval(node);
+  }
+
+  // If the expression has complex type, extract the real part
+  if (is_complex(node->ty)) {
+    double re, im;
+    eval_complex(node, &re, &im);
+    return re;
   }
 
   switch (node->kind) {
@@ -1434,11 +1483,67 @@ static double eval_double(Node *node) {
     if (is_flonum(node->lhs->ty))
       return eval_double(node->lhs);
     return eval(node->lhs);
+  case ND_REAL:
+    if (is_complex(node->lhs->ty)) {
+      double re, im;
+      eval_complex(node->lhs, &re, &im);
+      return re;
+    }
+    return eval_double(node->lhs);
+  case ND_IMAG:
+    if (is_complex(node->lhs->ty)) {
+      double re, im;
+      eval_complex(node->lhs, &re, &im);
+      return im;
+    }
+    return 0.0;
   case ND_NUM:
     return node->fval;
   default:
     error_tok(node->tok, "not a constant expression");
   }
+}
+
+// Evaluate a complex expression at compile time.
+// The lowered form is: ((__real__ tmp = R, __imag__ tmp = I), tmp)
+// We need to evaluate R and I.
+static void eval_complex(Node *node, double *re, double *im) {
+  add_type(node);
+
+  if (node->kind == ND_COMMA) {
+    // The rightmost child is the complex variable (just a temp).
+    // The left side contains the assignments.
+    // Pattern: COMMA(COMMA(ASSIGN(__real__ tmp, R), ASSIGN(__imag__ tmp, I)), tmp)
+    if (node->lhs->kind == ND_COMMA) {
+      Node *inner = node->lhs;
+      // inner->lhs = ASSIGN(__real__ tmp, R)
+      // inner->rhs = ASSIGN(__imag__ tmp, I)
+      if (inner->lhs->kind == ND_ASSIGN && inner->rhs->kind == ND_ASSIGN) {
+        *re = eval_double(inner->lhs->rhs);
+        *im = eval_double(inner->rhs->rhs);
+        return;
+      }
+    }
+  }
+
+  if (node->kind == ND_CAST) {
+    // Cast to complex from scalar
+    if (is_complex(node->ty) && !is_complex(node->lhs->ty)) {
+      *re = eval_double(node->lhs);
+      *im = 0.0;
+      return;
+    }
+    eval_complex(node->lhs, re, im);
+    return;
+  }
+
+  if (node->kind == ND_NUM) {
+    *re = node->fval;
+    *im = 0.0;
+    return;
+  }
+
+  error_tok(node->tok, "not a compile-time constant");
 }
 
 // assign = cond (assign-op assign)?
@@ -1683,11 +1788,39 @@ static Node *equality(Token **rest, Token *tok) {
   for (;;) {
     Token *start = tok;
     if (equal(tok, "==")) {
-      node = new_binary(ND_EQ, node, relational(&tok, tok->next), start);
+      Node *rhs = relational(&tok, tok->next);
+      add_type(node);
+      add_type(rhs);
+      if (is_complex(node->ty) || is_complex(rhs->ty)) {
+        // Complex ==: both real and imag must be equal
+        Node *lr = is_complex(node->ty) ? new_real(node, start) : node;
+        Node *li = is_complex(node->ty) ? new_imag(node, start) : new_num(0, start);
+        Node *rr = is_complex(rhs->ty) ? new_real(rhs, start) : rhs;
+        Node *ri = is_complex(rhs->ty) ? new_imag(rhs, start) : new_num(0, start);
+        node = new_binary(ND_LOGAND,
+          new_binary(ND_EQ, lr, rr, start),
+          new_binary(ND_EQ, li, ri, start), start);
+      } else {
+        node = new_binary(ND_EQ, node, rhs, start);
+      }
       continue;
     }
     if (equal(tok, "!=")) {
-      node = new_binary(ND_NE, node, relational(&tok, tok->next), start);
+      Node *rhs = relational(&tok, tok->next);
+      add_type(node);
+      add_type(rhs);
+      if (is_complex(node->ty) || is_complex(rhs->ty)) {
+        // Complex !=: either real or imag differs
+        Node *lr = is_complex(node->ty) ? new_real(node, start) : node;
+        Node *li = is_complex(node->ty) ? new_imag(node, start) : new_num(0, start);
+        Node *rr = is_complex(rhs->ty) ? new_real(rhs, start) : rhs;
+        Node *ri = is_complex(rhs->ty) ? new_imag(rhs, start) : new_num(0, start);
+        node = new_binary(ND_LOGOR,
+          new_binary(ND_NE, lr, rr, start),
+          new_binary(ND_NE, li, ri, start), start);
+      } else {
+        node = new_binary(ND_NE, node, rhs, start);
+      }
       continue;
     }
     *rest = tok;
@@ -1756,16 +1889,71 @@ static Node *add(Token **rest, Token *tok) {
 }
 
 // mul = cast ("*" cast | "/" cast | "%" cast)*
+// Complex multiplication: (a+bi)(c+di) = (ac-bd) + (ad+bc)i
+static Node *new_complex_mul(Node *lhs, Node *rhs, Token *tok) {
+  add_type(lhs);
+  add_type(rhs);
+  Type *cty = is_complex(lhs->ty) ? lhs->ty : rhs->ty;
+  Node *a = is_complex(lhs->ty) ? new_real(lhs, tok) : lhs;
+  Node *b = is_complex(lhs->ty) ? new_imag(lhs, tok) : new_num(0, tok);
+  Node *c = is_complex(rhs->ty) ? new_real(rhs, tok) : rhs;
+  Node *d = is_complex(rhs->ty) ? new_imag(rhs, tok) : new_num(0, tok);
+  Node *real = new_binary(ND_SUB,
+    new_binary(ND_MUL, a, c, tok),
+    new_binary(ND_MUL, b, d, tok), tok);
+  Node *imag = new_binary(ND_ADD,
+    new_binary(ND_MUL, a, d, tok),
+    new_binary(ND_MUL, b, c, tok), tok);
+  return new_complex_val(real, imag, cty, tok);
+}
+
+// Complex division: (a+bi)/(c+di) = ((ac+bd) + (bc-ad)i) / (c^2+d^2)
+static Node *new_complex_div(Node *lhs, Node *rhs, Token *tok) {
+  add_type(lhs);
+  add_type(rhs);
+  Type *cty = is_complex(lhs->ty) ? lhs->ty : rhs->ty;
+  Node *a = is_complex(lhs->ty) ? new_real(lhs, tok) : lhs;
+  Node *b = is_complex(lhs->ty) ? new_imag(lhs, tok) : new_num(0, tok);
+  Node *c = is_complex(rhs->ty) ? new_real(rhs, tok) : rhs;
+  Node *d = is_complex(rhs->ty) ? new_imag(rhs, tok) : new_num(0, tok);
+  Node *denom = new_binary(ND_ADD,
+    new_binary(ND_MUL, c, c, tok),
+    new_binary(ND_MUL, d, d, tok), tok);
+  Node *real = new_binary(ND_DIV,
+    new_binary(ND_ADD,
+      new_binary(ND_MUL, a, c, tok),
+      new_binary(ND_MUL, b, d, tok), tok),
+    denom, tok);
+  Node *imag = new_binary(ND_DIV,
+    new_binary(ND_SUB,
+      new_binary(ND_MUL, b, c, tok),
+      new_binary(ND_MUL, a, d, tok), tok),
+    denom, tok);
+  return new_complex_val(real, imag, cty, tok);
+}
+
 static Node *mul(Token **rest, Token *tok) {
   Node *node = cast(&tok, tok);
   for (;;) {
     Token *start = tok;
     if (equal(tok, "*")) {
-      node = new_binary(ND_MUL, node, cast(&tok, tok->next), start);
+      Node *rhs = cast(&tok, tok->next);
+      add_type(node);
+      add_type(rhs);
+      if (is_complex(node->ty) || is_complex(rhs->ty))
+        node = new_complex_mul(node, rhs, start);
+      else
+        node = new_binary(ND_MUL, node, rhs, start);
       continue;
     }
     if (equal(tok, "/")) {
-      node = new_binary(ND_DIV, node, cast(&tok, tok->next), start);
+      Node *rhs = cast(&tok, tok->next);
+      add_type(node);
+      add_type(rhs);
+      if (is_complex(node->ty) || is_complex(rhs->ty))
+        node = new_complex_div(node, rhs, start);
+      else
+        node = new_binary(ND_DIV, node, rhs, start);
       continue;
     }
     if (equal(tok, "%")) {
@@ -1807,8 +1995,17 @@ static Node *unary(Token **rest, Token *tok) {
   if (equal(tok, "+"))
     return cast(rest, tok->next);
 
-  if (equal(tok, "-"))
-    return new_unary(ND_NEG, cast(rest, tok->next), tok);
+  if (equal(tok, "-")) {
+    Node *operand = cast(rest, tok->next);
+    add_type(operand);
+    if (is_complex(operand->ty)) {
+      return new_complex_val(
+        new_unary(ND_NEG, new_real(operand, tok), tok),
+        new_unary(ND_NEG, new_imag(operand, tok), tok),
+        operand->ty, tok);
+    }
+    return new_unary(ND_NEG, operand, tok);
+  }
 
   if (equal(tok, "&"))
     return new_unary(ND_ADDR, cast(rest, tok->next), tok);
@@ -1823,15 +2020,14 @@ static Node *unary(Token **rest, Token *tok) {
     return new_unary(ND_NOT, cast(rest, tok->next), tok);
 
   if (equal(tok, "~")) {
-    // Check if this is complex conjugate (~ applied to complex)
     Node *operand = cast(rest, tok->next);
     add_type(operand);
     if (is_complex(operand->ty)) {
       // Complex conjugate: negate the imaginary part
-      // We'll handle this by creating a special ND_BITNOT on complex
-      Node *node = new_unary(ND_BITNOT, operand, tok);
-      node->ty = operand->ty;
-      return node;
+      return new_complex_val(
+        new_real(operand, tok),
+        new_unary(ND_NEG, new_imag(operand, tok), tok),
+        operand->ty, tok);
     }
     return new_unary(ND_BITNOT, operand, tok);
   }
@@ -1905,9 +2101,15 @@ static Node *unary(Token **rest, Token *tok) {
   // _Alignof
   if (equal(tok, "_Alignof") || equal(tok, "__alignof__")) {
     tok = skip(tok->next, "(");
-    Type *ty = typename_(&tok, tok);
+    if (is_typename(tok)) {
+      Type *ty = typename_(&tok, tok);
+      *rest = skip(tok, ")");
+      return new_ulong(ty->align, tok);
+    }
+    Node *node = unary(&tok, tok);
+    add_type(node);
     *rest = skip(tok, ")");
-    return new_ulong(ty->align, tok);
+    return new_ulong(node->ty->align, tok);
   }
 
   return postfix(rest, tok);
@@ -3477,6 +3679,41 @@ static void write_gvar_data(Initializer *init, Type *ty, char *buf, int offset, 
   // Evaluate the expression
   Node *expr = init->expr;
   add_type(expr);
+
+  // Complex type: evaluate real and imaginary parts separately
+  if (ty->kind == TY_COMPLEX) {
+    Type *base = ty->base;
+    // Create __real__ and __imag__ nodes to extract parts
+    Node *re = new_unary(ND_REAL, expr, expr->tok);
+    Node *im = new_unary(ND_IMAG, expr, expr->tok);
+    add_type(re);
+    add_type(im);
+    if (is_flonum(base)) {
+      if (base->kind == TY_FLOAT) {
+        float fr = eval_double(re);
+        float fi = eval_double(im);
+        memcpy(buf + offset, &fr, 4);
+        memcpy(buf + offset + 4, &fi, 4);
+      } else {
+        double dr = eval_double(re);
+        double di = eval_double(im);
+        memcpy(buf + offset, &dr, 8);
+        memcpy(buf + offset + 8, &di, 8);
+      }
+    } else {
+      // Integer complex
+      int64_t vr = eval(re);
+      int64_t vi = eval(im);
+      if (base->size <= 4) {
+        *(int32_t *)(buf + offset) = vr;
+        *(int32_t *)(buf + offset + 4) = vi;
+      } else {
+        *(int64_t *)(buf + offset) = vr;
+        *(int64_t *)(buf + offset + 8) = vi;
+      }
+    }
+    return;
+  }
 
   if (is_flonum(ty)) {
     if (ty->kind == TY_FLOAT) {
