@@ -160,6 +160,25 @@ Node *new_cast(Node *expr, Type *ty) {
   return node;
 }
 
+// Helper: create a __real__ (ND_REAL) node for a complex expression
+static Node *new_real(Node *expr, Token *tok) {
+  Node *node = new_unary(ND_REAL, expr, tok);
+  add_type(node);
+  return node;
+}
+
+// Helper: create a __imag__ (ND_IMAG) node for a complex expression
+static Node *new_imag(Node *expr, Token *tok) {
+  Node *node = new_unary(ND_IMAG, expr, tok);
+  add_type(node);
+  return node;
+}
+
+// Helper: create a complex value from real and imaginary parts.
+// Creates an anonymous local variable, assigns real and imag parts to it,
+// and returns a comma expression that evaluates to the complex variable.
+static Node *new_complex_val(Node *real_part, Node *imag_part, Type *cty, Token *tok);
+
 //
 // Variable creation
 //
@@ -179,6 +198,23 @@ static Obj *new_lvar(char *name, Type *ty) {
   var->next = locals;
   locals = var;
   return var;
+}
+
+// Create a complex value from real and imaginary parts by allocating
+// an anonymous local variable, assigning each part, and returning the variable.
+// Returns: (tmp.__real__ = real_part, tmp.__imag__ = imag_part, tmp)
+static Node *new_complex_val(Node *real_part, Node *imag_part, Type *cty, Token *tok) {
+  Obj *tmp = new_lvar("", cty);
+  Node *tmp_var = new_var_node(tmp, tok);
+
+  // tmp.__real__ = real_part
+  Node *set_real = new_binary(ND_ASSIGN, new_real(tmp_var, tok), real_part, tok);
+  // tmp.__imag__ = imag_part
+  Node *set_imag = new_binary(ND_ASSIGN, new_imag(tmp_var, tok), imag_part, tok);
+  // (set_real, set_imag, tmp)
+  Node *comma1 = new_binary(ND_COMMA, set_real, set_imag, tok);
+  Node *result = new_binary(ND_COMMA, comma1, new_var_node(tmp, tok), tok);
+  return result;
 }
 
 static Obj *new_gvar(char *name, Type *ty) {
@@ -1488,6 +1524,32 @@ static Node *new_add(Node *lhs, Node *rhs, Token *tok) {
   add_type(lhs);
   add_type(rhs);
 
+  // complex + complex (or complex + scalar, scalar + complex)
+  if (is_complex(lhs->ty) || is_complex(rhs->ty)) {
+    // Promote scalar to complex if needed
+    Type *cty;
+    if (is_complex(lhs->ty) && is_complex(rhs->ty)) {
+      // Both complex: use wider base
+      Type *lb = lhs->ty->base, *rb = rhs->ty->base;
+      Type *base = (lb->size >= rb->size) ? lb : rb;
+      if (lb->kind == TY_DOUBLE || rb->kind == TY_DOUBLE) base = ty_double;
+      if (lb->kind == TY_LDOUBLE || rb->kind == TY_LDOUBLE) base = ty_ldouble;
+      cty = complex_type(base);
+    } else if (is_complex(lhs->ty)) {
+      cty = lhs->ty;
+    } else {
+      cty = rhs->ty;
+    }
+    Node *lr = is_complex(lhs->ty) ? new_real(lhs, tok) : lhs;
+    Node *li = is_complex(lhs->ty) ? new_imag(lhs, tok) : new_num(0, tok);
+    Node *rr = is_complex(rhs->ty) ? new_real(rhs, tok) : rhs;
+    Node *ri = is_complex(rhs->ty) ? new_imag(rhs, tok) : new_num(0, tok);
+    return new_complex_val(
+      new_binary(ND_ADD, lr, rr, tok),
+      new_binary(ND_ADD, li, ri, tok),
+      cty, tok);
+  }
+
   // num + num
   if (is_numeric(lhs->ty) && is_numeric(rhs->ty))
     return new_binary(ND_ADD, lhs, rhs, tok);
@@ -1511,6 +1573,19 @@ static Node *new_add(Node *lhs, Node *rhs, Token *tok) {
 static Node *new_sub(Node *lhs, Node *rhs, Token *tok) {
   add_type(lhs);
   add_type(rhs);
+
+  // complex - complex
+  if (is_complex(lhs->ty) || is_complex(rhs->ty)) {
+    Type *cty = is_complex(lhs->ty) ? lhs->ty : rhs->ty;
+    Node *lr = is_complex(lhs->ty) ? new_real(lhs, tok) : lhs;
+    Node *li = is_complex(lhs->ty) ? new_imag(lhs, tok) : new_num(0, tok);
+    Node *rr = is_complex(rhs->ty) ? new_real(rhs, tok) : rhs;
+    Node *ri = is_complex(rhs->ty) ? new_imag(rhs, tok) : new_num(0, tok);
+    return new_complex_val(
+      new_binary(ND_SUB, lr, rr, tok),
+      new_binary(ND_SUB, li, ri, tok),
+      cty, tok);
+  }
 
   // num - num
   if (is_numeric(lhs->ty) && is_numeric(rhs->ty))
@@ -2330,6 +2405,20 @@ static Node *primary(Token **rest, Token *tok) {
 
   // Number
   if (tok->kind == TK_NUM) {
+    if (is_complex(tok->ty)) {
+      // Imaginary literal (e.g., 1.0i): create complex value {0, imag}
+      Type *base = tok->ty->base;
+      Node *zero = new_node(ND_NUM, tok);
+      zero->fval = 0.0;
+      zero->val = 0;
+      zero->ty = base;
+      Node *imag = new_node(ND_NUM, tok);
+      imag->fval = tok->fval;
+      imag->val = tok->val;
+      imag->ty = base;
+      *rest = tok->next;
+      return new_complex_val(zero, imag, tok->ty, tok);
+    }
     Node *node;
     if (is_flonum(tok->ty)) {
       node = new_node(ND_NUM, tok);

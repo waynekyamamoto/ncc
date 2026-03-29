@@ -187,6 +187,7 @@ static bool is_keyword(Token *tok) {
     "__thread", "typeof", "__typeof__", "asm", "__asm__",
     "_Static_assert", "static_assert",
     "_Generic",
+    "_Complex", "__complex__", "__real__", "__imag__",
     NULL
   };
 
@@ -386,15 +387,25 @@ static Token *read_number(char *start) {
     Token *tok = new_token(TK_NUM, start, p);
     tok->fval = strtold(start, NULL);
 
-    Type *ty = ty_double;
-    if (*p == 'f' || *p == 'F') {
-      ty = ty_float;
-      p++;
-    } else if (*p == 'l' || *p == 'L') {
-      ty = ty_ldouble;
-      p++;
+    // Parse float/imaginary suffix in any order: f, F, l, L, i, fi, if, iL, Li, etc.
+    Type *base_ty = ty_double;
+    bool is_imag = false;
+    for (int pass = 0; pass < 2; pass++) {
+      if (*p == 'f' || *p == 'F') {
+        base_ty = ty_float;
+        p++;
+      } else if (*p == 'l' || *p == 'L') {
+        base_ty = ty_ldouble;
+        p++;
+      } else if (*p == 'i' || *p == 'I') {
+        is_imag = true;
+        p++;
+      }
     }
-    tok->ty = ty;
+    if (is_imag)
+      tok->ty = complex_type(base_ty);
+    else
+      tok->ty = base_ty;
     tok->len = p - start;
     return tok;
   }

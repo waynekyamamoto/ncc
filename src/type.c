@@ -40,6 +40,10 @@ bool is_numeric(Type *ty) {
   return is_integer(ty) || is_flonum(ty);
 }
 
+bool is_complex(Type *ty) {
+  return ty->kind == TY_COMPLEX;
+}
+
 bool is_compatible(Type *t1, Type *t2) {
   if (t1 == t2)
     return true;
@@ -145,10 +149,29 @@ Type *struct_type(void) {
   return ty;
 }
 
+// Create a _Complex type from a base scalar type.
+// _Complex double = 16 bytes (two doubles), etc.
+Type *complex_type(Type *base) {
+  Type *ty = calloc_checked(1, sizeof(Type));
+  ty->kind = TY_COMPLEX;
+  ty->base = base;
+  ty->size = base->size * 2;
+  ty->align = base->align;
+  return ty;
+}
+
 // Get the common type for binary operations (usual arithmetic conversions).
 static Type *get_common_type(Type *ty1, Type *ty2) {
-  if (ty1->base)
+  if (ty1->base && ty1->kind != TY_COMPLEX)
     return pointer_to(ty1->base);
+
+  // Complex type promotions: if either is complex, result is complex
+  if (ty1->kind == TY_COMPLEX || ty2->kind == TY_COMPLEX) {
+    Type *base1 = ty1->kind == TY_COMPLEX ? ty1->base : ty1;
+    Type *base2 = ty2->kind == TY_COMPLEX ? ty2->base : ty2;
+    Type *common_base = get_common_type(base1, base2);
+    return complex_type(common_base);
+  }
 
   // Float promotions
   if (ty1->kind == TY_FUNC)
@@ -231,7 +254,7 @@ void add_type(Node *node) {
   case ND_ASSIGN:
     if (node->lhs->ty->kind == TY_ARRAY)
       error_tok(node->lhs->tok, "not an lvalue");
-    if (node->lhs->ty->kind != TY_STRUCT)
+    if (node->lhs->ty->kind != TY_STRUCT && node->lhs->ty->kind != TY_COMPLEX)
       node->rhs = new_cast(node->rhs, node->lhs->ty);
     node->ty = node->lhs->ty;
     return;
@@ -323,6 +346,13 @@ void add_type(Node *node) {
     return;
   case ND_LABEL_VAL:
     node->ty = pointer_to(ty_void);
+    return;
+  case ND_REAL:
+  case ND_IMAG:
+    if (node->lhs->ty->kind == TY_COMPLEX)
+      node->ty = node->lhs->ty->base;
+    else
+      node->ty = node->lhs->ty;  // for non-complex, __real__/__imag__ is identity/zero
     return;
   case ND_CAS:
     add_type(node->cas_addr);

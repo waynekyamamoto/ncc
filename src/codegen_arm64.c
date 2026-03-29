@@ -97,6 +97,46 @@ static void load_imm(char *reg, uint64_t val) {
     println("movk %s, #%llu, lsl #48", reg, (unsigned long long)((val >> 48) & 0xFFFF));
 }
 
+// Emit a double constant into d-register.
+static void emit_double_const(int dreg, double val) {
+  union { double d; uint64_t u; } v;
+  v.d = val;
+  if (v.u == 0) {
+    println("movi d%d, #0", dreg);
+  } else {
+    println("mov x9, #%llu", v.u & 0xFFFF);
+    if ((v.u >> 16) & 0xFFFF)
+      println("movk x9, #%llu, lsl #16", (v.u >> 16) & 0xFFFF);
+    if ((v.u >> 32) & 0xFFFF)
+      println("movk x9, #%llu, lsl #32", (v.u >> 32) & 0xFFFF);
+    if ((v.u >> 48) & 0xFFFF)
+      println("movk x9, #%llu, lsl #48", (v.u >> 48) & 0xFFFF);
+    println("fmov d%d, x9", dreg);
+  }
+}
+
+// Load a scalar from [x0 + offset] into d0, respecting the base type.
+static void load_complex_part(Type *base, int offset) {
+  if (base->kind == TY_FLOAT) {
+    println("ldr s0, [x0, #%d]", offset);
+    println("fcvt d0, s0");
+  } else if (base->kind == TY_DOUBLE || base->kind == TY_LDOUBLE) {
+    println("ldr d0, [x0, #%d]", offset);
+  } else {
+    // Integer complex
+    if (base->size == 1)
+      println(base->is_unsigned ? "ldrb w0, [x0, #%d]" : "ldrsb w0, [x0, #%d]", offset);
+    else if (base->size == 2)
+      println(base->is_unsigned ? "ldrh w0, [x0, #%d]" : "ldrsh w0, [x0, #%d]", offset);
+    else if (base->size == 4)
+      println("ldr w0, [x0, #%d]", offset);
+    else
+      println("ldr x0, [x0, #%d]", offset);
+    if (base->size == 4 && !base->is_unsigned)
+      println("sxtw x0, w0");
+  }
+}
+
 // Load value from memory according to type
 static void load(Type *ty) {
   switch (ty->kind) {
@@ -105,6 +145,7 @@ static void load(Type *ty) {
   case TY_UNION:
   case TY_FUNC:
   case TY_VLA:
+  case TY_COMPLEX:
     // These are already addresses — no dereference needed
     return;
   case TY_FLOAT:
@@ -142,8 +183,9 @@ static void store(Type *ty) {
 
   switch (ty->kind) {
   case TY_STRUCT:
-  case TY_UNION: {
-    // Copy struct from x0 (src addr) to x1 (dst addr)
+  case TY_UNION:
+  case TY_COMPLEX: {
+    // Copy struct/complex from x0 (src addr) to x1 (dst addr)
     for (int i = 0; i < ty->size; i++) {
       println("ldrb w2, [x0, #%d]", i);
       println("strb w2, [x1, #%d]", i);
@@ -255,6 +297,18 @@ static void gen_addr(Node *node) {
 
   case ND_FUNCALL:
     gen_expr(node);
+    return;
+
+  case ND_REAL:
+    // Address of __real__ expr: address of the real part
+    gen_addr(node->lhs);
+    return;
+
+  case ND_IMAG:
+    // Address of __imag__ expr: address of the imaginary part
+    gen_addr(node->lhs);
+    if (is_complex(node->lhs->ty))
+      println("add x0, x0, #%d", node->lhs->ty->base->size);
     return;
 
   case ND_ASSIGN:
@@ -411,7 +465,7 @@ static void gen_funcall(Node *node) {
     bool is_named_arg = (i < named_count);
     bool is_fp = is_flonum(args[i]->ty);
     Type *aty = args[i]->ty;
-    bool is_struct = (aty->kind == TY_STRUCT || aty->kind == TY_UNION);
+    bool is_struct = (aty->kind == TY_STRUCT || aty->kind == TY_UNION || aty->kind == TY_COMPLEX);
     int gp_needed = is_struct ? ((aty->size > 8) ? 2 : 1) : 1;
 
     if (is_variadic && !is_named_arg) {
@@ -655,6 +709,30 @@ static void gen_expr(Node *node) {
       println("fneg d0, d0");
     } else {
       println("neg x0, x0");
+    }
+    return;
+
+  case ND_REAL:
+    // __real__ expr: extract real part of complex
+    gen_expr(node->lhs);
+    if (is_complex(node->lhs->ty)) {
+      load_complex_part(node->lhs->ty->base, 0);
+    }
+    // If not complex, the value is already in x0/d0
+    return;
+
+  case ND_IMAG:
+    // __imag__ expr: extract imaginary part of complex
+    gen_expr(node->lhs);
+    if (is_complex(node->lhs->ty)) {
+      load_complex_part(node->lhs->ty->base, node->lhs->ty->base->size);
+    } else {
+      // Non-complex: imaginary part is 0
+      if (is_flonum(node->lhs->ty)) {
+        println("movi d0, #0");
+      } else {
+        println("mov x0, #0");
+      }
     }
     return;
 
@@ -1373,7 +1451,7 @@ static void assign_lvar_offsets(Obj *fn) {
   int gp2 = 0, fp2 = 0;
   for (Obj *param = fn->params; param; param = param->next) {
     bool is_fp = is_flonum(param->ty);
-    bool is_struct = (param->ty->kind == TY_STRUCT || param->ty->kind == TY_UNION);
+    bool is_struct = (param->ty->kind == TY_STRUCT || param->ty->kind == TY_UNION || param->ty->kind == TY_COMPLEX);
 
     if (is_fp && fp2 < 8) {
       fp2++;
@@ -1538,9 +1616,9 @@ static void emit_text(Obj *prog) {
       // Skip stack-passed params (positive offset = on caller's stack)
       if (param->offset > 0) {
         if (is_flonum(param->ty)) fp++;
-        else if ((param->ty->kind == TY_STRUCT || param->ty->kind == TY_UNION) && param->ty->size > 16)
+        else if ((param->ty->kind == TY_STRUCT || param->ty->kind == TY_UNION || param->ty->kind == TY_COMPLEX) && param->ty->size > 16)
           gp += 1;  // indirect reference
-        else if (param->ty->kind == TY_STRUCT || param->ty->kind == TY_UNION)
+        else if (param->ty->kind == TY_STRUCT || param->ty->kind == TY_UNION || param->ty->kind == TY_COMPLEX)
           gp += (param->ty->size > 8) ? 2 : 1;
         else gp++;
         continue;
@@ -1556,7 +1634,7 @@ static void emit_text(Obj *prog) {
           }
           fp++;
         }
-      } else if (param->ty->kind == TY_STRUCT || param->ty->kind == TY_UNION) {
+      } else if (param->ty->kind == TY_STRUCT || param->ty->kind == TY_UNION || param->ty->kind == TY_COMPLEX) {
         if (param->ty->size > 16 && gp < 8) {
           // Large struct: passed by indirect reference (pointer in GP reg).
           // Copy from the pointer to local storage.
