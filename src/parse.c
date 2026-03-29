@@ -811,9 +811,16 @@ static void struct_layout(Type *ty) {
   for (Member *mem = ty->members; mem; mem = mem->next) {
     if (mem->is_bitfield) {
       int sz = mem->ty->size;
+
+      // Sync bit counter with byte offset when transitioning
+      // from non-bitfield to bitfield members
+      if (bits == 0 && offset > 0)
+        bits = offset * 8;
+
       if (mem->bit_width == 0) {
         // Zero-width: align to next unit boundary
         bits = align_to(bits, sz * 8);
+        offset = bits / 8;
         continue;
       }
 
