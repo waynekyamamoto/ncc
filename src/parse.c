@@ -287,6 +287,7 @@ static bool is_typename(Token *tok) {
     "_Atomic", "_Alignas", "auto", "register", "_Thread_local", "__thread",
     "typeof", "__typeof__", "_Static_assert", "static_assert",
     "__extension__", "__builtin_va_list", "__attribute__",
+    "_Complex", "__complex__",
   };
 
   for (int i = 0; i < (int)(sizeof(kw) / sizeof(*kw)); i++)
@@ -316,6 +317,7 @@ static Type *declspec(Token **rest, Token *tok, VarAttr *attr) {
     OTHER    = 1 << 16,
     SIGNED   = 1 << 17,
     UNSIGNED = 1 << 18,
+    COMPLEX  = 1 << 19,
   };
 
   Type *ty = ty_int;
@@ -460,6 +462,8 @@ static Type *declspec(Token **rest, Token *tok, VarAttr *attr) {
     else if (equal(tok, "double"))  counter += DOUBLE;
     else if (equal(tok, "signed"))  counter |= SIGNED;
     else if (equal(tok, "unsigned")) counter |= UNSIGNED;
+    else if (equal(tok, "_Complex") || equal(tok, "__complex__"))
+      counter |= COMPLEX;
     else
       break;
 
@@ -489,6 +493,25 @@ static Type *declspec(Token **rest, Token *tok, VarAttr *attr) {
     case FLOAT:                           ty = ty_float; break;
     case DOUBLE:                          ty = ty_double; break;
     case LONG + DOUBLE:                   ty = ty_ldouble; break;
+    // _Complex types
+    case COMPLEX:
+    case COMPLEX + DOUBLE:                ty = complex_type(ty_double); break;
+    case COMPLEX + FLOAT:                 ty = complex_type(ty_float); break;
+    case COMPLEX + LONG + DOUBLE:         ty = complex_type(ty_ldouble); break;
+    case COMPLEX + INT:
+    case COMPLEX + SIGNED:
+    case COMPLEX + SIGNED + INT:          ty = complex_type(ty_int); break;
+    case COMPLEX + UNSIGNED:
+    case COMPLEX + UNSIGNED + INT:        ty = complex_type(ty_uint); break;
+    case COMPLEX + LONG:
+    case COMPLEX + LONG + INT:
+    case COMPLEX + SIGNED + LONG:
+    case COMPLEX + SIGNED + LONG + INT:   ty = complex_type(ty_long); break;
+    case COMPLEX + UNSIGNED + LONG:
+    case COMPLEX + UNSIGNED + LONG + INT: ty = complex_type(ty_ulong); break;
+    case COMPLEX + CHAR:
+    case COMPLEX + SIGNED + CHAR:         ty = complex_type(ty_char); break;
+    case COMPLEX + UNSIGNED + CHAR:       ty = complex_type(ty_uchar); break;
     default:
       error_tok(tok, "invalid type");
     }
@@ -1724,8 +1747,31 @@ static Node *unary(Token **rest, Token *tok) {
   if (equal(tok, "!"))
     return new_unary(ND_NOT, cast(rest, tok->next), tok);
 
-  if (equal(tok, "~"))
-    return new_unary(ND_BITNOT, cast(rest, tok->next), tok);
+  if (equal(tok, "~")) {
+    // Check if this is complex conjugate (~ applied to complex)
+    Node *operand = cast(rest, tok->next);
+    add_type(operand);
+    if (is_complex(operand->ty)) {
+      // Complex conjugate: negate the imaginary part
+      // We'll handle this by creating a special ND_BITNOT on complex
+      Node *node = new_unary(ND_BITNOT, operand, tok);
+      node->ty = operand->ty;
+      return node;
+    }
+    return new_unary(ND_BITNOT, operand, tok);
+  }
+
+  // __real__ and __imag__ (GCC extensions)
+  if (equal(tok, "__real__")) {
+    Node *node = new_unary(ND_REAL, cast(rest, tok->next), tok);
+    add_type(node);
+    return node;
+  }
+  if (equal(tok, "__imag__")) {
+    Node *node = new_unary(ND_IMAG, cast(rest, tok->next), tok);
+    add_type(node);
+    return node;
+  }
 
   // Pre-increment: ++i → i += 1
   if (equal(tok, "++"))
@@ -2295,6 +2341,17 @@ static Node *primary(Token **rest, Token *tok) {
     node->ty = tok->ty;
     *rest = tok->next;
     return node;
+  }
+
+  // __func__ predefined identifier (C99 6.4.2.2)
+  if (tok->kind == TK_IDENT &&
+      (equal(tok, "__func__") || equal(tok, "__FUNCTION__") || equal(tok, "__PRETTY_FUNCTION__"))) {
+    char *name = current_fn ? current_fn->name : "";
+    Token *str_tok = tok;
+    Obj *var = new_string_literal(strndup_checked(name, strlen(name)),
+                                  array_of(ty_char, strlen(name) + 1));
+    *rest = tok->next;
+    return new_var_node(var, str_tok);
   }
 
   // Identifier
