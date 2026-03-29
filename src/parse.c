@@ -788,6 +788,9 @@ static void struct_members(Token **rest, Token *tok, Type *ty) {
         mem->bit_width = const_expr_val(&tok, tok);
       }
 
+      // Handle __attribute__ on struct members
+      tok = attribute_list(tok, mem->ty, NULL);
+
       cur = cur->next = mem;
     }
   }
@@ -900,8 +903,8 @@ static Token *attribute_list(Token *tok, Type *ty, VarAttr *attr) {
     tok = skip(tok, "(");
 
     while (!equal(tok, ")")) {
-      if (equal(tok, "packed")) {
-        ty->is_packed = true;
+      if (equal(tok, "packed") || equal(tok, "__packed__")) {
+        if (ty) ty->is_packed = true;
         tok = tok->next;
       } else if (equal(tok, "aligned") || equal(tok, "__aligned__")) {
         tok = tok->next;
@@ -911,6 +914,15 @@ static Token *attribute_list(Token *tok, Type *ty, VarAttr *attr) {
           if (ty) {
             ty->align = a;
             // Also round up size to alignment
+            if (ty->size > 0)
+              ty->size = align_to(ty->size, a);
+          }
+          if (attr) attr->align = a;
+        } else {
+          // __attribute__((aligned)) with no args means max alignment (16 on ARM64)
+          int a = 16;
+          if (ty) {
+            ty->align = a;
             if (ty->size > 0)
               ty->size = align_to(ty->size, a);
           }
@@ -991,13 +1003,19 @@ static Token *attribute_list(Token *tok, Type *ty, VarAttr *attr) {
 
 static Type *struct_decl(Token **rest, Token *tok) {
   Token *tag = NULL;
+
+  // Collect attributes that appear before or after the tag name.
+  // Use a temporary type to capture packed/aligned attributes.
+  Type early_attr = {};
+  tok = attribute_list(tok, &early_attr, NULL);
+
   if (tok->kind == TK_IDENT) {
     tag = tok;
     tok = tok->next;
   }
 
-  // Attribute before body
-  tok = attribute_list(tok, NULL, NULL);
+  // Attribute after tag name, before body
+  tok = attribute_list(tok, &early_attr, NULL);
 
   if (tag && !equal(tok, "{")) {
     // Forward reference or existing tag
@@ -1022,6 +1040,12 @@ static Type *struct_decl(Token **rest, Token *tok) {
       push_tag_scope(tag, ty);
   }
 
+  // Apply early attributes (e.g., packed from before the tag name)
+  if (early_attr.is_packed)
+    ty->is_packed = true;
+  if (early_attr.align)
+    ty->align = early_attr.align;
+
   struct_members(&tok, tok, ty);
   struct_layout(ty);
   // Apply attributes AFTER layout (so aligned() overrides computed alignment)
@@ -1032,12 +1056,17 @@ static Type *struct_decl(Token **rest, Token *tok) {
 
 static Type *union_decl(Token **rest, Token *tok) {
   Token *tag = NULL;
+
+  // Collect early attributes
+  Type early_attr = {};
+  tok = attribute_list(tok, &early_attr, NULL);
+
   if (tok->kind == TK_IDENT) {
     tag = tok;
     tok = tok->next;
   }
 
-  tok = attribute_list(tok, NULL, NULL);
+  tok = attribute_list(tok, &early_attr, NULL);
 
   if (tag && !equal(tok, "{")) {
     *rest = tok;
@@ -1061,6 +1090,12 @@ static Type *union_decl(Token **rest, Token *tok) {
     if (tag)
       push_tag_scope(tag, ty);
   }
+
+  // Apply early attributes
+  if (early_attr.is_packed)
+    ty->is_packed = true;
+  if (early_attr.align)
+    ty->align = early_attr.align;
 
   struct_members(&tok, tok, ty);
   union_layout(ty);
@@ -2024,6 +2059,162 @@ static Node *primary(Token **rest, Token *tok) {
     return new_binary(ND_ASSIGN, dest, src, tok);
   }
 
+  // __builtin_prefetch(addr, ...) — no-op, evaluate and discard args
+  if (equal(tok, "__builtin_prefetch")) {
+    tok = skip(tok->next, "(");
+    // Parse and discard all arguments
+    Node *node = assign(&tok, tok);
+    while (consume(&tok, tok, ","))
+      assign(&tok, tok);
+    *rest = skip(tok, ")");
+    // Return 0 but evaluate the first arg for side effects via comma
+    return new_binary(ND_COMMA, node, new_num(0, tok), tok);
+  }
+
+  // __builtin_alloca(size) — stack allocation
+  if (equal(tok, "__builtin_alloca") || equal(tok, "alloca")) {
+    tok = skip(tok->next, "(");
+    Node *size = assign(&tok, tok);
+    *rest = skip(tok, ")");
+    Node *node = new_unary(ND_BUILTIN_ALLOCA, size, tok);
+    node->ty = pointer_to(ty_void);
+    return node;
+  }
+
+  // __builtin_clz[l|ll](x) — count leading zeros
+  if (equal(tok, "__builtin_clz") || equal(tok, "__builtin_clzl") ||
+      equal(tok, "__builtin_clzll")) {
+    bool is64 = !equal(tok, "__builtin_clz");
+    tok = skip(tok->next, "(");
+    Node *arg = assign(&tok, tok);
+    if (is64) arg = new_cast(arg, ty_long);
+    *rest = skip(tok, ")");
+    Node *node = new_unary(ND_BUILTIN_CLZ, arg, tok);
+    node->ty = ty_int;
+    node->val = is64;
+    return node;
+  }
+
+  // __builtin_ctz[l|ll](x) — count trailing zeros
+  if (equal(tok, "__builtin_ctz") || equal(tok, "__builtin_ctzl") ||
+      equal(tok, "__builtin_ctzll")) {
+    bool is64 = !equal(tok, "__builtin_ctz");
+    tok = skip(tok->next, "(");
+    Node *arg = assign(&tok, tok);
+    if (is64) arg = new_cast(arg, ty_long);
+    *rest = skip(tok, ")");
+    Node *node = new_unary(ND_BUILTIN_CTZ, arg, tok);
+    node->ty = ty_int;
+    node->val = is64;
+    return node;
+  }
+
+  // __builtin_ffs[l|ll](x) — find first set bit (1-indexed, 0 if x==0)
+  if (equal(tok, "__builtin_ffs") || equal(tok, "__builtin_ffsl") ||
+      equal(tok, "__builtin_ffsll")) {
+    bool is64 = !equal(tok, "__builtin_ffs");
+    tok = skip(tok->next, "(");
+    Node *arg = assign(&tok, tok);
+    if (is64) arg = new_cast(arg, ty_long);
+    *rest = skip(tok, ")");
+    Node *node = new_unary(ND_BUILTIN_FFS, arg, tok);
+    node->ty = ty_int;
+    node->val = is64;
+    return node;
+  }
+
+  // __builtin_popcount[l|ll](x) — count set bits
+  if (equal(tok, "__builtin_popcount") || equal(tok, "__builtin_popcountl") ||
+      equal(tok, "__builtin_popcountll")) {
+    tok = skip(tok->next, "(");
+    Node *arg = assign(&tok, tok);
+    *rest = skip(tok, ")");
+    Node *node = new_unary(ND_BUILTIN_POPCOUNT, arg, tok);
+    node->ty = ty_int;
+    return node;
+  }
+
+  // __builtin_parity[l|ll](x) — parity of set bits
+  if (equal(tok, "__builtin_parity") || equal(tok, "__builtin_parityl") ||
+      equal(tok, "__builtin_parityll")) {
+    tok = skip(tok->next, "(");
+    Node *arg = assign(&tok, tok);
+    *rest = skip(tok, ")");
+    Node *node = new_unary(ND_BUILTIN_PARITY, arg, tok);
+    node->ty = ty_int;
+    return node;
+  }
+
+  // __builtin_clrsb[l|ll](x) — count leading redundant sign bits
+  if (equal(tok, "__builtin_clrsb") || equal(tok, "__builtin_clrsbl") ||
+      equal(tok, "__builtin_clrsbll")) {
+    bool is64 = !equal(tok, "__builtin_clrsb");
+    tok = skip(tok->next, "(");
+    Node *arg = assign(&tok, tok);
+    if (is64) arg = new_cast(arg, ty_long);
+    *rest = skip(tok, ")");
+    Node *node = new_unary(ND_BUILTIN_CLRSB, arg, tok);
+    node->ty = ty_int;
+    node->val = is64;
+    return node;
+  }
+
+  // __builtin_bswap16(x) — byte swap 16-bit
+  if (equal(tok, "__builtin_bswap16")) {
+    tok = skip(tok->next, "(");
+    Node *arg = assign(&tok, tok);
+    *rest = skip(tok, ")");
+    // bswap16: rev16 w0,w0 then extract lower 16 bits
+    Node *node = new_unary(ND_BUILTIN_BSWAP32, arg, tok);
+    node->ty = ty_ushort;
+    node->val = 16; // flag for 16-bit
+    return node;
+  }
+
+  // __builtin_bswap32(x) — byte swap 32-bit
+  if (equal(tok, "__builtin_bswap32")) {
+    tok = skip(tok->next, "(");
+    Node *arg = assign(&tok, tok);
+    *rest = skip(tok, ")");
+    Node *node = new_unary(ND_BUILTIN_BSWAP32, arg, tok);
+    node->ty = ty_uint;
+    return node;
+  }
+
+  // __builtin_bswap64(x) — byte swap 64-bit
+  if (equal(tok, "__builtin_bswap64")) {
+    tok = skip(tok->next, "(");
+    Node *arg = assign(&tok, tok);
+    *rest = skip(tok, ")");
+    Node *node = new_unary(ND_BUILTIN_BSWAP64, arg, tok);
+    node->ty = ty_ulong;
+    return node;
+  }
+
+  // __builtin_classify_type(x) — return integer classification
+  if (equal(tok, "__builtin_classify_type")) {
+    tok = skip(tok->next, "(");
+    Node *arg = assign(&tok, tok);
+    add_type(arg);
+    *rest = skip(tok, ")");
+    // GCC type classification values
+    int val = 5; // default: record_type_class
+    if (arg->ty) {
+      switch (arg->ty->kind) {
+      case TY_VOID: val = 0; break;
+      case TY_INT: case TY_CHAR: case TY_SHORT: case TY_LONG: case TY_BOOL: case TY_ENUM:
+        val = 1; break; // integer_type_class
+      case TY_FLOAT: case TY_DOUBLE: case TY_LDOUBLE:
+        val = 8; break; // real_type_class
+      case TY_PTR: val = 5; break; // pointer_type_class
+      case TY_ARRAY: val = 5; break;
+      case TY_STRUCT: case TY_UNION: val = 12; break; // record_type_class
+      default: val = 5; break;
+      }
+    }
+    return new_num(val, tok);
+  }
+
   // Parenthesized expression
   if (equal(tok, "(") && equal(tok->next, "{")) {
     // GNU statement expression
@@ -2560,6 +2751,9 @@ static Node *declaration(Token **rest, Token *tok, Type *basety, VarAttr *attr) 
       error_tok(tok, "variable declared void");
     if (!ty->name)
       error_tok(tok, "variable name omitted");
+
+    // Handle __attribute__ after declarator (e.g., int x __attribute__((aligned(16))) = ...)
+    tok = attribute_list(tok, ty, attr);
 
     if (attr && attr->is_static) {
       // Static local variable → global with mangled name

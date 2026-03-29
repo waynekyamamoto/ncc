@@ -203,6 +203,15 @@ typedef enum {
   ND_ASM,         // asm (inline assembly)
   ND_CAS,         // atomic compare-and-swap
   ND_EXCH,        // atomic exchange
+  ND_BUILTIN_CLZ,      // __builtin_clz
+  ND_BUILTIN_CTZ,      // __builtin_ctz
+  ND_BUILTIN_FFS,      // __builtin_ffs
+  ND_BUILTIN_POPCOUNT, // __builtin_popcount
+  ND_BUILTIN_BSWAP32,  // __builtin_bswap32
+  ND_BUILTIN_BSWAP64,  // __builtin_bswap64
+  ND_BUILTIN_CLRSB,    // __builtin_clrsb
+  ND_BUILTIN_PARITY,   // __builtin_parity
+  ND_BUILTIN_ALLOCA,   // __builtin_alloca / alloca
 } NodeKind;
 
 // AST node

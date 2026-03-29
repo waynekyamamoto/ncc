@@ -1111,6 +1111,8 @@ void init_macros(void) {
   define_macro("__int128", "long");              // simplified
   define_macro("_Float16", "float");             // simplified: treat as float
   define_macro("__volatile__", "volatile");
+  define_macro("__volatile", "volatile");
+  define_macro("__attribute", "__attribute__");
   define_macro("__signed__", "signed");
   define_macro("__restrict__", "restrict");
   define_macro("__restrict", "restrict");
@@ -1135,12 +1137,8 @@ void init_macros(void) {
   define_macro("__builtin_unreachable()", "((void)0)");
   define_macro("__builtin_assume(x)", "((void)0)");
   define_macro("__builtin_trap()", "abort()");
-  define_macro("__builtin_clz(x)", "__ncc_clz(x)");
-  define_macro("__builtin_ctz(x)", "__ncc_ctz(x)");
-  define_macro("__builtin_popcount(x)", "__ncc_popcount(x)");
-  define_macro("__builtin_bswap16(x)", "__ncc_bswap16(x)");
-  define_macro("__builtin_bswap32(x)", "__ncc_bswap32(x)");
-  define_macro("__builtin_bswap64(x)", "__ncc_bswap64(x)");
+  // Bit manipulation builtins - handled as special cases in parse.c primary()
+  // We do NOT define these as macros; they are parsed directly.
   define_macro("__builtin_memset(d,v,n)", "memset((d),(v),(n))");
   define_macro("__builtin_memcpy(d,s,n)", "memcpy((d),(s),(n))");
   define_macro("__builtin_memmove(d,s,n)", "memmove(d,s,n)");
@@ -1166,6 +1164,10 @@ void init_macros(void) {
   define_macro("__builtin_printf", "printf");
   define_macro("__builtin_sprintf", "sprintf");
   define_macro("__builtin_putchar(c)", "putchar(c)");
+  define_macro("__builtin_puts(s)", "puts(s)");
+  define_macro("__builtin_signbit(x)", "((x) < 0)");
+  define_macro("__builtin_signbitf(x)", "((x) < 0)");
+  define_macro("__builtin_signbitl(x)", "((x) < 0)");
 
   // Date/time macros
   {

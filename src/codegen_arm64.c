@@ -67,6 +67,36 @@ static void popf(int reg) {
   depth--;
 }
 
+// Emit instructions to load an arbitrary 64-bit immediate into a register.
+// Uses movz+movk sequence for values that don't fit in a single MOV.
+static void load_imm(char *reg, uint64_t val) {
+  if (val == 0) {
+    println("mov %s, #0", reg);
+    return;
+  }
+
+  // Check if it fits in a simple MOV (16-bit unsigned)
+  if (val <= 0xFFFF) {
+    println("mov %s, #%llu", reg, (unsigned long long)val);
+    return;
+  }
+
+  // Check if it's a small negative (fits in MOV with sign extension)
+  if ((int64_t)val >= -0x10000 && (int64_t)val < 0) {
+    println("mov %s, #%lld", reg, (long long)(int64_t)val);
+    return;
+  }
+
+  // Need movz + movk sequence
+  println("movz %s, #%llu", reg, (unsigned long long)(val & 0xFFFF));
+  if ((val >> 16) & 0xFFFF)
+    println("movk %s, #%llu, lsl #16", reg, (unsigned long long)((val >> 16) & 0xFFFF));
+  if ((val >> 32) & 0xFFFF)
+    println("movk %s, #%llu, lsl #32", reg, (unsigned long long)((val >> 32) & 0xFFFF));
+  if ((val >> 48) & 0xFFFF)
+    println("movk %s, #%llu, lsl #48", reg, (unsigned long long)((val >> 48) & 0xFFFF));
+}
+
 // Load value from memory according to type
 static void load(Type *ty) {
   switch (ty->kind) {
@@ -187,14 +217,14 @@ static void gen_addr(Node *node) {
         if (off <= 4095) {
           println("sub x0, x29, #%d", off);
         } else {
-          println("mov x0, #%d", off);
+          load_imm("x0", (uint64_t)off);
           println("sub x0, x29, x0");
         }
       } else {
         if (node->var->offset <= 4095) {
           println("add x0, x29, #%d", node->var->offset);
         } else {
-          println("mov x0, #%d", node->var->offset);
+          load_imm("x0", (uint64_t)node->var->offset);
           println("add x0, x29, x0");
         }
       }
@@ -767,10 +797,13 @@ static void gen_expr(Node *node) {
     if (off < 0 && -off <= 4095) {
       println("sub x1, x29, #%d", -off);
     } else if (off < 0) {
-      println("mov x1, #%d", -off);
+      load_imm("x1", (uint64_t)(-off));
       println("sub x1, x29, x1");
-    } else {
+    } else if (off <= 4095) {
       println("add x1, x29, #%d", off);
+    } else {
+      load_imm("x1", (uint64_t)off);
+      println("add x1, x29, x1");
     }
 
     println("mov x2, #0");
@@ -894,6 +927,168 @@ static void gen_expr(Node *node) {
     println("stlxr w3, x0, [x1]");
     println("cbnz w3, .L.exch.%d", c);
     println("mov x0, x2");
+    return;
+  }
+
+  case ND_BUILTIN_CLZ: {
+    // count leading zeros: CLZ instruction on ARM64
+    gen_expr(node->lhs);
+    if (node->val) // 64-bit variant
+      println("clz x0, x0");
+    else
+      println("clz w0, w0");
+    return;
+  }
+
+  case ND_BUILTIN_CTZ: {
+    // count trailing zeros: RBIT + CLZ
+    gen_expr(node->lhs);
+    if (node->val) { // 64-bit
+      println("rbit x0, x0");
+      println("clz x0, x0");
+    } else {
+      println("rbit w0, w0");
+      println("clz w0, w0");
+    }
+    return;
+  }
+
+  case ND_BUILTIN_FFS: {
+    // find first set: if x==0 return 0, else ctz(x)+1
+    gen_expr(node->lhs);
+    int c = label_cnt++;
+    if (node->val) { // 64-bit
+      println("cmp x0, #0");
+      println("b.eq .L.ffs.zero.%d", c);
+      println("rbit x0, x0");
+      println("clz x0, x0");
+      println("add w0, w0, #1");
+    } else {
+      println("cmp w0, #0");
+      println("b.eq .L.ffs.zero.%d", c);
+      println("rbit w0, w0");
+      println("clz w0, w0");
+      println("add w0, w0, #1");
+    }
+    println("b .L.ffs.end.%d", c);
+    printlabel(".L.ffs.zero.%d:", c);
+    println("mov w0, #0");
+    printlabel(".L.ffs.end.%d:", c);
+    return;
+  }
+
+  case ND_BUILTIN_POPCOUNT: {
+    // Population count using NEON: fmov d0,x0; cnt v0.8b,v0.8b; addv b0,v0.8b; fmov w0,s0
+    gen_expr(node->lhs);
+    println("fmov d0, x0");
+    println("cnt v0.8b, v0.8b");
+    println("addv b0, v0.8b");
+    println("fmov w0, s0");
+    return;
+  }
+
+  case ND_BUILTIN_PARITY: {
+    // parity = popcount(x) & 1
+    gen_expr(node->lhs);
+    println("fmov d0, x0");
+    println("cnt v0.8b, v0.8b");
+    println("addv b0, v0.8b");
+    println("fmov w0, s0");
+    println("and w0, w0, #1");
+    return;
+  }
+
+  case ND_BUILTIN_CLRSB: {
+    // cls instruction on ARM64 counts leading redundant sign bits
+    gen_expr(node->lhs);
+    if (node->val) // 64-bit
+      println("cls x0, x0");
+    else
+      println("cls w0, w0");
+    return;
+  }
+
+  case ND_BUILTIN_BSWAP32: {
+    gen_expr(node->lhs);
+    if (node->val == 16) {
+      // bswap16: reverse bytes in halfword
+      println("rev w0, w0");
+      println("lsr w0, w0, #16");
+    } else {
+      println("rev w0, w0");
+    }
+    return;
+  }
+
+  case ND_BUILTIN_BSWAP64: {
+    gen_expr(node->lhs);
+    println("rev x0, x0");
+    return;
+  }
+
+  case ND_BUILTIN_ALLOCA: {
+    // __builtin_alloca(size): allocate on stack, aligned to 16 bytes.
+    // We lower sp by (size + expr_stack_size), copy expression stack
+    // items down, and return the alloca'd address.
+
+    // 1. Evaluate size into x0
+    gen_expr(node->lhs);
+    // 2. Round up to 16-byte alignment
+    println("add x0, x0, #15");
+    println("and x0, x0, #-16");
+    // Save aligned size in x10
+    println("mov x10, x0");
+
+    // 3. Save old sp
+    println("mov x11, sp");
+
+    // 4. New sp = old sp - alloca_size
+    println("sub sp, sp, x10");
+
+    // 5. Copy expression stack items down (they were at old sp)
+    //    depth items, each 16 bytes, starting from old sp
+    for (int i = 0; i < depth; i++) {
+      println("ldr x12, [x11, #%d]", i * 16);
+      println("str x12, [sp, #%d]", i * 16);
+    }
+
+    // 6. Update alloca_bottom
+    {
+      int off = current_fn->alloca_bottom->offset;
+      if (off < 0 && -off <= 4095)
+        println("sub x9, x29, #%d", -off);
+      else if (off < 0) {
+        load_imm("x9", (uint64_t)(-off));
+        println("sub x9, x29, x9");
+      } else if (off <= 4095)
+        println("add x9, x29, #%d", off);
+      else {
+        load_imm("x9", (uint64_t)off);
+        println("add x9, x29, x9");
+      }
+    }
+    // alloca_bottom = sp + depth*16 (bottom of alloca'd area)
+    if (depth > 0) {
+      println("add x0, sp, #%d", depth * 16);
+      println("str x0, [x9]");
+    } else {
+      println("mov x0, sp");
+      println("str x0, [x9]");
+    }
+
+    // 7. The alloca'd memory is at [old sp - alloca_size .. old sp)
+    //    Which is [sp + depth*16 .. sp + depth*16 + alloca_size)
+    //    But the caller wants the start address of the alloca'd block.
+    //    old sp - alloca_size = new sp + depth*16... no.
+    //    old sp = x11. alloca'd memory starts at x11 - alloca_size.
+    //    new sp = x11 - alloca_size. So alloca'd memory starts at new sp.
+    //    But expression stack items were copied to [new sp..new sp+depth*16).
+    //    So alloca'd memory is actually at [new sp + depth*16 .. old sp)
+    //    = [sp + depth*16 .. x11)
+    if (depth > 0)
+      println("add x0, sp, #%d", depth * 16);
+    else
+      println("mov x0, sp");
     return;
   }
 
@@ -1099,10 +1294,10 @@ static void gen_stmt(Node *node) {
         println("b.eq %s", n->label);
       } else {
         // Case range
-        println("mov x9, #%ld", n->begin);
+        load_imm("x9", (uint64_t)(int64_t)n->begin);
         println("cmp x0, x9");
         println("b.lt .L.next.%s", n->label);
-        println("mov x9, #%ld", n->end);
+        load_imm("x9", (uint64_t)(int64_t)n->end);
         println("cmp x0, x9");
         println("b.le %s", n->label);
         printlabel(".L.next.%s:", n->label);
@@ -1308,7 +1503,7 @@ static void emit_text(Obj *prog) {
       if (fn->stack_size <= 4095)
         println("sub sp, sp, #%d", fn->stack_size);
       else {
-        println("mov x9, #%d", fn->stack_size);
+        load_imm("x9", (uint64_t)fn->stack_size);
         println("sub sp, sp, x9");
       }
     }
@@ -1322,12 +1517,12 @@ static void emit_text(Obj *prog) {
       if ((off) < 0 && -(off) <= 4095) \
         println("sub x9, x29, #%d", -(off)); \
       else if ((off) < 0) { \
-        println("mov x9, #%d", -(off)); \
+        load_imm("x9", (uint64_t)(-(off))); \
         println("sub x9, x29, x9"); \
       } else if ((off) <= 4095) \
         println("add x9, x29, #%d", (off)); \
       else { \
-        println("mov x9, #%d", (off)); \
+        load_imm("x9", (uint64_t)(off)); \
         println("add x9, x29, x9"); \
       } \
     } while(0)
@@ -1455,9 +1650,14 @@ static void emit_text(Obj *prog) {
       int off = fn->va_area->offset;
       if (off < 0 && -off <= 4095) {
         println("sub x9, x29, #%d", -off);
-      } else {
-        println("mov x9, #%d", -off);
+      } else if (off < 0) {
+        load_imm("x9", (uint64_t)(-off));
         println("sub x9, x29, x9");
+      } else if (off <= 4095) {
+        println("add x9, x29, #%d", off);
+      } else {
+        load_imm("x9", (uint64_t)off);
+        println("add x9, x29, x9");
       }
       println("add x10, x29, #16");
       println("str x10, [x9]");
@@ -1470,10 +1670,13 @@ static void emit_text(Obj *prog) {
       if (off < 0 && -off <= 4095) {
         println("sub x9, x29, #%d", -off);
       } else if (off < 0) {
-        println("mov x9, #%d", -off);
+        load_imm("x9", (uint64_t)(-off));
         println("sub x9, x29, x9");
-      } else {
+      } else if (off <= 4095) {
         println("add x9, x29, #%d", off);
+      } else {
+        load_imm("x9", (uint64_t)off);
+        println("add x9, x29, x9");
       }
       println("str x10, [x9]");
     }
