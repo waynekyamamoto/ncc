@@ -282,6 +282,144 @@ typedef struct {
   int align;
 } VarAttr;
 
+// Helper: check if a type (or any of its members) contains a VLA
+static bool type_has_vla(Type *ty) {
+  if (ty->kind == TY_VLA)
+    return true;
+  if (ty->kind == TY_ARRAY)
+    return type_has_vla(ty->base);
+  if (ty->kind == TY_STRUCT || ty->kind == TY_UNION) {
+    for (Member *mem = ty->members; mem; mem = mem->next)
+      if (type_has_vla(mem->ty))
+        return true;
+  }
+  return false;
+}
+
+// Compute VLA byte size at runtime.
+// For a VLA type like int[n], creates a hidden local variable to hold
+// the byte size (n * sizeof(int)), emits an assignment to compute it,
+// and sets ty->vla_size to that variable.
+// Also handles structs/unions that contain VLA members.
+// Returns a statement node that must be inserted into the statement list,
+// or NULL if the type does not involve VLAs.
+static Node *compute_vla_size(Type *ty, Token *tok) {
+  if (ty->kind == TY_VLA) {
+    // Recursively compute base VLA sizes first (for multi-dimensional VLAs)
+    Node *base_stmt = compute_vla_size(ty->base, tok);
+
+    // Create hidden variable to hold byte size
+    Obj *size_var = new_lvar("", ty_ulong);
+    ty->vla_size = size_var;
+
+    // Compute: vla_len * base_size_in_bytes
+    Node *len_node = ty->vla_len;
+    Node *base_size;
+    if (ty->base->kind == TY_VLA)
+      base_size = new_var_node(ty->base->vla_size, tok);
+    else if (ty->base->vla_size)
+      base_size = new_var_node(ty->base->vla_size, tok);
+    else
+      base_size = new_ulong(ty->base->size, tok);
+
+    // Cast vla_len to unsigned long for the multiplication
+    Node *len_cast = new_cast(len_node, ty_ulong);
+    Node *mul_node = new_binary(ND_MUL, len_cast, base_size, tok);
+    add_type(mul_node);
+
+    Node *assign = new_binary(ND_ASSIGN, new_var_node(size_var, tok), mul_node, tok);
+    add_type(assign);
+
+    Node *stmt = new_node(ND_EXPR_STMT, tok);
+    stmt->lhs = assign;
+
+    if (base_stmt) {
+      // Chain: first compute base size, then this size
+      base_stmt->next = stmt;
+      Node *block = new_node(ND_BLOCK, tok);
+      block->body = base_stmt;
+      return block;
+    }
+
+    return stmt;
+  }
+
+  // Handle structs/unions that contain VLA members
+  if ((ty->kind == TY_STRUCT || ty->kind == TY_UNION) && type_has_vla(ty)) {
+    // First, recursively compute VLA sizes for all members
+    Node stmt_head = {};
+    Node *stmt_cur = &stmt_head;
+
+    for (Member *mem = ty->members; mem; mem = mem->next) {
+      Node *mem_stmt = compute_vla_size(mem->ty, tok);
+      if (mem_stmt)
+        stmt_cur = stmt_cur->next = mem_stmt;
+    }
+
+    // Create hidden variable for the struct's runtime size
+    Obj *size_var = new_lvar("", ty_ulong);
+    ty->vla_size = size_var;
+
+    // For a struct: sum of member sizes (simplified: last member offset + size)
+    // For a union: max of member sizes
+    // Build runtime expression to compute the total size.
+    // We approximate: for structs, compute sum with alignment padding;
+    // for simplicity, compute offset + size of last member at runtime.
+    Node *total_size = NULL;
+    if (ty->kind == TY_STRUCT) {
+      // Runtime struct size = sum of all member sizes with alignment
+      // For each member, we know the compile-time offset (from struct_layout).
+      // The last member that is VLA determines the runtime portion.
+      // Actually, for structs with VLA members, the layout is:
+      //   fixed members at compile-time offsets
+      //   VLA member's offset is known at compile time, but its size is runtime
+      // So: struct_size = last_vla_member_offset + runtime_vla_member_size
+      Member *last = NULL;
+      for (Member *mem = ty->members; mem; mem = mem->next)
+        last = mem;
+
+      if (last && last->ty->vla_size) {
+        // size = last->offset + vla_size_of_last_member
+        Node *offset_node = new_ulong(last->offset, tok);
+        Node *last_size = new_var_node(last->ty->vla_size, tok);
+        total_size = new_binary(ND_ADD, offset_node, last_size, tok);
+        add_type(total_size);
+      } else if (last && type_has_vla(last->ty)) {
+        total_size = new_ulong(ty->size, tok);
+      } else {
+        total_size = new_ulong(ty->size, tok);
+      }
+    } else {
+      // Union: max of member sizes (simplified for now)
+      total_size = new_ulong(ty->size, tok);
+      for (Member *mem = ty->members; mem; mem = mem->next) {
+        if (mem->ty->vla_size) {
+          total_size = new_var_node(mem->ty->vla_size, tok);
+          break;
+        }
+      }
+    }
+
+    Node *assign = new_binary(ND_ASSIGN, new_var_node(size_var, tok), total_size, tok);
+    add_type(assign);
+    Node *assign_stmt = new_node(ND_EXPR_STMT, tok);
+    assign_stmt->lhs = assign;
+    stmt_cur = stmt_cur->next = assign_stmt;
+
+    if (stmt_head.next) {
+      if (stmt_head.next->next) {
+        Node *block = new_node(ND_BLOCK, tok);
+        block->body = stmt_head.next;
+        return block;
+      }
+      return stmt_head.next;
+    }
+    return NULL;
+  }
+
+  return NULL;
+}
+
 //
 // Type handling utilities
 //
@@ -332,7 +470,7 @@ static Node *to_assign(Node *binary);
 static Node *new_add(Node *lhs, Node *rhs, Token *tok);
 static Node *new_sub(Node *lhs, Node *rhs, Token *tok);
 static Node *new_inc_dec(Node *node, Token *tok, int addend);
-static Token *parse_typedef(Token *tok, Type *basety);
+static Token *parse_typedef(Token *tok, Type *basety, Node **cur);
 static bool is_function_definition(Token *tok, Type *basety);
 static Token *attribute_list(Token *tok, Type *ty, VarAttr *attr);
 static bool is_end(Token *tok);
@@ -1699,7 +1837,13 @@ static Node *new_add(Node *lhs, Node *rhs, Token *tok) {
   }
 
   // ptr + num
-  rhs = new_binary(ND_MUL, rhs, new_long(lhs->ty->base->size, tok), tok);
+  // For VLA base types, use the runtime-computed size
+  Node *elem_size;
+  if (lhs->ty->base->vla_size)
+    elem_size = new_var_node(lhs->ty->base->vla_size, tok);
+  else
+    elem_size = new_long(lhs->ty->base->size, tok);
+  rhs = new_binary(ND_MUL, rhs, elem_size, tok);
   return new_binary(ND_ADD, lhs, rhs, tok);
 }
 
@@ -1726,7 +1870,12 @@ static Node *new_sub(Node *lhs, Node *rhs, Token *tok) {
 
   // ptr - num
   if (lhs->ty->base && is_integer(rhs->ty)) {
-    rhs = new_binary(ND_MUL, rhs, new_long(lhs->ty->base->size, tok), tok);
+    Node *elem_size;
+    if (lhs->ty->base->vla_size)
+      elem_size = new_var_node(lhs->ty->base->vla_size, tok);
+    else
+      elem_size = new_long(lhs->ty->base->size, tok);
+    rhs = new_binary(ND_MUL, rhs, elem_size, tok);
     add_type(rhs);
     Node *node = new_binary(ND_SUB, lhs, rhs, tok);
     node->ty = lhs->ty;
@@ -1737,7 +1886,12 @@ static Node *new_sub(Node *lhs, Node *rhs, Token *tok) {
   if (lhs->ty->base && rhs->ty->base) {
     Node *node = new_binary(ND_SUB, lhs, rhs, tok);
     node->ty = ty_long;
-    return new_binary(ND_DIV, node, new_num(lhs->ty->base->size, tok), tok);
+    Node *divisor;
+    if (lhs->ty->base->vla_size)
+      divisor = new_var_node(lhs->ty->base->vla_size, tok);
+    else
+      divisor = new_num(lhs->ty->base->size, tok);
+    return new_binary(ND_DIV, node, divisor, tok);
   }
 
   error_tok(tok, "invalid operands");
@@ -2122,20 +2276,18 @@ static Node *unary(Token **rest, Token *tok) {
     if (equal(tok->next, "(") && is_typename(tok->next->next)) {
       Type *ty = typename_(&tok, tok->next->next);
       *rest = skip(tok, ")");
+      // VLA or struct/union with VLA members: sizeof is computed at runtime
+      if (ty->vla_size)
+        return new_var_node(ty->vla_size, tok);
       if (ty->kind == TY_VLA) {
-        // VLA sizeof is computed at runtime
-        if (ty->vla_size)
-          return new_var_node(ty->vla_size, tok);
-        // Fall through to use the expression
+        // Fallback: should not happen if compute_vla_size was called
       }
       return new_ulong(ty->size, tok);
     }
     Node *node = unary(&tok, tok->next);
     add_type(node);
-    if (node->ty->kind == TY_VLA) {
-      if (node->ty->vla_size)
-        return new_var_node(node->ty->vla_size, tok);
-    }
+    if (node->ty->vla_size)
+      return new_var_node(node->ty->vla_size, tok);
     *rest = tok;
     return new_ulong(node->ty->size, tok);
   }
@@ -3118,7 +3270,7 @@ static Node *compound_stmt(Token **rest, Token *tok) {
 
       if (attr.is_typedef) {
         // typedef
-        tok = parse_typedef(tok, basety);
+        tok = parse_typedef(tok, basety, &cur);
         continue;
       }
 
@@ -3148,7 +3300,7 @@ static Node *compound_stmt(Token **rest, Token *tok) {
   return node;
 }
 
-static Token *parse_typedef(Token *tok, Type *basety) {
+static Token *parse_typedef(Token *tok, Type *basety, Node **cur) {
   bool first = true;
   while (!consume(&tok, tok, ";")) {
     if (!first)
@@ -3161,6 +3313,14 @@ static Token *parse_typedef(Token *tok, Type *basety) {
       error_tok(tok, "typedef name omitted");
     char *name = strndup_checked(ty->name->loc, ty->name->len);
     push_scope(name)->type_def = ty;
+
+    // For VLA typedefs, emit runtime size computation
+    if (cur) {
+      Node *vla_stmt = compute_vla_size(ty, ty->name);
+      if (vla_stmt) {
+        *cur = (*cur)->next = vla_stmt;
+      }
+    }
   }
   return tok;
 }
@@ -3179,6 +3339,14 @@ static bool is_function_definition(Token *tok, Type *basety) {
 static Node *declaration(Token **rest, Token *tok, Type *basety, VarAttr *attr) {
   Node head = {};
   Node *cur = &head;
+
+  // If the basetype (e.g., struct/union) contains VLA members,
+  // emit size computation statements now.
+  if (type_has_vla(basety) && !basety->vla_size) {
+    Node *vla_stmt = compute_vla_size(basety, tok);
+    if (vla_stmt)
+      cur = cur->next = vla_stmt;
+  }
 
   int i = 0;
   while (!equal(tok, ";")) {
@@ -3222,14 +3390,36 @@ static Node *declaration(Token **rest, Token *tok, Type *basety, VarAttr *attr) 
       continue;
     }
 
+    if (ty->kind == TY_VLA) {
+      // VLA variable declaration:
+      // 1. Compute and store byte size in hidden variable
+      Node *vla_stmt = compute_vla_size(ty, ty->name);
+      if (vla_stmt)
+        cur = cur->next = vla_stmt;
+
+      // 2. Create a hidden variable to save sp before allocation.
+      //    This allows deallocation when the VLA goes out of scope
+      //    or is re-allocated (e.g., via goto loop).
+      Obj *saved_sp = new_lvar("", pointer_to(ty_char));
+
+      // 3. Emit VLA stack allocation node
+      //    This tells codegen to: restore sp from saved_sp (if non-zero),
+      //    save current sp, allocate, and store VLA base pointer.
+      Node *vla_node = new_node(ND_VLA_PTR, tok);
+      vla_node->var = var;
+      // Use lhs to carry the saved_sp variable reference
+      Node *sp_var_node = new_node(ND_VAR, tok);
+      sp_var_node->var = saved_sp;
+      vla_node->lhs = sp_var_node;
+
+      Node *vla_expr = new_node(ND_EXPR_STMT, tok);
+      vla_expr->lhs = vla_node;
+      cur = cur->next = vla_expr;
+      continue;
+    }
+
     if (ty->size < 0)
       error_tok(ty->name, "variable has incomplete type");
-
-    // Zero-initialize VLAs
-    if (ty->kind == TY_VLA) {
-      // Store VLA size
-      // For now, treat as error
-    }
   }
 
   Node *node = new_node(ND_BLOCK, tok);
@@ -3923,7 +4113,7 @@ Obj *parse(Token *tok) {
 
     // Typedef
     if (attr.is_typedef) {
-      tok = parse_typedef(tok, basety);
+      tok = parse_typedef(tok, basety, NULL);
       continue;
     }
 

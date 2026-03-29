@@ -130,6 +130,8 @@ Type *array_of(Type *base, int len) {
 Type *vla_of(Type *base, Node *len) {
   Type *ty = calloc_checked(1, sizeof(Type));
   ty->kind = TY_VLA;
+  ty->size = 8;   // VLA variables are stored as pointers
+  ty->align = 8;
   ty->base = base;
   ty->vla_len = len;
   return ty;
@@ -329,8 +331,9 @@ void add_type(Node *node) {
       error_tok(node->tok, "dereferencing a void pointer");
 
     node->ty = node->lhs->ty->base;
-    if (node->ty->kind == TY_VLA)
-      node->ty = pointer_to(node->ty->base);
+    // Note: VLA types stay as VLA here (like arrays, they're address types).
+    // load() will skip the load for VLA types, and VLA-to-pointer decay
+    // happens in new_add/new_sub when used in pointer arithmetic.
     return;
   case ND_STMT_EXPR:
     if (node->body) {

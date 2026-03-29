@@ -187,9 +187,33 @@ static void store(Type *ty) {
   case TY_UNION:
   case TY_COMPLEX: {
     // Copy struct/complex from x0 (src addr) to x1 (dst addr)
-    for (int i = 0; i < ty->size; i++) {
-      println("ldrb w2, [x0, #%d]", i);
-      println("strb w2, [x1, #%d]", i);
+    // Use 8-byte copies for bulk, then byte copies for the tail.
+    // For large structs, periodically advance base pointers to keep
+    // offsets within ARM64 immediate range (strb: 0-4095, str x: 0-32760).
+    int copied = 0;
+    int off = 0;
+    while (copied + 8 <= ty->size) {
+      if (off + 8 > 4088) {
+        // Advance base pointers to keep offsets in range
+        println("add x0, x0, #%d", off);
+        println("add x1, x1, #%d", off);
+        off = 0;
+      }
+      println("ldr x2, [x0, #%d]", off);
+      println("str x2, [x1, #%d]", off);
+      off += 8;
+      copied += 8;
+    }
+    while (copied < ty->size) {
+      if (off >= 4096) {
+        println("add x0, x0, #%d", off);
+        println("add x1, x1, #%d", off);
+        off = 0;
+      }
+      println("ldrb w2, [x0, #%d]", off);
+      println("strb w2, [x1, #%d]", off);
+      off++;
+      copied++;
     }
     return;
   }
@@ -220,12 +244,33 @@ __attribute__((unused))
 static void store_to(Type *ty, char *addr_reg) {
   switch (ty->kind) {
   case TY_STRUCT:
-  case TY_UNION:
-    for (int i = 0; i < ty->size; i++) {
-      println("ldrb w2, [x0, #%d]", i);
-      println("strb w2, [%s, #%d]", addr_reg, i);
+  case TY_UNION: {
+    int copied = 0;
+    int off = 0;
+    while (copied + 8 <= ty->size) {
+      if (off + 8 > 4088) {
+        println("add x0, x0, #%d", off);
+        println("add %s, %s, #%d", addr_reg, addr_reg, off);
+        off = 0;
+      }
+      println("ldr x2, [x0, #%d]", off);
+      println("str x2, [%s, #%d]", addr_reg, off);
+      off += 8;
+      copied += 8;
+    }
+    while (copied < ty->size) {
+      if (off >= 4096) {
+        println("add x0, x0, #%d", off);
+        println("add %s, %s, #%d", addr_reg, addr_reg, off);
+        off = 0;
+      }
+      println("ldrb w2, [x0, #%d]", off);
+      println("strb w2, [%s, #%d]", addr_reg, off);
+      off++;
+      copied++;
     }
     return;
+  }
   case TY_FLOAT:
     println("fcvt s0, d0");
     println("str s0, [%s]", addr_reg);
@@ -737,6 +782,67 @@ static void gen_expr(Node *node) {
     }
     return;
 
+  case ND_VLA_PTR: {
+    // VLA stack allocation:
+    // 1. If saved_sp is non-zero, restore sp from it (re-allocation via goto)
+    // 2. Save current sp to saved_sp
+    // 3. Load the byte size, round up, subtract from sp
+    // 4. Store the new sp as the VLA base address
+    Obj *var = node->var;
+    Obj *size_var = var->ty->vla_size;
+
+    // Step 1: Restore sp from saved_sp if available (handles goto re-allocation)
+    if (node->lhs && node->lhs->var) {
+      Obj *saved_sp = node->lhs->var;
+      int sp_off = -saved_sp->offset;
+      if (sp_off <= 4095)
+        println("sub x9, x29, #%d", sp_off);
+      else {
+        load_imm("x9", (uint64_t)sp_off);
+        println("sub x9, x29, x9");
+      }
+      println("ldr x10, [x9]");
+      println("cbz x10, .L.vla.skip.%d", label_cnt);
+      // Restore sp to saved value (dealloc previous VLA)
+      println("mov sp, x10");
+      printlabel(".L.vla.skip.%d:", label_cnt);
+      label_cnt++;
+
+      // Step 2: Save current sp
+      println("mov x10, sp");
+      println("str x10, [x9]");
+    }
+
+    // Step 3: Load byte size from the hidden variable
+    int size_off = -size_var->offset;
+    if (size_off <= 4095)
+      println("sub x0, x29, #%d", size_off);
+    else {
+      load_imm("x0", (uint64_t)size_off);
+      println("sub x0, x29, x0");
+    }
+    println("ldr x0, [x0]");
+
+    // Round up to 16-byte alignment
+    println("add x0, x0, #15");
+    println("and x0, x0, #-16");
+
+    // Subtract from sp to allocate
+    println("sub sp, sp, x0");
+
+    // Step 4: Store the new sp as the VLA base address
+    println("mov x0, sp");
+    int var_off = -var->offset;
+    if (var_off <= 4095)
+      println("sub x9, x29, #%d", var_off);
+    else {
+      load_imm("x9", (uint64_t)var_off);
+      println("sub x9, x29, x9");
+    }
+    println("str x0, [x9]");
+    return;
+  }
+
   case ND_VAR:
     gen_addr(node);
     load(node->ty);
@@ -760,7 +866,9 @@ static void gen_expr(Node *node) {
       if (bo > 0)
         println("lsr x0, x0, #%d", bo);
       if (node->member->ty->is_unsigned || node->member->ty->kind == TY_ENUM) {
-        println("and x0, x0, #%llu", (unsigned long long)((1ULL << bw) - 1));
+        // If bw covers all 64 bits, AND is a no-op (also avoids invalid immediate)
+        if (bw < 64)
+          println("and x0, x0, #%llu", (unsigned long long)((1ULL << bw) - 1));
       } else {
         // Sign extend: shift left then arithmetic shift right
         int shift = 64 - bw;
@@ -833,7 +941,11 @@ static void gen_expr(Node *node) {
           println("movk x3, #%llu, lsl #48", (unsigned long long)((val_mask >> 48) & 0xFFFF));
         println("and x0, x10, x3");
       } else {
-        println("and w0, w10, #%u", (unsigned)(val_mask & 0xFFFFFFFF));
+        // If val_mask covers all bits for the container size, AND is a no-op
+        if ((unsigned)(val_mask & 0xFFFFFFFF) == 0xFFFFFFFF)
+          println("mov w0, w10");
+        else
+          println("and w0, w10, #%u", (unsigned)(val_mask & 0xFFFFFFFF));
       }
       if (bo > 0)
         println("lsl %s0, %s0, #%d", wr, wr, bo);
@@ -848,7 +960,10 @@ static void gen_expr(Node *node) {
       // Return the truncated (and sign-extended) value that was actually stored.
       // x10 holds the original unmasked value; mask it to bw bits.
       if (node->lhs->member->ty->is_unsigned || node->lhs->member->ty->kind == TY_ENUM) {
-        println("and x0, x10, #%llu", (unsigned long long)((1ULL << bw) - 1));
+        if (bw < 64)
+          println("and x0, x10, #%llu", (unsigned long long)((1ULL << bw) - 1));
+        else
+          println("mov x0, x10");
       } else {
         // Signed: mask then sign-extend via shift left + arithmetic shift right
         int shift = 64 - bw;
@@ -895,14 +1010,28 @@ static void gen_expr(Node *node) {
     }
 
     println("mov x2, #0");
-    for (int i = 0; i < sz; i += 8) {
-      if (i + 8 <= sz)
-        println("str x2, [x1, #%d]", i);
-      else {
-        for (int j = i; j < sz; j++)
-          println("strb w2, [x1, #%d]", j);
-        break;
+    int zeroed = 0;
+    int zoff = 0;
+    while (zeroed + 8 <= sz) {
+      if (zoff + 8 > 32760) {
+        // Advance base pointer to keep offsets in range for str x
+        println("add x1, x1, #%d", zoff);
+        zoff = 0;
       }
+      println("str x2, [x1, #%d]", zoff);
+      zoff += 8;
+      zeroed += 8;
+    }
+    // Handle remaining bytes (< 8)
+    while (zeroed < sz) {
+      if (zoff >= 4096) {
+        // Advance base pointer to keep offsets in range for strb
+        println("add x1, x1, #%d", zoff);
+        zoff = 0;
+      }
+      println("strb w2, [x1, #%d]", zoff);
+      zoff++;
+      zeroed++;
     }
     return;
   }
