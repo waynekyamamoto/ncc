@@ -789,7 +789,7 @@ static Token *subst(Token *tok, MacroArg *args) {
       continue;
     }
 
-    // x##y (token pasting)
+    // x##y (token pasting), with support for chained A##B##C##D
     if (equal(tok->next, "##")) {
       MacroArg *arg = find_arg(args, tok);
       if (arg) {
@@ -806,18 +806,26 @@ static Token *subst(Token *tok, MacroArg *args) {
         tok = tok->next->next; // skip tok and ##
       }
 
-      // Now paste with what follows ##
-      MacroArg *rhs = find_arg(args, tok);
-      if (rhs) {
-        if (rhs->tok->kind != TK_EOF) {
-          *cur = *paste(cur, rhs->tok);
-          for (Token *t = rhs->tok->next; t->kind != TK_EOF; t = t->next)
-            cur = cur->next = copy_token(t);
+      // Now paste with what follows ##, and keep pasting for chains
+      for (;;) {
+        MacroArg *rhs = find_arg(args, tok);
+        if (rhs) {
+          if (rhs->tok->kind != TK_EOF) {
+            *cur = *paste(cur, rhs->tok);
+            for (Token *t = rhs->tok->next; t->kind != TK_EOF; t = t->next)
+              cur = cur->next = copy_token(t);
+          }
+          tok = tok->next;
+        } else {
+          *cur = *paste(cur, tok);
+          tok = tok->next;
         }
-        tok = tok->next;
-      } else {
-        *cur = *paste(cur, tok);
-        tok = tok->next;
+        // If next is another ##, continue pasting
+        if (equal(tok, "##")) {
+          tok = tok->next; // skip ##
+          continue;
+        }
+        break;
       }
       continue;
     }
@@ -1126,6 +1134,7 @@ void init_macros(void) {
 
   define_macro("__alignof__", "_Alignof");
   define_macro("__const__", "const");
+  define_macro("__const", "const");
   define_macro("__inline__", "inline");
   define_macro("__inline", "inline");
   define_macro("__uint128_t", "unsigned long");  // simplified: treat as 64-bit
@@ -1136,9 +1145,14 @@ void init_macros(void) {
   define_macro("__volatile", "volatile");
   define_macro("__attribute", "__attribute__");
   define_macro("__signed__", "signed");
+  define_macro("__signed", "signed");
   define_macro("__restrict__", "restrict");
   define_macro("__restrict", "restrict");
   define_macro("__extension__", "");
+  define_macro("__complex", "_Complex");
+  define_macro("__real", "__real__");
+  define_macro("__imag", "__imag__");
+  define_macro("__asm", "asm");
   define_macro("__builtin_va_list", "void *");
 
   // Builtin function-like macros

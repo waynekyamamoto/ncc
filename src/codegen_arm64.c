@@ -187,6 +187,31 @@ static void store(Type *ty) {
   case TY_UNION:
   case TY_COMPLEX: {
     // Copy struct/complex from x0 (src addr) to x1 (dst addr)
+
+    // For structs with VLA members, use a runtime-sized copy loop
+    if (ty->vla_size && (ty->kind == TY_STRUCT || ty->kind == TY_UNION)) {
+      int size_off = -ty->vla_size->offset;
+      if (size_off <= 4095)
+        println("sub x3, x29, #%d", size_off);
+      else {
+        load_imm("x3", (uint64_t)size_off);
+        println("sub x3, x29, x3");
+      }
+      println("ldr x3, [x3]");  // x3 = runtime byte count
+      // Runtime byte-copy loop: copy x3 bytes from [x0] to [x1]
+      int c = label_cnt++;
+      println("mov x4, #0");                      // x4 = offset
+      printlabel(".L.vla.copy.%d:", c);
+      println("cmp x4, x3");
+      println("b.ge .L.vla.copy.end.%d", c);
+      println("ldrb w5, [x0, x4]");
+      println("strb w5, [x1, x4]");
+      println("add x4, x4, #1");
+      println("b .L.vla.copy.%d", c);
+      printlabel(".L.vla.copy.end.%d:", c);
+      return;
+    }
+
     // Use 8-byte copies for bulk, then byte copies for the tail.
     // For large structs, periodically advance base pointers to keep
     // offsets within ARM64 immediate range (strb: 0-4095, str x: 0-32760).
@@ -315,6 +340,12 @@ static void gen_addr(Node *node) {
           load_imm("x0", (uint64_t)node->var->offset);
           println("add x0, x29, x0");
         }
+      }
+      // For struct/union with VLA members: the frame slot stores a pointer
+      // to the dynamically allocated struct. Load it to get the actual address.
+      if ((node->var->ty->kind == TY_STRUCT || node->var->ty->kind == TY_UNION) &&
+          node->var->ty->vla_size) {
+        println("ldr x0, [x0]");
       }
     } else if (!node->var->is_definition) {
       // External variable: use GOT for PIC on macOS
@@ -784,14 +815,17 @@ static void gen_expr(Node *node) {
 
   case ND_VLA_PTR: {
     // VLA stack allocation:
-    // 1. If saved_sp is non-zero, restore sp from it (re-allocation via goto)
-    // 2. Save current sp to saved_sp
-    // 3. Load the byte size, round up, subtract from sp
-    // 4. Store the new sp as the VLA base address
+    // 1. Load the byte size, round up, subtract from sp
+    // 2. Store the new sp as the VLA base address
+    //
+    // If a saved_sp variable is available (node->lhs), use it
+    // for deallocation on re-entry (e.g., goto loops):
+    //   - Restore sp from saved_sp if non-zero
+    //   - Save current sp to saved_sp before allocating
     Obj *var = node->var;
     Obj *size_var = var->ty->vla_size;
 
-    // Step 1: Restore sp from saved_sp if available (handles goto re-allocation)
+    // Deallocation support: restore/save sp via saved_sp
     if (node->lhs && node->lhs->var) {
       Obj *saved_sp = node->lhs->var;
       int sp_off = -saved_sp->offset;
@@ -803,17 +837,14 @@ static void gen_expr(Node *node) {
       }
       println("ldr x10, [x9]");
       println("cbz x10, .L.vla.skip.%d", label_cnt);
-      // Restore sp to saved value (dealloc previous VLA)
       println("mov sp, x10");
       printlabel(".L.vla.skip.%d:", label_cnt);
       label_cnt++;
-
-      // Step 2: Save current sp
       println("mov x10, sp");
       println("str x10, [x9]");
     }
 
-    // Step 3: Load byte size from the hidden variable
+    // Load byte size
     int size_off = -size_var->offset;
     if (size_off <= 4095)
       println("sub x0, x29, #%d", size_off);
@@ -830,7 +861,7 @@ static void gen_expr(Node *node) {
     // Subtract from sp to allocate
     println("sub sp, sp, x0");
 
-    // Step 4: Store the new sp as the VLA base address
+    // Store the new sp as the VLA base address
     println("mov x0, sp");
     int var_off = -var->offset;
     if (var_off <= 4095)
@@ -1733,6 +1764,29 @@ static void emit_text(Obj *prog) {
       else {
         load_imm("x9", (uint64_t)fn->stack_size);
         println("sub sp, sp, x9");
+      }
+
+      // Check if function has VLA declarations (including structs with VLA members)
+      bool has_vla = false;
+      for (Obj *v = fn->locals; v; v = v->next)
+        if (v->ty->kind == TY_VLA || v->ty->vla_size) { has_vla = true; break; }
+
+      // Zero-initialize the stack frame when VLAs are present.
+      // This ensures VLA saved_sp variables start at zero so the
+      // first-time check (cbz) works correctly.
+      if (has_vla) {
+        int remaining = fn->stack_size;
+        int off = 0;
+        while (remaining >= 16) {
+          println("stp xzr, xzr, [sp, #%d]", off);
+          off += 16;
+          remaining -= 16;
+        }
+        if (remaining >= 8) {
+          println("str xzr, [sp, #%d]", off);
+          off += 8;
+          remaining -= 8;
+        }
       }
     }
 
