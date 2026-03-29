@@ -2286,8 +2286,15 @@ static Node *unary(Token **rest, Token *tok) {
     }
     Node *node = unary(&tok, tok->next);
     add_type(node);
-    if (node->ty->vla_size)
+    // For VLA variables, check the original type (before VLA-to-pointer decay)
+    if (node->kind == ND_VAR && node->var->ty->vla_size) {
+      *rest = tok;
+      return new_var_node(node->var->ty->vla_size, tok);
+    }
+    if (node->ty->vla_size) {
+      *rest = tok;
       return new_var_node(node->ty->vla_size, tok);
+    }
     *rest = tok;
     return new_ulong(node->ty->size, tok);
   }
@@ -3390,12 +3397,14 @@ static Node *declaration(Token **rest, Token *tok, Type *basety, VarAttr *attr) 
       continue;
     }
 
-    if (ty->kind == TY_VLA) {
-      // VLA variable declaration:
-      // 1. Compute and store byte size in hidden variable
-      Node *vla_stmt = compute_vla_size(ty, ty->name);
-      if (vla_stmt)
-        cur = cur->next = vla_stmt;
+    if (ty->kind == TY_VLA || (ty->vla_size && (ty->kind == TY_STRUCT || ty->kind == TY_UNION))) {
+      // VLA or struct/union with VLA members: dynamic stack allocation
+      // 1. Compute and store byte size in hidden variable (if not already done)
+      if (!ty->vla_size) {
+        Node *vla_stmt = compute_vla_size(ty, ty->name);
+        if (vla_stmt)
+          cur = cur->next = vla_stmt;
+      }
 
       // 2. Create a hidden variable to save sp before allocation.
       //    This allows deallocation when the VLA goes out of scope
