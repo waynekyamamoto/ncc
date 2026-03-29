@@ -42,9 +42,9 @@ Requires clang and macOS command line tools for linking.
 | Suite | Pass Rate | Details |
 |-------|-----------|---------|
 | Compliance | 15/15 (100%) | Basic C feature tests |
-| GCC Torture | 852/995 (85.6%) | GCC execute test suite |
+| GCC Torture | 861/995 (86.5%) | GCC execute test suite |
 | DOOM | Compiles and runs | doomgeneric port with graphics, sound, music |
-| SQLite | Compiles, queries work | SELECT queries pass; CREATE TABLE has a known issue |
+| SQLite | Compiles and works | CREATE TABLE, INSERT, SELECT, JOIN all pass |
 | Lua | 30/33 files compile | Minor preprocessor gaps remain |
 | Self-hosting | Yes | ncc can compile itself |
 
