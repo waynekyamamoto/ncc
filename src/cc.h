@@ -212,6 +212,8 @@ typedef enum {
   ND_BUILTIN_CLRSB,    // __builtin_clrsb
   ND_BUILTIN_PARITY,   // __builtin_parity
   ND_BUILTIN_ALLOCA,   // __builtin_alloca / alloca
+  ND_REAL,             // __real__ (extract real part of complex)
+  ND_IMAG,             // __imag__ (extract imaginary part of complex)
 } NodeKind;
 
 // AST node
@@ -357,6 +359,7 @@ typedef enum {
   TY_FLOAT,
   TY_DOUBLE,
   TY_LDOUBLE,
+  TY_COMPLEX,   // _Complex
   TY_ENUM,
   TY_PTR,
   TY_FUNC,
@@ -422,6 +425,7 @@ extern Type *ty_ldouble;
 bool is_integer(Type *ty);
 bool is_flonum(Type *ty);
 bool is_numeric(Type *ty);
+bool is_complex(Type *ty);
 bool is_compatible(Type *t1, Type *t2);
 Type *copy_type(Type *ty);
 Type *pointer_to(Type *base);
@@ -430,6 +434,7 @@ Type *array_of(Type *base, int len);
 Type *vla_of(Type *base, Node *len);
 Type *enum_type(void);
 Type *struct_type(void);
+Type *complex_type(Type *base);
 void add_type(Node *node);
 
 //

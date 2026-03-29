@@ -1021,10 +1021,25 @@ void init_macros(void) {
   define_macro("__UINTMAX_TYPE__", "unsigned long");
 
   define_macro("__CHAR_BIT__", "8");
+  define_macro("__SCHAR_MAX__", "127");
+  define_macro("__SHRT_MAX__", "32767");
   define_macro("__INT_MAX__", "2147483647");
   define_macro("__LONG_MAX__", "9223372036854775807L");
   define_macro("__LONG_LONG_MAX__", "9223372036854775807LL");
-  define_macro("__SHRT_MAX__", "32767");
+  define_macro("__INT8_MAX__", "127");
+  define_macro("__INT16_MAX__", "32767");
+  define_macro("__INT32_MAX__", "2147483647");
+  define_macro("__INT64_MAX__", "9223372036854775807LL");
+  define_macro("__UINT8_MAX__", "255");
+  define_macro("__UINT16_MAX__", "65535");
+  define_macro("__UINT32_MAX__", "4294967295U");
+  define_macro("__UINT64_MAX__", "18446744073709551615ULL");
+  define_macro("__SIZE_MAX__", "18446744073709551615UL");
+  define_macro("__INTMAX_MAX__", "9223372036854775807L");
+  define_macro("__UINTMAX_MAX__", "18446744073709551615UL");
+  define_macro("__PTRDIFF_MAX__", "9223372036854775807L");
+  define_macro("__INTPTR_MAX__", "9223372036854775807L");
+  define_macro("__UINTPTR_MAX__", "18446744073709551615UL");
 
   // Float/double builtin constants
   define_macro("__FLT_MIN__", "1.17549435e-38F");

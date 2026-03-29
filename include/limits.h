@@ -31,4 +31,13 @@
 // Include the system limits.h for additional definitions like PATH_MAX
 #include_next <limits.h>
 
+// Re-assert our correctly-typed definitions (system headers may use
+// untyped hex literals like 0xffffffff instead of 4294967295U)
+#undef UINT_MAX
+#define UINT_MAX 4294967295U
+#undef ULONG_MAX
+#define ULONG_MAX 18446744073709551615UL
+#undef ULLONG_MAX
+#define ULLONG_MAX 18446744073709551615ULL
+
 #endif

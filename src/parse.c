@@ -1319,6 +1319,11 @@ static int64_t eval2(Node *node, char ***label) {
     if (!label)
       error_tok(node->tok, "not a compile-time constant");
     return eval_rval(node->lhs, label) + node->member->offset;
+  case ND_LABEL_VAL:
+    if (!label)
+      error_tok(node->tok, "not a compile-time constant");
+    *label = &node->unique_label;
+    return 0;
   default:
     error_tok(node->tok, "not a compile-time constant");
   }
@@ -1734,6 +1739,19 @@ static Node *unary(Token **rest, Token *tok) {
   if (equal(tok, "&&")) {
     Node *node = new_node(ND_LABEL_VAL, tok);
     node->label = strndup_checked(tok->next->loc, tok->next->len);
+    // Check if we already have a unique_label for this label name
+    // (can happen when initializer is parsed twice, e.g., for flexible arrays).
+    // All ND_LABEL_VAL nodes for the same label must share the same unique_label.
+    char *shared_label = NULL;
+    for (Node *g = gotos; g; g = g->goto_next) {
+      if (g->kind == ND_LABEL_VAL && !strcmp(g->label, node->label)) {
+        shared_label = g->unique_label;
+        break;
+      }
+    }
+    // Use a non-temporary symbol name (no ".L" prefix) so it survives
+    // Mach-O linking when referenced from data sections.
+    node->unique_label = shared_label ? shared_label : format("L_cg_%d", label_cnt++);
     node->goto_next = gotos;
     gotos = node;
     *rest = tok->next->next;
@@ -3532,8 +3550,25 @@ static Token *function(Token *tok, Type *fn_ty, VarAttr *attr) {
   // Parse function body — tok points at "{"
   fn->body = compound_stmt(&tok, tok);
 
-  // Resolve goto labels
+  // Resolve goto labels.
+  // First pass: handle ND_LABEL_VAL nodes, which have pre-assigned
+  // unique_labels needed for static initializer relocations.
+  // The label statement adopts the ND_LABEL_VAL's name.
   for (Node *g = gotos; g; g = g->goto_next) {
+    if (g->kind != ND_LABEL_VAL)
+      continue;
+    for (Node *l = labels; l; l = l->goto_next) {
+      if (!strcmp(g->label, l->label)) {
+        l->unique_label = g->unique_label;
+        break;
+      }
+    }
+  }
+  // Second pass: handle ND_GOTO nodes (and ND_LABEL_VAL nodes that
+  // didn't find a label yet — though they don't error).
+  for (Node *g = gotos; g; g = g->goto_next) {
+    if (g->kind == ND_LABEL_VAL)
+      continue;
     for (Node *l = labels; l; l = l->goto_next) {
       if (!strcmp(g->label, l->label)) {
         g->unique_label = l->unique_label;

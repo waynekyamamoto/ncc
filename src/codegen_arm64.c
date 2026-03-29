@@ -1450,8 +1450,14 @@ static void emit_data(Obj *prog) {
         }
 
         if (rel) {
-          // Emit a pointer relocation
-          println(".quad _%s+%ld", *rel->label, rel->addend);
+          // Emit a pointer relocation.
+          // Computed goto labels (L_cg_) don't get _ prefix; they are
+          // code labels defined without the Mach-O underscore convention.
+          char *sym = *rel->label;
+          if (!strncmp(sym, "L_cg_", 5))
+            println(".quad %s+%ld", sym, rel->addend);
+          else
+            println(".quad _%s+%ld", sym, rel->addend);
           i += 7; // skip 8 bytes
         } else {
           println(".byte %d", (unsigned char)var->init_data[i]);
