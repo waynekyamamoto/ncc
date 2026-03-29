@@ -827,8 +827,15 @@ static Token *subst(Token *tok, MacroArg *args) {
     if (arg) {
       // Check if next is ##
       Token *expanded = preprocess2(copy_token_list(arg->tok));
-      for (Token *t = expanded; t->kind != TK_EOF; t = t->next)
+      bool first = true;
+      for (Token *t = expanded; t->kind != TK_EOF; t = t->next) {
         cur = cur->next = copy_token(t);
+        // First token inherits spacing from the parameter token in the body
+        if (first) {
+          cur->has_space = tok->has_space;
+          first = false;
+        }
+      }
       tok = tok->next;
       continue;
     }

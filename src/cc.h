@@ -294,6 +294,7 @@ struct Obj {
   bool is_tls;        // thread-local storage
   bool is_inline;
   char *init_data;     // Initial data for globals
+  int init_data_size;  // Size of init_data (may exceed ty->size for flexible array members)
   Relocation *rel;     // Relocations for initial data
   char *section;       // Section name
   char *visibility;    // Visibility

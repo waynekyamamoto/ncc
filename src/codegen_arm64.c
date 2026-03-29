@@ -845,7 +845,16 @@ static void gen_expr(Node *node) {
       else if (sz == 4) println("str w2, [x1]");
       else println("str x2, [x1]");
 
-      println("mov x0, x10"); // return the assigned value
+      // Return the truncated (and sign-extended) value that was actually stored.
+      // x10 holds the original unmasked value; mask it to bw bits.
+      if (node->lhs->member->ty->is_unsigned || node->lhs->member->ty->kind == TY_ENUM) {
+        println("and x0, x10, #%llu", (unsigned long long)((1ULL << bw) - 1));
+      } else {
+        // Signed: mask then sign-extend via shift left + arithmetic shift right
+        int shift = 64 - bw;
+        println("lsl x0, x10, #%d", shift);
+        println("asr x0, x0, #%d", shift);
+      }
       return;
     }
 
@@ -1493,7 +1502,7 @@ static void emit_data(Obj *prog) {
   for (Obj *var = prog; var; var = var->next) {
     if (var->is_function || !var->is_definition)
       continue;
-    if (var->ty->size < 0 || var->ty->size == 0)
+    if (var->ty->size < 0 || (var->ty->size == 0 && !var->init_data_size))
       continue; // incomplete type, skip
     if (hashmap_get(&emitted, var->name))
       continue; // already emitted
@@ -1521,8 +1530,9 @@ static void emit_data(Obj *prog) {
     printlabel("_%s:", var->name);
 
     if (var->init_data) {
-      // Emit initialized data
-      for (int i = 0; i < var->ty->size; i++) {
+      // Emit initialized data (use init_data_size for flexible array members)
+      int data_size = var->init_data_size ? var->init_data_size : var->ty->size;
+      for (int i = 0; i < data_size; i++) {
         // Check for relocations at this offset
         Relocation *rel = NULL;
         for (Relocation *r = var->rel; r; r = r->next) {

@@ -320,7 +320,7 @@ static Type *enum_specifier(Token **rest, Token *tok);
 static void struct_members(Token **rest, Token *tok, Type *ty);
 static Node *declaration(Token **rest, Token *tok, Type *basety, VarAttr *attr);
 static Token *function(Token *tok, Type *basety, VarAttr *attr);
-static Token *global_variable(Token *tok, Type *basety, VarAttr *attr);
+static Token *global_variable(Token *tok, Type *ty, Type *basety, VarAttr *attr);
 static int64_t const_expr_val(Token **rest, Token *tok);
 static int64_t eval(Node *node);
 static int64_t eval2(Node *node, char ***label);
@@ -2073,12 +2073,26 @@ static Node *unary(Token **rest, Token *tok) {
   }
 
   // Pre-increment: ++i → i += 1
-  if (equal(tok, "++"))
-    return to_assign(new_add(unary(rest, tok->next), new_num(1, tok), tok));
+  if (equal(tok, "++")) {
+    Node *operand = unary(rest, tok->next);
+    add_type(operand);
+    if (operand->kind == ND_MEMBER && operand->member && operand->member->is_bitfield) {
+      // Bitfield: lhs = lhs + 1 (no pointer indirection)
+      return new_binary(ND_ASSIGN, operand, new_add(operand, new_num(1, tok), tok), tok);
+    }
+    return to_assign(new_add(operand, new_num(1, tok), tok));
+  }
 
   // Pre-decrement: --i → i -= 1
-  if (equal(tok, "--"))
-    return to_assign(new_sub(unary(rest, tok->next), new_num(1, tok), tok));
+  if (equal(tok, "--")) {
+    Node *operand = unary(rest, tok->next);
+    add_type(operand);
+    if (operand->kind == ND_MEMBER && operand->member && operand->member->is_bitfield) {
+      // Bitfield: lhs = lhs - 1 (no pointer indirection)
+      return new_binary(ND_ASSIGN, operand, new_sub(operand, new_num(1, tok), tok), tok);
+    }
+    return to_assign(new_sub(operand, new_num(1, tok), tok));
+  }
 
   // &&label (GNU extension, for computed goto)
   if (equal(tok, "&&")) {
@@ -2322,6 +2336,19 @@ static Node *postfix(Token **rest, Token *tok) {
 
 static Node *new_inc_dec(Node *node, Token *tok, int addend) {
   add_type(node);
+
+  // Bitfield: avoid pointer indirection which loses bitfield metadata.
+  // Generate: (old = bf, bf = bf + addend, old)
+  if (node->kind == ND_MEMBER && node->member && node->member->is_bitfield) {
+    Node *old_val = new_var_node(new_lvar("", node->ty), tok);
+    Node *save_old = new_binary(ND_ASSIGN, old_val, node, tok);
+    Node *inc = new_binary(ND_ASSIGN, node,
+      new_add(node, new_num(addend, tok), tok), tok);
+    return new_binary(ND_COMMA, save_old,
+      new_binary(ND_COMMA, inc,
+        new_var_node(old_val->var, tok), tok), tok);
+  }
+
   Node *tmp = new_binary(ND_ASSIGN,
     new_var_node(new_lvar("", pointer_to(node->ty)), tok),
     new_unary(ND_ADDR, node, tok), tok);
@@ -2739,10 +2766,28 @@ static Node *funcall(Token **rest, Token *tok, Node *fn) {
                           !strcmp(fn, "scanf") || !strcmp(fn, "sscanf");
     func_ty = func_type(ty_int);
     if (known_variadic) {
-      // First param is named (format string), rest are variadic
-      Type *p = copy_type(pointer_to(ty_char));
-      p->next = NULL;
-      func_ty->params = p;
+      // Create named parameters for the non-variadic portion.
+      // printf/scanf: 1 named param (format)
+      // fprintf/sprintf/sscanf: 2 named params (dest/stream, format)
+      // snprintf: 3 named params (buf, size, format)
+      bool two_named = !strcmp(fn, "fprintf") || !strcmp(fn, "sprintf") ||
+                       !strcmp(fn, "sscanf");
+      bool three_named = !strcmp(fn, "snprintf");
+      Type *p1 = copy_type(pointer_to(ty_char));
+      p1->next = NULL;
+      func_ty->params = p1;
+      if (two_named) {
+        Type *p2 = copy_type(pointer_to(ty_char));
+        p2->next = NULL;
+        p1->next = p2;
+      } else if (three_named) {
+        Type *p2 = copy_type(ty_ulong);
+        p2->next = NULL;
+        p1->next = p2;
+        Type *p3 = copy_type(pointer_to(ty_char));
+        p3->next = NULL;
+        p2->next = p3;
+      }
       func_ty->is_variadic = true;
     } else {
       func_ty->is_variadic = false;
@@ -3241,6 +3286,10 @@ static Initializer *new_initializer(Type *ty, bool is_flexible) {
       init->is_flexible = true;
       return init;
     }
+    if (is_flexible && ty->array_len == 0) {
+      init->is_flexible = true;
+      return init;
+    }
     init->children = calloc_checked(ty->array_len, sizeof(Initializer *));
     for (int i = 0; i < ty->array_len; i++)
       init->children[i] = new_initializer(ty->base, false);
@@ -3254,8 +3303,12 @@ static Initializer *new_initializer(Type *ty, bool is_flexible) {
 
     init->children = calloc_checked(len, sizeof(Initializer *));
     int i = 0;
-    for (Member *mem = ty->members; mem; mem = mem->next)
-      init->children[i++] = new_initializer(mem->ty, false);
+    for (Member *mem = ty->members; mem; mem = mem->next) {
+      // Propagate is_flexible to the last member if the struct has a
+      // flexible array member, so that the initializer can resize it.
+      bool flex = is_flexible && ty->is_flexible && !mem->next;
+      init->children[i++] = new_initializer(mem->ty, flex);
+    }
     return init;
   }
 
@@ -3335,17 +3388,35 @@ static void initializer2(Token **rest, Token *tok, Initializer *init) {
 }
 
 static void string_initializer(Token **rest, Token *tok, Initializer *init) {
-  if (init->is_flexible) {
-    *init = *new_initializer(array_of(init->ty->base, tok->ty->array_len), false);
+  // Handle adjacent string literal concatenation: "abc" "def" → "abcdef"
+  char *str = tok->str;
+  int str_len = tok->ty->array_len; // includes null terminator
+  Token *start = tok;
+  tok = tok->next;
+
+  while (tok->kind == TK_STR) {
+    int add_len = tok->ty->array_len - 1; // exclude null
+    int new_len = str_len - 1 + add_len + 1;
+    char *buf = calloc_checked(1, new_len);
+    memcpy(buf, str, str_len - 1);
+    memcpy(buf + str_len - 1, tok->str, add_len);
+    buf[new_len - 1] = '\0';
+    str = buf;
+    str_len = new_len;
+    tok = tok->next;
   }
 
-  int len = (init->ty->array_len < tok->ty->array_len) ?
-            init->ty->array_len : tok->ty->array_len;
+  if (init->is_flexible) {
+    *init = *new_initializer(array_of(init->ty->base, str_len), false);
+  }
+
+  int len = (init->ty->array_len < str_len) ?
+            init->ty->array_len : str_len;
 
   for (int i = 0; i < len; i++) {
-    init->children[i]->expr = new_num(tok->str[i], tok);
+    init->children[i]->expr = new_num(str[i], start);
   }
-  *rest = tok->next;
+  *rest = tok;
 }
 
 static void array_initializer1(Token **rest, Token *tok, Initializer *init) {
@@ -3664,15 +3735,41 @@ static void gvar_initializer(Token **rest, Token *tok, Obj *var) {
     var->ty = init->ty;
   }
 
+  // For structs with flexible array members, compute the total allocation
+  // size including the flexible array data.  The struct's ty->size only
+  // covers the fixed part; the flexible member's initializer knows the
+  // actual element count after initializer2() resolved it.
+  int alloc_size = var->ty->size;
+  if (var->ty->kind == TY_STRUCT && var->ty->is_flexible) {
+    // Find the last member (the flexible array) and its initializer
+    int idx = 0;
+    Member *last = NULL;
+    for (Member *mem = var->ty->members; mem; mem = mem->next) {
+      if (!mem->next) last = mem;
+      idx++;
+    }
+    if (last && idx > 0) {
+      Initializer *flex_init = init->children[idx - 1];
+      if (flex_init->ty && flex_init->ty->kind == TY_ARRAY &&
+          flex_init->ty->size > last->ty->size) {
+        alloc_size = last->offset + flex_init->ty->size;
+      }
+    }
+  }
+
   // Allocate data buffer
   Relocation head = {};
   var->rel = &head;
 
-  char *buf = calloc_checked(1, var->ty->size);
+  char *buf = calloc_checked(1, alloc_size);
   Relocation *rel_tail = &head;
   write_gvar_data(init, var->ty, buf, 0, &rel_tail);
   var->init_data = buf;
   var->rel = head.next;
+
+  // Update var's init_data_size so emit_data emits all bytes
+  // (including the flexible array data beyond ty->size)
+  var->init_data_size = alloc_size;
 }
 
 static void write_gvar_data(Initializer *init, Type *ty, char *buf, int offset, Relocation **rel_tail) {
@@ -3704,7 +3801,13 @@ static void write_gvar_data(Initializer *init, Type *ty, char *buf, int offset, 
         cur |= (bits << bo);
         memcpy(buf + byte_off, &cur, sz);
       } else {
-        write_gvar_data(init->children[i], mem->ty, buf, offset + mem->offset, rel_tail);
+        // For flexible array members, use the initializer's resolved type
+        // which has the actual array length after initialization.
+        Type *mem_ty = mem->ty;
+        if (!mem->next && ty->is_flexible && init->children[i]->ty &&
+            init->children[i]->ty->kind == TY_ARRAY)
+          mem_ty = init->children[i]->ty;
+        write_gvar_data(init->children[i], mem_ty, buf, offset + mem->offset, rel_tail);
       }
     }
     return;
@@ -3873,7 +3976,7 @@ Obj *parse(Token *tok) {
     }
 
     // Global variable
-    tok = global_variable(tok, ty, &attr);
+    tok = global_variable(tok, ty, basety, &attr);
   }
 
   leave_scope();
@@ -4016,14 +4119,14 @@ static Token *function(Token *tok, Type *fn_ty, VarAttr *attr) {
   return tok;
 }
 
-static Token *global_variable(Token *tok, Type *ty, VarAttr *attr) {
+static Token *global_variable(Token *tok, Type *ty, Type *basety, VarAttr *attr) {
   // ty already has the first declarator parsed (name, type suffix, etc.)
+  // basety is the original base type from declspec (before array/pointer suffixes)
   // tok points to what follows the first declarator (=, ;, or ,)
 
   for (bool first = true; ; first = false) {
     if (!first) {
-      // Parse additional declarators after comma
-      Type *basety = ty; // reuse base type
+      // Parse additional declarators after comma, using the original base type
       ty = declarator(&tok, tok, basety);
     }
 
