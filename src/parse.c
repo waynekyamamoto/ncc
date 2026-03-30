@@ -659,6 +659,7 @@ static Node *lvar_initializer(Token **rest, Token *tok, Obj *var);
 static Node *to_assign(Node *binary);
 static Node *new_add(Node *lhs, Node *rhs, Token *tok);
 static Node *new_sub(Node *lhs, Node *rhs, Token *tok);
+static Node *new_vec_or_binary(NodeKind kind, Node *lhs, Node *rhs, Token *tok);
 static Node *new_inc_dec(Node *node, Token *tok, int addend);
 static Token *parse_typedef(Token *tok, Type *basety, Node **cur);
 static bool is_function_definition(Token *tok, Type *basety);
@@ -1412,9 +1413,15 @@ static Token *attribute_list(Token *tok, Type *ty, VarAttr *attr) {
         if (attr) attr->vector_size = vs;
         // If ty is provided directly (e.g. from typedef), convert it to vector type
         if (ty && ty->kind != TY_VECTOR && ty->size > 0) {
-          Type *vec = vector_of(ty, vs);
-          // Copy vector info back into ty so the caller sees the change
+          // Copy the base type to avoid self-reference when we overwrite *ty
+          Type *base_copy = copy_type(ty);
+          Type *vec = vector_of(base_copy, vs);
+          // Preserve name and name_pos from original type
+          Token *saved_name = ty->name;
+          Token *saved_name_pos = ty->name_pos;
           *ty = *vec;
+          ty->name = saved_name;
+          ty->name_pos = saved_name_pos;
         }
       } else if (equal(tok, "format") || equal(tok, "__format__") ||
                  equal(tok, "sentinel") || equal(tok, "alloc_size") ||
@@ -1982,6 +1989,18 @@ static Node *assign(Token **rest, Token *tok) {
           val = new_complex_div(node, rhs, optok);
         else
           error_tok(optok, "invalid complex compound assignment");
+        return new_binary(ND_ASSIGN, node, val, optok);
+      }
+
+      // Vector compound assignment: x op= y -> x = x op y
+      if (node->ty->kind == TY_VECTOR) {
+        Node *val;
+        if (is_add_sub && op == ND_ADD)
+          val = new_add(node, rhs, optok);
+        else if (is_add_sub && op == ND_SUB)
+          val = new_sub(node, rhs, optok);
+        else
+          val = new_vec_or_binary(op, node, rhs, optok);
         return new_binary(ND_ASSIGN, node, val, optok);
       }
 
@@ -2722,7 +2741,7 @@ static Node *postfix(Token **rest, Token *tok) {
           Node *arg = assign(&tok, tok);
           add_type(arg);
           if (param_ty) {
-            if (param_ty->kind != TY_STRUCT && param_ty->kind != TY_UNION)
+            if (param_ty->kind != TY_STRUCT && param_ty->kind != TY_UNION && param_ty->kind != TY_VECTOR)
               arg = new_cast(arg, param_ty);
             param_ty = param_ty->next;
           } else if (arg->ty->kind == TY_FLOAT) {
@@ -3333,7 +3352,7 @@ static Node *funcall(Token **rest, Token *tok, Node *fn) {
 
     if (param_ty) {
       // Type-check against parameter
-      if (param_ty->kind != TY_STRUCT && param_ty->kind != TY_UNION)
+      if (param_ty->kind != TY_STRUCT && param_ty->kind != TY_UNION && param_ty->kind != TY_VECTOR)
         arg = new_cast(arg, param_ty);
       param_ty = param_ty->next;
     } else if (arg->ty->kind == TY_FLOAT) {
@@ -3970,6 +3989,13 @@ static Initializer *new_initializer(Type *ty, bool is_flexible) {
     return init;
   }
 
+  if (ty->kind == TY_VECTOR) {
+    init->children = calloc_checked(ty->array_len, sizeof(Initializer *));
+    for (int i = 0; i < ty->array_len; i++)
+      init->children[i] = new_initializer(ty->base, false);
+    return init;
+  }
+
   if (ty->kind == TY_STRUCT || ty->kind == TY_UNION) {
     int len = 0;
     for (Member *mem = ty->members; mem; mem = mem->next)
@@ -4009,6 +4035,28 @@ static void initializer2(Token **rest, Token *tok, Initializer *init) {
       array_initializer1(rest, tok, init);
     } else {
       array_initializer1(rest, tok, init);
+    }
+    return;
+  }
+
+  if (init->ty->kind == TY_VECTOR) {
+    // Vector initializer: { elem0, elem1, ... }
+    // Treat like array initializer but with vector element count
+    if (equal(tok, "{")) {
+      array_initializer1(rest, tok, init);
+    } else {
+      // Vector can be initialized with a single expression of same vector type
+      Node *expr_node = assign(&tok, tok);
+      add_type(expr_node);
+      if (expr_node->ty->kind == TY_VECTOR) {
+        init->expr = expr_node;
+        *rest = tok;
+        return;
+      }
+      // Otherwise, broadcast scalar to all elements
+      for (int i = 0; i < init->ty->array_len; i++)
+        init->children[i]->expr = expr_node;
+      *rest = tok;
     }
     return;
   }
@@ -4340,6 +4388,31 @@ static Node *create_lvar_init(Initializer *init, Type *ty, InitDesig *desig, Tok
     return head.next;
   }
 
+  if (ty->kind == TY_VECTOR) {
+    // Vector initializer: handle like an array but use pointer-based element access
+    if (init->expr) {
+      Node *lhs = init_desig_expr(desig, tok);
+      return new_binary(ND_ASSIGN, lhs, init->expr, tok);
+    }
+    Node head = {};
+    Node *cur = &head;
+    for (int i = 0; i < ty->array_len; i++) {
+      if (!init->children[i]->expr)
+        continue;
+      // Access element: ((elem_type *)&vec)[i] = expr
+      Node *vec_node = init_desig_expr(desig, tok);
+      Type *elem_ty = ty->base;
+      Node *addr = new_unary(ND_ADDR, vec_node, tok);
+      Node *ptr = new_cast(addr, pointer_to(elem_ty));
+      Node *elem_addr = new_binary(ND_ADD, ptr, new_binary(ND_MUL, new_num(i, tok), new_long(elem_ty->size, tok), tok), tok);
+      Node *elem_deref = new_unary(ND_DEREF, elem_addr, tok);
+      Node *n = new_binary(ND_ASSIGN, elem_deref, init->children[i]->expr, tok);
+      cur->next = n;
+      while (cur->next) cur = cur->next;
+    }
+    return head.next;
+  }
+
   if (ty->kind == TY_STRUCT) {
     // If the entire struct is initialized from a single expression (e.g., s->d),
     // generate a struct assignment instead of per-member init
@@ -4517,6 +4590,13 @@ static void gvar_initializer(Token **rest, Token *tok, Obj *var) {
 
 static void write_gvar_data(Initializer *init, Type *ty, char *buf, int offset, Relocation **rel_tail) {
   if (ty->kind == TY_ARRAY) {
+    for (int i = 0; i < ty->array_len; i++)
+      write_gvar_data(init->children[i], ty->base, buf, offset + ty->base->size * i, rel_tail);
+    return;
+  }
+
+  if (ty->kind == TY_VECTOR) {
+    // Vector: like array, write each element
     for (int i = 0; i < ty->array_len; i++)
       write_gvar_data(init->children[i], ty->base, buf, offset + ty->base->size * i, rel_tail);
     return;
@@ -5015,6 +5095,75 @@ static Token *nested_function(Token *tok, Type *fn_ty, VarAttr *attr, Node **cur
 
   CapturedVar *my_captures = captured_vars;
 
+  // Rebuild the locals chain so capture pointers are positioned as parameters.
+  // Current locals chain: cap_ptrs -> body_locals -> alloca_bottom -> params -> NULL
+  // We need: body_locals -> alloca_bottom -> params -> cap_ptrs -> NULL
+  // This way cap_ptrs are adjacent to params and can be appended to fn->params.
+  if (my_captures) {
+    // Collect all nodes into categories
+    int ncaps = 0;
+    for (CapturedVar *cv = my_captures; cv; cv = cv->next) ncaps++;
+
+    // Remove capture pointers from the locals chain and re-insert after params
+    // First, build a set of capture pointer Objs
+    Obj **cap_objs = calloc_checked(ncaps, sizeof(Obj *));
+    { int ci = 0; for (CapturedVar *cv = my_captures; cv; cv = cv->next) cap_objs[ci++] = cv->inner_ptr; }
+
+    // Collect all locals into an array, excluding captures
+    int nlocals = 0;
+    for (Obj *v = locals; v; v = v->next) nlocals++;
+    Obj **all_locals = calloc_checked(nlocals, sizeof(Obj *));
+    { int li = 0; for (Obj *v = locals; v; v = v->next) all_locals[li++] = v; }
+
+    // Rebuild: non-capture locals first, then captures at the end
+    Obj *new_head = NULL;
+    Obj *new_tail = NULL;
+    for (int li = 0; li < nlocals; li++) {
+      bool is_cap = false;
+      for (int ci = 0; ci < ncaps; ci++)
+        if (all_locals[li] == cap_objs[ci]) { is_cap = true; break; }
+      if (is_cap) continue;
+      all_locals[li]->next = NULL;
+      if (!new_head) new_head = all_locals[li];
+      else new_tail->next = all_locals[li];
+      new_tail = all_locals[li];
+    }
+    // Append captures (in the order they appear in CapturedVar list)
+    for (int ci = 0; ci < ncaps; ci++) {
+      cap_objs[ci]->next = NULL;
+      if (!new_head) new_head = cap_objs[ci];
+      else new_tail->next = cap_objs[ci];
+      new_tail = cap_objs[ci];
+    }
+
+    locals = new_head;
+
+    // Now find the last regular param and append captures to fn->params
+    Obj *last_param = NULL;
+    for (Obj *p = fn->params; p; p = p->next)
+      last_param = p;
+
+    // The captures are now at the end of the locals chain, right after param_0
+    // Set fn->params to include captures: last_param already points to param_0
+    // We need param_0->next to point to first capture
+    if (last_param) {
+      // last_param is param_0 (the last in fn->params order)
+      // Find param_0 (the one with next==NULL in the original params chain)
+      Obj *param_0 = NULL;
+      for (Obj *p = fn->params; p; p = p->next)
+        param_0 = p;
+      // param_0->next should now point to first capture (they are right after in locals)
+      // Since we rebuilt locals with captures at the end, param_0->next == cap_objs[0]
+      // (if they are adjacent in the chain). Let's verify and fix.
+      param_0->next = cap_objs[0];
+    } else {
+      fn->params = cap_objs[0];
+    }
+
+    free(cap_objs);
+    free(all_locals);
+  }
+
   for (Node *g = gotos; g; g = g->goto_next) {
     if (g->kind != ND_LABEL_VAL) continue;
     for (Node *l = labels; l; l = l->goto_next)
@@ -5092,13 +5241,3 @@ static Token *global_variable(Token *tok, Type *ty, Type *basety, VarAttr *attr)
   return tok;
 }
 
-// Stub: nested function support (not yet fully implemented)
-static Token *nested_function(Token *tok, Type *fn_ty, VarAttr *attr, Node **cur) {
-  (void)attr; (void)cur;
-  error_tok(fn_ty->name, "nested functions are not supported");
-  return tok; // unreachable
-}
-
-static void rewrite_nested_var_refs(Node *node, Obj *outer_fn) {
-  (void)node; (void)outer_fn;
-}
