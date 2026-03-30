@@ -4481,10 +4481,21 @@ static Node *init_desig_expr(InitDesig *desig, Token *tok) {
     return node;
   }
 
-  // Array element
+  // Array/vector element
+  Node *parent = init_desig_expr(desig->next, tok);
+  add_type(parent);
+  if (parent->ty->kind == TY_VECTOR) {
+    // Vector element access: use byte arithmetic to avoid triggering vector decomposition
+    Type *elem_ty = parent->ty->base;
+    Node *addr = new_unary(ND_ADDR, parent, tok);
+    Node *byte_ptr = new_cast(addr, pointer_to(ty_char));
+    Node *offset = new_num((int64_t)desig->idx * elem_ty->size, tok);
+    Node *elem_ptr = new_binary(ND_ADD, byte_ptr, offset, tok);
+    Node *typed_ptr = new_cast(elem_ptr, pointer_to(elem_ty));
+    return new_unary(ND_DEREF, typed_ptr, tok);
+  }
   Node *node = new_unary(ND_DEREF,
-    new_add(init_desig_expr(desig->next, tok),
-            new_num(desig->idx, tok), tok), tok);
+    new_add(parent, new_num(desig->idx, tok), tok), tok);
   return node;
 }
 
