@@ -1175,6 +1175,174 @@ static void gen_expr(Node *node) {
     println("mov x0, x29");
     return;
 
+  case ND_RETURN_ADDR: {
+    // __builtin_return_address(level)
+    // Level 0: return address of current function = [x29, #8]
+    // Level N: follow frame pointer chain N times, then read [fp, #8]
+    gen_expr(node->lhs);
+    int c = label_cnt++;
+    println("mov x1, x29"); // start from current frame
+    println("cbz x0, .L.ra.done.%d", c);
+    printlabel(".L.ra.loop.%d:", c);
+    println("ldr x1, [x1]"); // follow frame pointer chain
+    println("sub x0, x0, #1");
+    println("cbnz x0, .L.ra.loop.%d", c);
+    printlabel(".L.ra.done.%d:", c);
+    println("ldr x0, [x1, #8]"); // return address is at fp+8
+    return;
+  }
+
+  case ND_BUILTIN_FRAME_ADDR: {
+    // __builtin_frame_address(level)
+    // Level 0: x29
+    // Level N: follow frame pointer chain N times
+    gen_expr(node->lhs);
+    int c = label_cnt++;
+    println("mov x1, x29");
+    println("cbz x0, .L.fa.done.%d", c);
+    printlabel(".L.fa.loop.%d:", c);
+    println("ldr x1, [x1]"); // follow frame pointer chain
+    println("sub x0, x0, #1");
+    println("cbnz x0, .L.fa.loop.%d", c);
+    printlabel(".L.fa.done.%d:", c);
+    println("mov x0, x1");
+    return;
+  }
+
+  case ND_BUILTIN_SETJMP: {
+    // __builtin_setjmp(buf):
+    // buf[0] = fp (x29)
+    // buf[1] = sp
+    // buf[2] = return point (address of label after setjmp)
+    // Returns 0 on first call, 1 on longjmp return
+    gen_expr(node->lhs);  // buf address in x0
+    println("str x29, [x0]");       // buf[0] = fp
+    println("mov x1, sp");
+    println("str x1, [x0, #8]");    // buf[1] = sp
+    int c = label_cnt++;
+    println("adr x1, .L.sjret.%d", c);
+    println("str x1, [x0, #16]");   // buf[2] = return label
+    println("mov x0, #0");          // first call returns 0
+    println("b .L.sjdone.%d", c);
+    printlabel(".L.sjret.%d:", c);
+    println("mov x0, #1");          // longjmp return returns 1
+    printlabel(".L.sjdone.%d:", c);
+    return;
+  }
+
+  case ND_BUILTIN_LONGJMP: {
+    // __builtin_longjmp(buf, val):
+    // Restore fp, sp, and jump to the return point
+    gen_expr(node->lhs);  // buf address in x0
+    println("ldr x29, [x0]");       // restore fp
+    println("ldr x1, [x0, #8]");    // restore sp
+    println("mov sp, x1");
+    println("ldr x1, [x0, #16]");   // return point
+    println("br x1");                // jump to return point
+    return;
+  }
+
+  case ND_BUILTIN_ADD_OVERFLOW:
+  case ND_BUILTIN_SUB_OVERFLOW:
+  case ND_BUILTIN_MUL_OVERFLOW: {
+    // Evaluate a and b
+    gen_expr(node->lhs);
+    push();  // push a (x0)
+    gen_expr(node->rhs);
+    println("mov x1, x0");
+    pop("x0");  // pop a into x0, b is in x1
+
+    Type *rty = node->overflow_ty;
+    bool is_unsigned = rty->is_unsigned;
+    int sz = rty->size;
+
+    if (node->kind == ND_BUILTIN_ADD_OVERFLOW) {
+      if (is_unsigned) {
+        if (sz <= 4) {
+          println("add w2, w0, w1");   // result in w2
+          println("cmp w2, w0");       // if result < a, overflow
+          println("cset w3, lo");      // overflow flag
+        } else {
+          println("adds x2, x0, x1");
+          println("cset w3, cs");
+        }
+      } else {
+        if (sz <= 4) {
+          println("adds w2, w0, w1");
+          println("cset w3, vs");
+        } else {
+          println("adds x2, x0, x1");
+          println("cset w3, vs");
+        }
+      }
+    } else if (node->kind == ND_BUILTIN_SUB_OVERFLOW) {
+      if (is_unsigned) {
+        if (sz <= 4) {
+          println("subs w2, w0, w1");
+          println("cset w3, lo");
+        } else {
+          println("subs x2, x0, x1");
+          println("cset w3, lo");
+        }
+      } else {
+        if (sz <= 4) {
+          println("subs w2, w0, w1");
+          println("cset w3, vs");
+        } else {
+          println("subs x2, x0, x1");
+          println("cset w3, vs");
+        }
+      }
+    } else { // MUL
+      if (is_unsigned) {
+        if (sz <= 4) {
+          println("umull x2, w0, w1");
+          println("lsr x4, x2, #32");
+          println("cmp x4, #0");
+          println("cset w3, ne");
+        } else {
+          println("umulh x4, x0, x1");
+          println("mul x2, x0, x1");
+          println("cmp x4, #0");
+          println("cset w3, ne");
+        }
+      } else {
+        if (sz <= 4) {
+          println("smull x2, w0, w1");
+          println("cmp x2, w2, sxtw");
+          println("cset w3, ne");
+        } else {
+          println("mul x2, x0, x1");
+          println("smulh x4, x0, x1");
+          println("cmp x4, x2, asr #63");
+          println("cset w3, ne");
+        }
+      }
+    }
+
+    // Store result if result pointer is provided (non-_p variant)
+    if (node->args) {
+      // Save result and overflow flag, then evaluate the result pointer
+      println("stp x2, x3, [sp, #-16]!");
+      depth++;
+      gen_expr(node->args);
+      // x0 = result_ptr, restore x2=result, x3=overflow
+      println("ldp x2, x3, [sp], #16");
+      depth--;
+      // Store w2/x2 to [x0]
+      switch (sz) {
+      case 1: println("strb w2, [x0]"); break;
+      case 2: println("strh w2, [x0]"); break;
+      case 4: println("str w2, [x0]"); break;
+      case 8: println("str x2, [x0]"); break;
+      }
+      println("mov w0, w3");
+    } else {
+      println("mov w0, w3");
+    }
+    return;
+  }
+
   case ND_CHAIN_VAR:
     gen_addr(node);
     load(node->ty);
@@ -1871,13 +2039,21 @@ static void emit_data(Obj *prog) {
   for (Obj *var = prog; var; var = var->next) {
     if (var->is_function || !var->is_definition)
       continue;
-    if (var->ty->size < 0 || (var->ty->size == 0 && !var->init_data_size))
+    if (var->ty->size < 0)
       continue; // incomplete type, skip
     if (hashmap_get(&emitted, var->name))
       continue; // already emitted
     if (var->is_tentative && (var->ty->kind == TY_FUNC || (var->name[0] == '_' && var->name[1] == '_')))
       continue; // skip tentative system variables
     hashmap_put(&emitted, var->name, (void *)1);
+
+    // Alias: emit .set directive
+    if (var->alias_target) {
+      if (!var->is_static)
+        println(".globl _%s", var->name);
+      println(".set _%s, _%s", var->name, var->alias_target);
+      continue;
+    }
 
     // Section
     if (var->init_data) {
@@ -1943,18 +2119,21 @@ static void emit_text(Obj *prog) {
       continue;
     if (hashmap_get(&emitted_fns, fn->name))
       continue;
-    // Skip inline functions from system headers (names starting with __)
-    // Skip inline functions from headers — they get emitted in every TU
-    if (fn->is_inline && !fn->is_static)
-      continue;
+    // Emit non-static inline functions as weak definitions so that
+    // the linker can deduplicate if the same inline appears in multiple TUs.
+    // (This handles both gnu89-inline and C99 inline semantics for single-TU builds.)
     hashmap_put(&emitted_fns, fn->name, (void *)1);
 
     // Skip static inline functions that aren't used
     // (simplified — emit all for now)
 
     printlabel(".section __TEXT,__text");
-    if (!fn->is_static)
+    if (!fn->is_static) {
+      if (fn->is_inline) {
+        println(".weak_definition _%s", fn->name);
+      }
       println(".globl _%s", fn->name);
+    }
     println(".p2align 2");
     printlabel("_%s:", fn->name);
 

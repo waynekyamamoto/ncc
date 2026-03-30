@@ -470,6 +470,7 @@ typedef struct {
   bool is_noreturn;
   int align;
   int vector_size;  // __attribute__((vector_size(N)))
+  char *alias_target; // __attribute__((alias("name")))
 } VarAttr;
 
 // Helper: check if a type (or any of its members) contains a VLA
@@ -910,6 +911,18 @@ static Type *declspec(Token **rest, Token *tok, VarAttr *attr) {
     case COMPLEX + SIGNED + LONG + INT:   ty = complex_type(ty_long); break;
     case COMPLEX + UNSIGNED + LONG:
     case COMPLEX + UNSIGNED + LONG + INT: ty = complex_type(ty_ulong); break;
+    case COMPLEX + LONG + LONG:
+    case COMPLEX + LONG + LONG + INT:
+    case COMPLEX + SIGNED + LONG + LONG:
+    case COMPLEX + SIGNED + LONG + LONG + INT: ty = complex_type(ty_longlong); break;
+    case COMPLEX + UNSIGNED + LONG + LONG:
+    case COMPLEX + UNSIGNED + LONG + LONG + INT: ty = complex_type(ty_ulonglong); break;
+    case COMPLEX + SHORT:
+    case COMPLEX + SHORT + INT:
+    case COMPLEX + SIGNED + SHORT:
+    case COMPLEX + SIGNED + SHORT + INT:  ty = complex_type(ty_short); break;
+    case COMPLEX + UNSIGNED + SHORT:
+    case COMPLEX + UNSIGNED + SHORT + INT: ty = complex_type(ty_ushort); break;
     case COMPLEX + CHAR:
     case COMPLEX + SIGNED + CHAR:         ty = complex_type(ty_char); break;
     case COMPLEX + UNSIGNED + CHAR:       ty = complex_type(ty_uchar); break;
@@ -971,6 +984,10 @@ static Type *func_params(Token **rest, Token *tok, Type *ty) {
     return func_type(ty);
   }
 
+  // Enter a scope so that VLA dimensions in later parameters
+  // can reference earlier parameter names (e.g. int array[i++]).
+  enter_scope();
+
   Type head = {};
   Type *cur = &head;
   bool is_variadic = false;
@@ -994,8 +1011,18 @@ static Type *func_params(Token **rest, Token *tok, Type *ty) {
 
     Token *name = ty2->name;
 
+    // Push named parameter into scope so later VLA params can reference it
+    if (name && name->len > 0) {
+      char *pname = strndup_checked(name->loc, name->len);
+      Obj *dummy = calloc_checked(1, sizeof(Obj));
+      dummy->name = pname;
+      dummy->ty = ty2;
+      dummy->is_local = true;
+      push_scope(pname)->var = dummy;
+    }
+
     // Array parameters decay to pointers
-    if (ty2->kind == TY_ARRAY) {
+    if (ty2->kind == TY_ARRAY || ty2->kind == TY_VLA) {
       ty2 = pointer_to(ty2->base);
       ty2->name = name;
     }
@@ -1009,6 +1036,8 @@ static Type *func_params(Token **rest, Token *tok, Type *ty) {
     param->next = NULL;
     cur = cur->next = param;
   }
+
+  leave_scope();
 
   if (cur == &head)
     is_variadic = true; // f() = f(...) effectively
@@ -1115,6 +1144,15 @@ static Type *declarator(Token **rest, Token *tok, Type *ty) {
       Type *inner = declarator(&tok, tok, placeholder);
       tok = skip(tok, ")");
       *placeholder = *type_suffix(rest, tok, ty);
+      // Fix up sizes in the type chain from inner down to placeholder.
+      // Array sizes were computed when placeholder was empty (size=0),
+      // so we need to recompute them now that placeholder is filled.
+      for (Type *t = inner; t && t != placeholder; t = t->base) {
+        if (t->kind == TY_ARRAY && t->base) {
+          t->size = t->base->size * t->array_len;
+          t->align = t->base->align;
+        }
+      }
       return inner;
     }
   }
@@ -1405,6 +1443,15 @@ static Token *attribute_list(Token *tok, Type *ty, VarAttr *attr) {
           }
           tok = tok->next;
         }
+      } else if (equal(tok, "alias") || equal(tok, "__alias__")) {
+        tok = tok->next;
+        tok = skip(tok, "(");
+        if (tok->kind == TK_STR) {
+          if (attr)
+            attr->alias_target = strndup_checked(tok->str, tok->ty->array_len - 1);
+          tok = tok->next;
+        }
+        tok = skip(tok, ")");
       } else if (equal(tok, "vector_size") || equal(tok, "__vector_size__")) {
         tok = tok->next;
         tok = skip(tok, "(");
@@ -1693,6 +1740,8 @@ static int64_t const_expr_val(Token **rest, Token *tok) {
   return eval(node);
 }
 
+static void eval_complex(Node *node, double *re, double *im);
+
 static int64_t eval(Node *node) {
   return eval2(node, NULL);
 }
@@ -1769,6 +1818,20 @@ static int64_t eval2(Node *node, char ***label) {
   }
   case ND_NUM:
     return node->val;
+  case ND_REAL:
+    if (is_complex(node->lhs->ty)) {
+      double re, im;
+      eval_complex(node->lhs, &re, &im);
+      return (int64_t)re;
+    }
+    return eval(node->lhs);
+  case ND_IMAG:
+    if (is_complex(node->lhs->ty)) {
+      double re, im;
+      eval_complex(node->lhs, &re, &im);
+      return (int64_t)im;
+    }
+    return 0;
   case ND_ADDR:
     return eval_rval(node->lhs, label);
   case ND_VAR:
@@ -3131,6 +3194,238 @@ static Node *primary(Token **rest, Token *tok) {
     return new_binary(ND_COMMA, store, ternary, start);
   }
 
+  // __builtin_add_overflow / __builtin_sub_overflow / __builtin_mul_overflow
+  if (equal(tok, "__builtin_add_overflow") ||
+      equal(tok, "__builtin_sub_overflow") ||
+      equal(tok, "__builtin_mul_overflow") ||
+      equal(tok, "__builtin_sadd_overflow") ||
+      equal(tok, "__builtin_uadd_overflow") ||
+      equal(tok, "__builtin_ssub_overflow") ||
+      equal(tok, "__builtin_usub_overflow") ||
+      equal(tok, "__builtin_smul_overflow") ||
+      equal(tok, "__builtin_umul_overflow") ||
+      equal(tok, "__builtin_saddl_overflow") ||
+      equal(tok, "__builtin_uaddl_overflow") ||
+      equal(tok, "__builtin_ssubl_overflow") ||
+      equal(tok, "__builtin_usubl_overflow") ||
+      equal(tok, "__builtin_smull_overflow") ||
+      equal(tok, "__builtin_umull_overflow") ||
+      equal(tok, "__builtin_saddll_overflow") ||
+      equal(tok, "__builtin_uaddll_overflow") ||
+      equal(tok, "__builtin_ssubll_overflow") ||
+      equal(tok, "__builtin_usubll_overflow") ||
+      equal(tok, "__builtin_smulll_overflow") ||
+      equal(tok, "__builtin_umulll_overflow")) {
+    Token *start = tok;
+    NodeKind kind;
+    // Determine operation from token name (use bounded string matching)
+    char name_buf[64] = {};
+    int len = start->len < 63 ? start->len : 63;
+    memcpy(name_buf, start->loc, len);
+    if (strstr(name_buf, "add"))
+      kind = ND_BUILTIN_ADD_OVERFLOW;
+    else if (strstr(name_buf, "sub"))
+      kind = ND_BUILTIN_SUB_OVERFLOW;
+    else
+      kind = ND_BUILTIN_MUL_OVERFLOW;
+    tok = skip(tok->next, "(");
+    Node *a = assign(&tok, tok);
+    tok = skip(tok, ",");
+    Node *b = assign(&tok, tok);
+    tok = skip(tok, ",");
+    Node *result_ptr = assign(&tok, tok);
+    *rest = skip(tok, ")");
+    add_type(a);
+    add_type(b);
+    add_type(result_ptr);
+    Node *node = new_node(kind, start);
+    node->lhs = a;
+    node->rhs = b;
+    node->args = result_ptr;
+    // Determine result type from the pointer's target type
+    Type *result_ty = result_ptr->ty;
+    if (result_ty->base)
+      result_ty = result_ty->base;
+    node->overflow_ty = result_ty;
+    node->ty = ty_int;
+    return node;
+  }
+
+  // __builtin_mul_overflow_p(a, b, type_val) — returns 1 if overflow
+  if (equal(tok, "__builtin_add_overflow_p") ||
+      equal(tok, "__builtin_sub_overflow_p") ||
+      equal(tok, "__builtin_mul_overflow_p")) {
+    Token *start = tok;
+    NodeKind kind;
+    char name_buf2[64] = {};
+    int len2 = start->len < 63 ? start->len : 63;
+    memcpy(name_buf2, start->loc, len2);
+    if (strstr(name_buf2, "add"))
+      kind = ND_BUILTIN_ADD_OVERFLOW;
+    else if (strstr(name_buf2, "sub"))
+      kind = ND_BUILTIN_SUB_OVERFLOW;
+    else
+      kind = ND_BUILTIN_MUL_OVERFLOW;
+    tok = skip(tok->next, "(");
+    Node *a = assign(&tok, tok);
+    tok = skip(tok, ",");
+    Node *b = assign(&tok, tok);
+    tok = skip(tok, ",");
+    Node *type_val = assign(&tok, tok);
+    *rest = skip(tok, ")");
+    add_type(a);
+    add_type(b);
+    add_type(type_val);
+    Node *node = new_node(kind, start);
+    node->lhs = a;
+    node->rhs = b;
+    node->args = NULL;  // NULL means no result pointer (_p variant)
+    node->overflow_ty = type_val->ty;
+    node->ty = ty_int;
+    return node;
+  }
+
+  // __builtin_constant_p(x) — returns 1 if x is a compile-time constant
+  if (equal(tok, "__builtin_constant_p")) {
+    tok = skip(tok->next, "(");
+    Node *arg = assign(&tok, tok);
+    *rest = skip(tok, ")");
+    add_type(arg);
+    // Check if the argument is a compile-time constant
+    // Walk the tree: if it only contains ND_NUM, ND_CAST, arithmetic ops,
+    // and string literals, it's constant.
+    bool is_const = true;
+    Node *stack[64];
+    int sp = 0;
+    stack[sp++] = arg;
+    while (sp > 0 && is_const) {
+      Node *n = stack[--sp];
+      if (!n) continue;
+      switch (n->kind) {
+      case ND_NUM:
+        break; // constant
+      case ND_VAR:
+        // String literals are constants (global, not local, with string data)
+        if (n->var && !n->var->is_local && n->var->init_data &&
+            n->ty && n->ty->kind == TY_ARRAY && n->ty->base && n->ty->base->kind == TY_CHAR)
+          break; // string literal
+        is_const = false;
+        break;
+      case ND_CAST:
+      case ND_NEG:
+      case ND_NOT:
+      case ND_BITNOT:
+        if (sp < 63 && n->lhs) stack[sp++] = n->lhs;
+        break;
+      case ND_ADD: case ND_SUB: case ND_MUL: case ND_DIV: case ND_MOD:
+      case ND_BITAND: case ND_BITOR: case ND_BITXOR:
+      case ND_SHL: case ND_SHR:
+      case ND_EQ: case ND_NE: case ND_LT: case ND_LE:
+      case ND_LOGAND: case ND_LOGOR:
+      case ND_COMMA:
+        if (sp < 62) {
+          if (n->lhs) stack[sp++] = n->lhs;
+          if (n->rhs) stack[sp++] = n->rhs;
+        }
+        break;
+      case ND_COND:
+        if (sp < 61) {
+          if (n->cond) stack[sp++] = n->cond;
+          if (n->then) stack[sp++] = n->then;
+          if (n->els) stack[sp++] = n->els;
+        }
+        break;
+      case ND_MEMBER:
+      case ND_DEREF:
+        if (sp < 63 && n->lhs) stack[sp++] = n->lhs;
+        break;
+      default:
+        is_const = false;
+        break;
+      }
+    }
+    return new_num(is_const ? 1 : 0, tok);
+  }
+
+  // __builtin_setjmp(buf) — lightweight setjmp
+  if (equal(tok, "__builtin_setjmp")) {
+    tok = skip(tok->next, "(");
+    Node *buf = assign(&tok, tok);
+    *rest = skip(tok, ")");
+    Node *node = new_unary(ND_BUILTIN_SETJMP, buf, tok);
+    node->ty = ty_int;
+    return node;
+  }
+
+  // __builtin_longjmp(buf, val) — lightweight longjmp
+  if (equal(tok, "__builtin_longjmp")) {
+    tok = skip(tok->next, "(");
+    Node *buf = assign(&tok, tok);
+    tok = skip(tok, ",");
+    Node *val = assign(&tok, tok);
+    *rest = skip(tok, ")");
+    Node *node = new_binary(ND_BUILTIN_LONGJMP, buf, val, tok);
+    node->ty = ty_void;
+    return node;
+  }
+
+  // __builtin_conjf/conj/conjl(z) — complex conjugate
+  if (equal(tok, "__builtin_conjf") || equal(tok, "__builtin_conj") ||
+      equal(tok, "__builtin_conjl")) {
+    Token *start = tok;
+    tok = skip(tok->next, "(");
+    Node *arg = assign(&tok, tok);
+    *rest = skip(tok, ")");
+    add_type(arg);
+    // result = real(arg) - imag(arg)*i
+    Type *cty = arg->ty;
+    if (!is_complex(cty))
+      cty = complex_type(ty_double);
+    Node *re = new_real(arg, start);
+    Node *im = new_imag(arg, start);
+    Node *neg_im = new_unary(ND_NEG, im, start);
+    add_type(neg_im);
+    return new_complex_val(re, neg_im, cty, start);
+  }
+
+  // __builtin_creal/crealf/creall/cimag/cimagf/cimagl
+  if (equal(tok, "__builtin_creal") || equal(tok, "__builtin_crealf") ||
+      equal(tok, "__builtin_creall")) {
+    tok = skip(tok->next, "(");
+    Node *arg = assign(&tok, tok);
+    *rest = skip(tok, ")");
+    add_type(arg);
+    return new_real(arg, tok);
+  }
+  if (equal(tok, "__builtin_cimag") || equal(tok, "__builtin_cimagf") ||
+      equal(tok, "__builtin_cimagl")) {
+    tok = skip(tok->next, "(");
+    Node *arg = assign(&tok, tok);
+    *rest = skip(tok, ")");
+    add_type(arg);
+    return new_imag(arg, tok);
+  }
+
+  // __builtin_return_address(level) — return address of current/caller function
+  if (equal(tok, "__builtin_return_address")) {
+    tok = skip(tok->next, "(");
+    Node *arg = assign(&tok, tok);
+    *rest = skip(tok, ")");
+    Node *node = new_unary(ND_RETURN_ADDR, arg, tok);
+    node->ty = pointer_to(ty_void);
+    return node;
+  }
+
+  // __builtin_frame_address(level) — frame address of current/caller function
+  if (equal(tok, "__builtin_frame_address")) {
+    tok = skip(tok->next, "(");
+    Node *arg = assign(&tok, tok);
+    *rest = skip(tok, ")");
+    Node *node = new_unary(ND_BUILTIN_FRAME_ADDR, arg, tok);
+    node->ty = pointer_to(ty_void);
+    return node;
+  }
+
   // __builtin_classify_type(x) — return integer classification
   if (equal(tok, "__builtin_classify_type")) {
     tok = skip(tok->next, "(");
@@ -3432,6 +3727,24 @@ static Node *stmt(Token **rest, Token *tok) {
     if (consume(&tok, tok, "else"))
       node->els = stmt(&tok, tok);
     *rest = tok;
+
+    // Dead code elimination: if condition is a compile-time constant,
+    // replace the dead branch with an empty statement.
+    // Only do this when NOT inside a switch, because case labels inside
+    // if(0){} are still reachable via the switch.
+    add_type(node->cond);
+    if (!current_switch && node->cond->kind == ND_NUM && is_integer(node->cond->ty)) {
+      if (node->cond->val == 0) {
+        // if (0) — then branch is dead
+        if (node->els)
+          return node->els;  // only else
+        return new_node(ND_BLOCK, tok); // empty block
+      } else {
+        // if (nonzero) — else branch is dead
+        return node->then;
+      }
+    }
+
     return node;
   }
 
@@ -4230,7 +4543,7 @@ static void struct_initializer1(Token **rest, Token *tok, Initializer *init) {
   Member *mem = init->ty->members;
   int i = 0;
 
-  while (mem && !is_end(tok)) {
+  while (!is_end(tok)) {
     if (i++ > 0) {
       tok = skip(tok, ",");
       if (is_end(tok)) break; // trailing comma
@@ -4276,6 +4589,10 @@ static void struct_initializer1(Token **rest, Token *tok, Initializer *init) {
       mem = mem->next;
       continue;
     }
+
+    // Non-designated initializer: need a current member
+    if (!mem)
+      break;
 
     int idx = 0;
     Member *m2 = init->ty->members;
@@ -4692,7 +5009,13 @@ static void write_gvar_data(Initializer *init, Type *ty, char *buf, int offset, 
       // Integer complex
       int64_t vr = eval(re);
       int64_t vi = eval(im);
-      if (base->size <= 4) {
+      if (base->size == 1) {
+        *(int8_t *)(buf + offset) = vr;
+        *(int8_t *)(buf + offset + 1) = vi;
+      } else if (base->size == 2) {
+        *(int16_t *)(buf + offset) = vr;
+        *(int16_t *)(buf + offset + 2) = vi;
+      } else if (base->size <= 4) {
         *(int32_t *)(buf + offset) = vr;
         *(int32_t *)(buf + offset + 4) = vi;
       } else {
@@ -4875,9 +5198,11 @@ static Token *function(Token *tok, Type *fn_ty, VarAttr *attr) {
   }
 
   for (int i = nparams - 1; i >= 0; i--) {
-    if (!param_arr[i]->name)
-      error_tok(fn_ty->name, "parameter name omitted");
-    char *pname = strndup_checked(param_arr[i]->name->loc, param_arr[i]->name->len);
+    char *pname;
+    if (!param_arr[i]->name || param_arr[i]->name->len == 0)
+      pname = new_unique_name();  // unnamed parameter - generate unique name
+    else
+      pname = strndup_checked(param_arr[i]->name->loc, param_arr[i]->name->len);
     new_lvar(pname, param_arr[i]);
   }
   free(param_arr);
@@ -4939,6 +5264,7 @@ static Token *function(Token *tok, Type *fn_ty, VarAttr *attr) {
 
   // Parse function body — tok points at "{"
   fn->body = compound_stmt(&tok, tok);
+
 
   // Resolve goto labels.
   // First pass: handle ND_LABEL_VAL nodes, which have pre-assigned
@@ -5135,6 +5461,11 @@ static Token *global_variable(Token *tok, Type *ty, Type *basety, VarAttr *attr)
       var->is_definition = false;
 
     tok = attribute_list(tok, ty, attr);
+
+    if (attr->alias_target) {
+      var->alias_target = attr->alias_target;
+      var->is_definition = true;
+    }
 
     if (equal(tok, "=")) {
       var->is_definition = true; // has initializer → is definition even if extern

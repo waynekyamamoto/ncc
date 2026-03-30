@@ -393,13 +393,17 @@ void add_type(Node *node) {
         return;
       }
     }
-    error_tok(node->tok, "statement expression returning void is not supported");
+    node->ty = ty_void;
     return;
   case ND_LABEL_VAL:
     node->ty = pointer_to(ty_void);
     return;
   case ND_FRAME_ADDR:
     node->ty = pointer_to(ty_char);
+    return;
+  case ND_RETURN_ADDR:
+  case ND_BUILTIN_FRAME_ADDR:
+    node->ty = pointer_to(ty_void);
     return;
   case ND_TRAMPOLINE:
     return;

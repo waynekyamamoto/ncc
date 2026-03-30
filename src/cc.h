@@ -216,6 +216,13 @@ typedef enum {
   ND_IMAG,             // __imag__ (extract imaginary part of complex)
   ND_CHAIN_VAR,        // access outer variable via static chain pointer
   ND_FRAME_ADDR,       // current function's frame pointer (x29)
+  ND_RETURN_ADDR,      // __builtin_return_address(level)
+  ND_BUILTIN_FRAME_ADDR, // __builtin_frame_address(level)
+  ND_BUILTIN_ADD_OVERFLOW, // __builtin_add_overflow(a, b, result_ptr)
+  ND_BUILTIN_SUB_OVERFLOW, // __builtin_sub_overflow(a, b, result_ptr)
+  ND_BUILTIN_MUL_OVERFLOW, // __builtin_mul_overflow(a, b, result_ptr)
+  ND_BUILTIN_SETJMP,    // __builtin_setjmp(buf)
+  ND_BUILTIN_LONGJMP,   // __builtin_longjmp(buf, val)
   ND_TRAMPOLINE,       // create trampoline for nested function
 } NodeKind;
 
@@ -268,6 +275,9 @@ struct Node {
   int64_t val;
   long double fval;
 
+  // Overflow builtins
+  Type *overflow_ty;
+
   // Inline assembly
   char *asm_str;
   // Asm operands: arrays of constraint/expression pairs
@@ -310,6 +320,7 @@ struct Obj {
   Relocation *rel;     // Relocations for initial data
   char *section;       // Section name
   char *visibility;    // Visibility
+  char *alias_target;  // alias attribute target name
 
   // Function body
   Obj *params;

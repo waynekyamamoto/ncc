@@ -430,13 +430,25 @@ static Token *read_number(char *start) {
   // Parse suffix
   Type *ty = int_suffix_type(endptr, &p);
 
+  // Check for imaginary suffix on integer literal (e.g. 200i)
+  bool int_imag = false;
+  if (*p == 'i' || *p == 'I') {
+    int_imag = true;
+    p++;
+  }
+
   // Promote to a wider type if needed
   if (ty == ty_int && val > INT_MAX)
     ty = ty_long;
   if (ty == ty_long && val > LONG_MAX)
     ty = ty_longlong;
 
-  tok->ty = ty;
+  if (int_imag) {
+    tok->fval = (long double)val;
+    tok->ty = complex_type(ty);
+  } else {
+    tok->ty = ty;
+  }
   tok->len = p - start;
   return tok;
 }
