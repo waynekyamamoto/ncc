@@ -3365,15 +3365,18 @@ static Node *funcall(Token **rest, Token *tok, Node *fn) {
 
   *rest = skip(tok, ")");
 
-  // For nested function direct calls: append captured variable addresses
+  // For nested function direct calls: pass chain pointer as last argument
   bool is_nested_call = vs && vs->var && vs->var->is_nested;
   if (is_nested_call) {
-    CapturedVar *caps = (CapturedVar *)(void *)vs->var->chain_param;
-    for (CapturedVar *cv = caps; cv; cv = cv->next) {
-      Node *addr = new_unary(ND_ADDR, new_var_node(cv->outer_var, start), start);
-      add_type(addr);
-      cur = cur->next = addr;
+    Node *chain_arg;
+    if (current_fn->is_nested && current_fn->chain_param) {
+      chain_arg = new_var_node(current_fn->chain_param, start);
+    } else {
+      chain_arg = new_node(ND_FRAME_ADDR, start);
+      chain_arg->ty = pointer_to(ty_char);
     }
+    add_type(chain_arg);
+    cur = cur->next = chain_arg;
   }
 
   Node *node = new_node(ND_FUNCALL, start);
@@ -4980,20 +4983,6 @@ static bool is_in_locals(Obj *var, Obj *locals_list) {
   return false;
 }
 
-static CapturedVar *find_or_create_capture(Obj *outer_var) {
-  for (CapturedVar *cv = captured_vars; cv; cv = cv->next)
-    if (cv->outer_var == outer_var)
-      return cv;
-  char *ptr_name = format("__cap_%s__", outer_var->name);
-  Obj *inner_ptr = new_lvar(ptr_name, pointer_to(outer_var->ty));
-  CapturedVar *cv = calloc_checked(1, sizeof(CapturedVar));
-  cv->outer_var = outer_var;
-  cv->inner_ptr = inner_ptr;
-  cv->next = captured_vars;
-  captured_vars = cv;
-  return cv;
-}
-
 static void rewrite_nested_var_refs(Node *node, Obj *outer_fn) {
   if (!node) return;
   rewrite_nested_var_refs(node->lhs, outer_fn);
@@ -5015,24 +5004,23 @@ static void rewrite_nested_var_refs(Node *node, Obj *outer_fn) {
   rewrite_nested_var_refs(node->cas_old, outer_fn);
   rewrite_nested_var_refs(node->cas_new, outer_fn);
   if (node->kind == ND_VAR && node->var && node->var->is_local) {
-    if (is_in_locals(node->var, outer_fn->locals)) {
-      CapturedVar *cv = find_or_create_capture(node->var);
-      Node *ptr_node = new_var_node(cv->inner_ptr, node->tok);
-      node->kind = ND_DEREF;
-      node->lhs = ptr_node;
-      node->var = NULL;
-      add_type(node);
+    Obj *chain_var = outer_fn->chain_param;
+    if (chain_var && is_in_locals(node->var, outer_fn->locals)) {
+      Node *chain_node = new_var_node(chain_var, node->tok);
+      Obj *orig_var = node->var;
+      node->kind = ND_CHAIN_VAR;
+      node->lhs = chain_node;
+      node->var = orig_var;
+      node->ty = orig_var->ty;
     }
   }
 }
 
 static Token *nested_function(Token *tok, Type *fn_ty, VarAttr *attr, Node **cur) {
   (void)attr;
-  if (!fn_ty->name)
-    error_tok(tok, "nested function has no name");
+  if (!fn_ty->name) error_tok(tok, "nested function has no name");
   char *inner_name = strndup_checked(fn_ty->name->loc, fn_ty->name->len);
   char *mangled_name = format("%s.%s", current_fn->name, inner_name);
-
   Obj *saved_fn = current_fn;
   Obj *saved_locals = locals;
   Node *saved_gotos = gotos;
@@ -5040,8 +5028,6 @@ static Token *nested_function(Token *tok, Type *fn_ty, VarAttr *attr, Node **cur
   char *saved_brk = brk_label;
   char *saved_cont = cont_label;
   Node *saved_switch = current_switch;
-  CapturedVar *saved_captures = captured_vars;
-
   Obj *fn = new_gvar(mangled_name, fn_ty);
   fn->is_function = true;
   fn->is_definition = true;
@@ -5049,7 +5035,6 @@ static Token *nested_function(Token *tok, Type *fn_ty, VarAttr *attr, Node **cur
   fn->is_variadic = fn_ty->is_variadic;
   fn->is_nested = true;
   fn->enclosing_fn = saved_fn;
-
   current_fn = fn;
   locals = NULL;
   gotos = NULL;
@@ -5057,124 +5042,46 @@ static Token *nested_function(Token *tok, Type *fn_ty, VarAttr *attr, Node **cur
   brk_label = NULL;
   cont_label = NULL;
   current_switch = NULL;
-  captured_vars = NULL;
-
   enter_scope();
-
+  Obj *chain_var = new_lvar("__chain__", pointer_to(ty_char));
+  fn->chain_param = chain_var;
   Type *nf_param_ty = fn_ty->params;
   int nf_nparams = 0;
   for (Type *t = nf_param_ty; t; t = t->next) nf_nparams++;
-  Type **nf_param_arr = calloc_checked(nf_nparams, sizeof(Type *));
-  { int i = 0; for (Type *t = nf_param_ty; t; t = t->next) nf_param_arr[i++] = t; }
+  Type **nf_pa = calloc_checked(nf_nparams, sizeof(Type *));
+  { int i = 0; for (Type *t = nf_param_ty; t; t = t->next) nf_pa[i++] = t; }
   for (int i = nf_nparams - 1; i >= 0; i--) {
-    if (!nf_param_arr[i]->name)
-      error_tok(fn_ty->name, "parameter name omitted");
-    char *pname = strndup_checked(nf_param_arr[i]->name->loc, nf_param_arr[i]->name->len);
-    new_lvar(pname, nf_param_arr[i]);
+    if (!nf_pa[i]->name) error_tok(fn_ty->name, "parameter name omitted");
+    new_lvar(strndup_checked(nf_pa[i]->name->loc, nf_pa[i]->name->len), nf_pa[i]);
   }
-  free(nf_param_arr);
+  free(nf_pa);
   fn->params = locals;
-
   if (!equal(tok, "{")) {
     while (!equal(tok, "{")) {
-      Type *nf_basety = declspec(&tok, tok, NULL);
+      Type *nb = declspec(&tok, tok, NULL);
       bool first = true;
       while (!consume(&tok, tok, ";")) {
         if (!first) tok = skip(tok, ",");
         first = false;
-        Type *ty2 = declarator(&tok, tok, nf_basety);
+        Type *ty2 = declarator(&tok, tok, nb);
         if (!ty2->name) error_tok(tok, "parameter name omitted");
-        char *pname = strndup_checked(ty2->name->loc, ty2->name->len);
+        char *pn = strndup_checked(ty2->name->loc, ty2->name->len);
         for (Obj *p = fn->params; p; p = p->next)
-          if (!strcmp(p->name, pname)) { p->ty = ty2; p->align = ty2->align; break; }
+          if (!strcmp(p->name, pn)) { p->ty = ty2; p->align = ty2->align; break; }
       }
     }
   }
-
   if (fn_ty->is_variadic) {
     fn->va_area = new_lvar("__va_area__", pointer_to(ty_char));
     fn->va_area->align = 8;
   }
   fn->alloca_bottom = new_lvar("__alloca_bottom__", pointer_to(ty_char));
-
   fn->body = compound_stmt(&tok, tok);
-
   Obj temp_outer;
   memset(&temp_outer, 0, sizeof(temp_outer));
   temp_outer.locals = saved_locals;
+  temp_outer.chain_param = chain_var;
   rewrite_nested_var_refs(fn->body, &temp_outer);
-
-  CapturedVar *my_captures = captured_vars;
-
-  // Rebuild the locals chain so capture pointers are positioned as parameters.
-  // Current locals chain: cap_ptrs -> body_locals -> alloca_bottom -> params -> NULL
-  // We need: body_locals -> alloca_bottom -> params -> cap_ptrs -> NULL
-  // This way cap_ptrs are adjacent to params and can be appended to fn->params.
-  if (my_captures) {
-    // Collect all nodes into categories
-    int ncaps = 0;
-    for (CapturedVar *cv = my_captures; cv; cv = cv->next) ncaps++;
-
-    // Remove capture pointers from the locals chain and re-insert after params
-    // First, build a set of capture pointer Objs
-    Obj **cap_objs = calloc_checked(ncaps, sizeof(Obj *));
-    { int ci = 0; for (CapturedVar *cv = my_captures; cv; cv = cv->next) cap_objs[ci++] = cv->inner_ptr; }
-
-    // Collect all locals into an array, excluding captures
-    int nlocals = 0;
-    for (Obj *v = locals; v; v = v->next) nlocals++;
-    Obj **all_locals = calloc_checked(nlocals, sizeof(Obj *));
-    { int li = 0; for (Obj *v = locals; v; v = v->next) all_locals[li++] = v; }
-
-    // Rebuild: non-capture locals first, then captures at the end
-    Obj *new_head = NULL;
-    Obj *new_tail = NULL;
-    for (int li = 0; li < nlocals; li++) {
-      bool is_cap = false;
-      for (int ci = 0; ci < ncaps; ci++)
-        if (all_locals[li] == cap_objs[ci]) { is_cap = true; break; }
-      if (is_cap) continue;
-      all_locals[li]->next = NULL;
-      if (!new_head) new_head = all_locals[li];
-      else new_tail->next = all_locals[li];
-      new_tail = all_locals[li];
-    }
-    // Append captures (in the order they appear in CapturedVar list)
-    for (int ci = 0; ci < ncaps; ci++) {
-      cap_objs[ci]->next = NULL;
-      if (!new_head) new_head = cap_objs[ci];
-      else new_tail->next = cap_objs[ci];
-      new_tail = cap_objs[ci];
-    }
-
-    locals = new_head;
-
-    // Now find the last regular param and append captures to fn->params
-    Obj *last_param = NULL;
-    for (Obj *p = fn->params; p; p = p->next)
-      last_param = p;
-
-    // The captures are now at the end of the locals chain, right after param_0
-    // Set fn->params to include captures: last_param already points to param_0
-    // We need param_0->next to point to first capture
-    if (last_param) {
-      // last_param is param_0 (the last in fn->params order)
-      // Find param_0 (the one with next==NULL in the original params chain)
-      Obj *param_0 = NULL;
-      for (Obj *p = fn->params; p; p = p->next)
-        param_0 = p;
-      // param_0->next should now point to first capture (they are right after in locals)
-      // Since we rebuilt locals with captures at the end, param_0->next == cap_objs[0]
-      // (if they are adjacent in the chain). Let's verify and fix.
-      param_0->next = cap_objs[0];
-    } else {
-      fn->params = cap_objs[0];
-    }
-
-    free(cap_objs);
-    free(all_locals);
-  }
-
   for (Node *g = gotos; g; g = g->goto_next) {
     if (g->kind != ND_LABEL_VAL) continue;
     for (Node *l = labels; l; l = l->goto_next)
@@ -5187,10 +5094,8 @@ static Token *nested_function(Token *tok, Type *fn_ty, VarAttr *attr, Node **cur
     if (!g->unique_label && g->kind == ND_GOTO)
       error_tok(g->tok, "use of undeclared label '%s'", g->label);
   }
-
   fn->locals = locals;
   leave_scope();
-
   current_fn = saved_fn;
   locals = saved_locals;
   gotos = saved_gotos;
@@ -5198,16 +5103,10 @@ static Token *nested_function(Token *tok, Type *fn_ty, VarAttr *attr, Node **cur
   brk_label = saved_brk;
   cont_label = saved_cont;
   current_switch = saved_switch;
-  captured_vars = saved_captures;
-
-  fn->chain_param = (Obj *)(void *)my_captures;
-
   VarScope *vs = push_scope(inner_name);
   vs->var = fn;
-
   Node *nop = new_node(ND_NULL_EXPR, fn_ty->name);
   *cur = (*cur)->next = nop;
-
   return tok;
 }
 

@@ -333,6 +333,7 @@ void add_type(Node *node) {
   }
   case ND_VAR:
   case ND_VLA_PTR:
+  case ND_CHAIN_VAR:
     node->ty = node->var->ty;
     if (node->ty->kind == TY_VLA)
       node->ty = pointer_to(node->ty->base);
@@ -396,6 +397,11 @@ void add_type(Node *node) {
     return;
   case ND_LABEL_VAL:
     node->ty = pointer_to(ty_void);
+    return;
+  case ND_FRAME_ADDR:
+    node->ty = pointer_to(ty_char);
+    return;
+  case ND_TRAMPOLINE:
     return;
   case ND_REAL:
   case ND_IMAG:

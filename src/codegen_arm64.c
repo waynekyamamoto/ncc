@@ -420,6 +420,20 @@ static void gen_addr(Node *node) {
     }
     return;
 
+  case ND_CHAIN_VAR: {
+    gen_expr(node->lhs);
+    int off = node->var->offset;
+    if (off < 0) {
+      int abs_off = -off;
+      if (abs_off <= 4095) println("sub x0, x0, #%d", abs_off);
+      else { load_imm("x9", (uint64_t)abs_off); println("sub x0, x0, x9"); }
+    } else if (off > 0) {
+      if (off <= 4095) println("add x0, x0, #%d", off);
+      else { load_imm("x9", (uint64_t)off); println("add x0, x0, x9"); }
+    }
+    return;
+  }
+
   default:
     error_tok(node->tok, "not an lvalue");
   }
@@ -537,6 +551,7 @@ static void count_params(Type *func_ty, int *gp_count, int *fp_count) {
 // - Variadic args are ALL passed on the stack (not in registers)
 // - Stack must be 16-byte aligned before the call
 static void gen_funcall(Node *node) {
+
   Node *args[64];
   int nargs = 0;
   for (Node *arg = node->args; arg; arg = arg->next) {
@@ -1154,6 +1169,15 @@ static void gen_expr(Node *node) {
 
   case ND_FUNCALL:
     gen_funcall(node);
+    return;
+
+  case ND_FRAME_ADDR:
+    println("mov x0, x29");
+    return;
+
+  case ND_CHAIN_VAR:
+    gen_addr(node);
+    load(node->ty);
     return;
 
   case ND_LABEL_VAL: {
@@ -1827,7 +1851,7 @@ static void assign_lvar_offsets(Obj *fn) {
 
   // Assign negative offsets to all other locals
   int offset = 0;
-  for (Obj *var = fn->locals; var; var = var->next) {
+    for (Obj *var = fn->locals; var; var = var->next) {
     if (var->offset > 0) continue; // already assigned (stack param)
     offset += var->ty->size;
     offset = align_to(offset, var->align);
@@ -1935,6 +1959,8 @@ static void emit_text(Obj *prog) {
     printlabel("_%s:", fn->name);
 
     current_fn = fn;
+    if (fn->is_nested && fn->enclosing_fn && fn->enclosing_fn->stack_size == 0)
+      assign_lvar_offsets(fn->enclosing_fn);
     assign_lvar_offsets(fn);
 
     // Prologue
