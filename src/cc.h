@@ -376,6 +376,8 @@ struct Type {
   int align;        // alignment
   bool is_unsigned; // unsigned or signed
   bool is_atomic;   // _Atomic
+  bool is_const;    // const qualifier
+  bool is_volatile; // volatile qualifier
   Type *origin;     // for type compatibility check
 
   // Pointer or array

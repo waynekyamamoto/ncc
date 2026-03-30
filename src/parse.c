@@ -525,6 +525,8 @@ static Type *declspec(Token **rest, Token *tok, VarAttr *attr) {
   Type *ty = ty_int;
   int counter = 0;
   bool is_atomic = false;
+  bool is_const = false;
+  bool is_volatile = false;
 
   while (is_typename(tok)) {
     // Storage class specifiers
@@ -560,6 +562,8 @@ static Type *declspec(Token **rest, Token *tok, VarAttr *attr) {
     // Type qualifiers
     if (equal(tok, "const") || equal(tok, "volatile") || equal(tok, "restrict") ||
         equal(tok, "__restrict") || equal(tok, "__restrict__")) {
+      if (equal(tok, "const")) is_const = true;
+      if (equal(tok, "volatile")) is_volatile = true;
       tok = tok->next;
       continue;
     }
@@ -721,9 +725,11 @@ static Type *declspec(Token **rest, Token *tok, VarAttr *attr) {
     tok = tok->next;
   }
 
-  if (is_atomic) {
+  if (is_atomic || is_const || is_volatile) {
     ty = copy_type(ty);
-    ty->is_atomic = true;
+    if (is_atomic) ty->is_atomic = true;
+    if (is_const) ty->is_const = true;
+    if (is_volatile) ty->is_volatile = true;
   }
 
   *rest = tok;
@@ -738,10 +744,16 @@ static Type *declspec(Token **rest, Token *tok, VarAttr *attr) {
 static Type *pointers(Token **rest, Token *tok, Type *ty) {
   while (consume(&tok, tok, "*")) {
     ty = pointer_to(ty);
+    bool pconst = false, pvolatile = false;
     while (equal(tok, "const") || equal(tok, "volatile") ||
            equal(tok, "restrict") || equal(tok, "__restrict") ||
-           equal(tok, "__restrict__") || equal(tok, "_Atomic"))
+           equal(tok, "__restrict__") || equal(tok, "_Atomic")) {
+      if (equal(tok, "const")) pconst = true;
+      if (equal(tok, "volatile")) pvolatile = true;
       tok = tok->next;
+    }
+    if (pconst) ty->is_const = true;
+    if (pvolatile) ty->is_volatile = true;
   }
   *rest = tok;
   return ty;
@@ -780,6 +792,10 @@ static Type *func_params(Token **rest, Token *tok, Type *ty) {
 
     Type *ty2 = declspec(&tok, tok, NULL);
     ty2 = declarator(&tok, tok, ty2);
+
+    // Consume trailing __attribute__ on parameters
+    // e.g., int argc __attribute__((unused))
+    tok = attribute_list(tok, ty2, NULL);
 
     Token *name = ty2->name;
 
@@ -878,6 +894,9 @@ static Type *type_suffix(Token **rest, Token *tok, Type *ty) {
 // declarator: parse a declarator
 static Type *declarator(Token **rest, Token *tok, Type *ty) {
   ty = pointers(&tok, tok, ty);
+
+  // Consume __attribute__ after pointer stars (e.g., void * __attribute__((noinline)) foo())
+  tok = attribute_list(tok, ty, NULL);
 
   // Check for nested declarator: ( declarator )
   if (equal(tok, "(") && (tok->next->kind == TK_IDENT || equal(tok->next, "*") ||
@@ -2538,6 +2557,75 @@ static Node *new_inc_dec(Node *node, Token *tok, int addend) {
 static Node *primary(Token **rest, Token *tok) {
   Token *start = tok;
 
+  // __builtin_types_compatible_p(type1, type2) — GCC extension
+  if (equal(tok, "__builtin_types_compatible_p")) {
+    tok = skip(tok->next, "(");
+    Type *t1 = typename_(&tok, tok);
+    tok = skip(tok, ",");
+    Type *t2 = typename_(&tok, tok);
+    *rest = skip(tok, ")");
+
+    // Strip top-level qualifiers for comparison (const, volatile, restrict, atomic)
+    // We do this by clearing the relevant fields on copies
+    // GCC rule: top-level qualifiers are ignored
+
+    // Recursively compare types for compatibility
+    int result = 0;
+    // Helper: compare two types for GCC __builtin_types_compatible_p semantics
+    // We implement this inline with a loop/goto structure
+    {
+      Type *a = t1, *b = t2;
+
+      // Resolve enums to int for comparison
+      if (a->kind == TY_ENUM) a = ty_int;
+      if (b->kind == TY_ENUM) b = ty_int;
+
+      if (a->kind != b->kind) {
+        result = 0;
+      } else if (a->kind == TY_PTR) {
+        // Pointers: base types must be fully compatible (including qualifiers)
+        // Recursively check base types but qualifiers DO matter here
+        Type *pa = a->base, *pb = b->base;
+        // For pointer targets, qualifiers matter
+        if (pa->kind == TY_ENUM) pa = ty_int;
+        if (pb->kind == TY_ENUM) pb = ty_int;
+        if (pa->kind != pb->kind)
+          result = 0;
+        else if (pa->is_unsigned != pb->is_unsigned)
+          result = 0;
+        else if (pa->kind == TY_PTR || pa->kind == TY_ARRAY) {
+          // Deep pointer/array comparison — check sizes match
+          result = (pa->size == pb->size && pa->base && pb->base &&
+                    pa->base->kind == pb->base->kind &&
+                    pa->base->is_unsigned == pb->base->is_unsigned);
+        } else if (pa->kind == TY_STRUCT || pa->kind == TY_UNION)
+          result = (pa->size == pb->size && pa->members == pb->members);
+        else
+          result = (pa->size == pb->size);
+      } else if (a->kind == TY_ARRAY) {
+        // Arrays: element types must be compatible; sizes must match unless one is []
+        Type *ea = a->base, *eb = b->base;
+        if (ea->kind == TY_ENUM) ea = ty_int;
+        if (eb->kind == TY_ENUM) eb = ty_int;
+        if (ea->kind != eb->kind || ea->is_unsigned != eb->is_unsigned || ea->size != eb->size)
+          result = 0;
+        else if (a->array_len >= 0 && b->array_len >= 0 && a->array_len != b->array_len)
+          result = 0;
+        else
+          result = 1;
+      } else if (a->kind == TY_STRUCT || a->kind == TY_UNION) {
+        // Struct/union: must be the same type (same members pointer)
+        result = (a->size == b->size && a->members == b->members);
+      } else if (a->kind == TY_FUNC) {
+        result = 0; // function types — simplified
+      } else {
+        // Scalar types: kind and signedness must match, ignore top-level qualifiers
+        result = (a->is_unsigned == b->is_unsigned && a->size == b->size);
+      }
+    }
+    return new_num(result, start);
+  }
+
   // __builtin_va_arg(ap, type)
   if (equal(tok, "__builtin_va_arg")) {
     tok = skip(tok->next, "(");
@@ -3571,6 +3659,19 @@ static void initializer2(Token **rest, Token *tok, Initializer *init) {
   }
 
   if (init->ty->kind == TY_UNION) {
+    if (!equal(tok, "{") && !equal(tok, ".")) {
+      // Union can be initialized with a single expression of the same union type
+      Token *save = tok;
+      Node *expr_node = assign(&tok, tok);
+      add_type(expr_node);
+      if (expr_node->ty->kind == TY_UNION) {
+        init->expr = expr_node;
+        *rest = tok;
+        return;
+      }
+      // Not a union expression; rewind and fall through to member-wise init
+      tok = save;
+    }
     union_initializer(rest, tok, init);
     return;
   }

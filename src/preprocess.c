@@ -1168,7 +1168,7 @@ void init_macros(void) {
   define_macro("__builtin_huge_valf()", "__FLT_MAX__");
   define_macro("__builtin_huge_val()", "__DBL_MAX__");
   define_macro("__builtin_offsetof(type,member)", "((unsigned long)&((type*)0)->member)");
-  define_macro("__builtin_types_compatible_p(x,y)", "0");
+  // __builtin_types_compatible_p is handled in parse.c primary()
   define_macro("__builtin_constant_p(x)", "0");
   define_macro("__builtin_unreachable()", "((void)0)");
   define_macro("__builtin_assume(x)", "((void)0)");
