@@ -214,6 +214,9 @@ typedef enum {
   ND_BUILTIN_ALLOCA,   // __builtin_alloca / alloca
   ND_REAL,             // __real__ (extract real part of complex)
   ND_IMAG,             // __imag__ (extract imaginary part of complex)
+  ND_CHAIN_VAR,        // access outer variable via static chain pointer
+  ND_FRAME_ADDR,       // current function's frame pointer (x29)
+  ND_TRAMPOLINE,       // create trampoline for nested function
 } NodeKind;
 
 // AST node
@@ -317,6 +320,11 @@ struct Obj {
   int stack_size;
   bool is_variadic;
 
+  // Nested function support
+  bool is_nested;        // true if this is a nested function
+  Obj *chain_param;      // hidden parameter holding outer's frame pointer
+  Obj *enclosing_fn;     // the enclosing function (for nested functions)
+
   // Static inline function
   bool is_live;
   bool is_root;
@@ -375,6 +383,7 @@ typedef enum {
   TY_FUNC,
   TY_ARRAY,
   TY_VLA,      // variable-length array
+  TY_VECTOR,   // GCC vector extension (__attribute__((vector_size(N))))
   TY_STRUCT,
   TY_UNION,
 } TypeKind;
@@ -447,6 +456,8 @@ Type *vla_of(Type *base, Node *len);
 Type *enum_type(void);
 Type *struct_type(void);
 Type *complex_type(Type *base);
+Type *vector_of(Type *base, int total_size);
+bool is_vector(Type *ty);
 void add_type(Node *node);
 
 //

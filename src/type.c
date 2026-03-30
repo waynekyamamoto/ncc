@@ -86,6 +86,8 @@ bool is_compatible(Type *t1, Type *t2) {
       return false;
     return t1->array_len < 0 || t2->array_len < 0 ||
            t1->array_len == t2->array_len;
+  case TY_VECTOR:
+    return t1->size == t2->size && is_compatible(t1->base, t2->base);
   default:
     return false;
   }
@@ -151,6 +153,25 @@ Type *struct_type(void) {
   return ty;
 }
 
+// Create a vector type: base is the element type, total_size is the vector_size in bytes.
+// Example: __attribute__((vector_size(16))) on int → 4 ints, size=16, align=16.
+Type *vector_of(Type *base, int total_size) {
+  Type *ty = calloc_checked(1, sizeof(Type));
+  ty->kind = TY_VECTOR;
+  ty->base = base;
+  ty->size = total_size;
+  ty->align = total_size;  // vector alignment = vector size (natural alignment)
+  // Cap alignment at 16 to avoid excessive stack alignment requirements
+  if (ty->align > 16)
+    ty->align = 16;
+  ty->array_len = total_size / base->size;  // element count (reuse array_len field)
+  return ty;
+}
+
+bool is_vector(Type *ty) {
+  return ty->kind == TY_VECTOR;
+}
+
 // Create a _Complex type from a base scalar type.
 // _Complex double = 16 bytes (two doubles), etc.
 Type *complex_type(Type *base) {
@@ -164,6 +185,12 @@ Type *complex_type(Type *base) {
 
 // Get the common type for binary operations (usual arithmetic conversions).
 static Type *get_common_type(Type *ty1, Type *ty2) {
+  // Vector types: keep the vector type as-is
+  if (ty1->kind == TY_VECTOR)
+    return ty1;
+  if (ty2->kind == TY_VECTOR)
+    return ty2;
+
   if (ty1->base && ty1->kind != TY_COMPLEX)
     return pointer_to(ty1->base);
 
@@ -243,11 +270,20 @@ void add_type(Node *node) {
   case ND_BITAND:
   case ND_BITOR:
   case ND_BITXOR:
+    if (node->lhs->ty->kind == TY_VECTOR || node->rhs->ty->kind == TY_VECTOR) {
+      // Vector arithmetic: type is the vector type
+      node->ty = node->lhs->ty->kind == TY_VECTOR ? node->lhs->ty : node->rhs->ty;
+      return;
+    }
     usual_arith_conv(&node->lhs, &node->rhs);
     node->ty = node->lhs->ty;
     return;
   case ND_NEG: {
     Type *ty = node->lhs->ty;
+    if (ty->kind == TY_VECTOR) {
+      node->ty = ty;
+      return;
+    }
     if (is_integer(ty) && ty->size < 4)
       ty = ty_int;
     node->ty = ty;
@@ -256,7 +292,8 @@ void add_type(Node *node) {
   case ND_ASSIGN:
     if (node->lhs->ty->kind == TY_ARRAY)
       error_tok(node->lhs->tok, "not an lvalue");
-    if (node->lhs->ty->kind != TY_STRUCT && node->lhs->ty->kind != TY_COMPLEX)
+    if (node->lhs->ty->kind != TY_STRUCT && node->lhs->ty->kind != TY_COMPLEX &&
+        node->lhs->ty->kind != TY_VECTOR)
       node->rhs = new_cast(node->rhs, node->lhs->ty);
     node->ty = node->lhs->ty;
     return;
@@ -264,6 +301,12 @@ void add_type(Node *node) {
   case ND_NE:
   case ND_LT:
   case ND_LE:
+    if (node->lhs->ty->kind == TY_VECTOR || node->rhs->ty->kind == TY_VECTOR) {
+      // Vector comparison: result is a signed vector of same shape (0 or -1 per element)
+      Type *vty = node->lhs->ty->kind == TY_VECTOR ? node->lhs->ty : node->rhs->ty;
+      node->ty = vty;
+      return;
+    }
     usual_arith_conv(&node->lhs, &node->rhs);
     node->ty = ty_int;
     return;
@@ -279,6 +322,10 @@ void add_type(Node *node) {
   case ND_SHL:
   case ND_SHR: {
     Type *ty = node->lhs->ty;
+    if (ty->kind == TY_VECTOR) {
+      node->ty = ty;
+      return;
+    }
     if (is_integer(ty) && ty->size < 4)
       ty = ty_int;
     node->ty = ty;

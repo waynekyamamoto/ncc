@@ -159,6 +159,7 @@ static void load(Type *ty) {
   case TY_FUNC:
   case TY_VLA:
   case TY_COMPLEX:
+  case TY_VECTOR:
     // These are already addresses — no dereference needed
     return;
   case TY_FLOAT:
@@ -197,8 +198,9 @@ static void store(Type *ty) {
   switch (ty->kind) {
   case TY_STRUCT:
   case TY_UNION:
-  case TY_COMPLEX: {
-    // Copy struct/complex from x0 (src addr) to x1 (dst addr)
+  case TY_COMPLEX:
+  case TY_VECTOR: {
+    // Copy struct/complex/vector from x0 (src addr) to x1 (dst addr)
 
     // For structs with VLA members, use a runtime-sized copy loop
     if (ty->vla_size && (ty->kind == TY_STRUCT || ty->kind == TY_UNION)) {
@@ -281,7 +283,8 @@ __attribute__((unused))
 static void store_to(Type *ty, char *addr_reg) {
   switch (ty->kind) {
   case TY_STRUCT:
-  case TY_UNION: {
+  case TY_UNION:
+  case TY_VECTOR: {
     int copied = 0;
     int off = 0;
     while (copied + 8 <= ty->size) {
@@ -388,6 +391,11 @@ static void gen_addr(Node *node) {
     gen_expr(node);
     return;
 
+  case ND_STMT_EXPR:
+    // Statement expressions that produce struct/union: gen_expr leaves address in x0
+    gen_expr(node);
+    return;
+
   case ND_REAL:
     // Address of __real__ expr: address of the real part
     gen_addr(node->lhs);
@@ -420,6 +428,11 @@ static void gen_addr(Node *node) {
 // Cast value in x0/d0 to a target type
 static void cast(Type *from, Type *to) {
   if (to->kind == TY_VOID)
+    return;
+
+  // Vector casts are handled in the parser via memory reinterpretation.
+  // If we still get here, it's a no-op (same-size bitwise reinterpret).
+  if (from->kind == TY_VECTOR || to->kind == TY_VECTOR)
     return;
 
   if (to->kind == TY_BOOL) {
@@ -554,7 +567,7 @@ static void gen_funcall(Node *node) {
     bool is_named_arg = (i < named_count);
     bool is_fp = is_flonum(args[i]->ty);
     Type *aty = args[i]->ty;
-    bool is_struct = (aty->kind == TY_STRUCT || aty->kind == TY_UNION || aty->kind == TY_COMPLEX);
+    bool is_struct = (aty->kind == TY_STRUCT || aty->kind == TY_UNION || aty->kind == TY_COMPLEX || aty->kind == TY_VECTOR);
     int gp_needed = is_struct ? ((aty->size > 8) ? 2 : 1) : 1;
 
     if (is_variadic && !is_named_arg) {
@@ -600,7 +613,7 @@ static void gen_funcall(Node *node) {
     if (arg_dest[i] == -1) {
       gen_expr(args[i]);
       Type *aty = args[i]->ty;
-      bool is_struct_arg = aty && (aty->kind == TY_STRUCT || aty->kind == TY_UNION || aty->kind == TY_COMPLEX);
+      bool is_struct_arg = aty && (aty->kind == TY_STRUCT || aty->kind == TY_UNION || aty->kind == TY_COMPLEX || aty->kind == TY_VECTOR);
       if (is_struct_arg) {
         // x0 is the address of the struct; copy its contents to the stack
         for (int j = 0; j + 7 < aty->size; j += 8) {
@@ -637,7 +650,7 @@ static void gen_funcall(Node *node) {
     if (arg_dest[i] >= 0) {
       gen_expr(args[i]);
       Type *aty = args[i]->ty;
-      bool is_struct = aty && (aty->kind == TY_STRUCT || aty->kind == TY_UNION || aty->kind == TY_COMPLEX);
+      bool is_struct = aty && (aty->kind == TY_STRUCT || aty->kind == TY_UNION || aty->kind == TY_COMPLEX || aty->kind == TY_VECTOR);
 
       if (is_struct && aty->size > 16) {
         // Large struct: pass by indirect reference (pointer in GP reg).
@@ -690,7 +703,7 @@ static void gen_funcall(Node *node) {
   for (int i = nargs - 1; i >= 0; i--) {
     if (arg_dest[i] < 0) continue;
     Type *aty = args[i]->ty;
-    bool is_struct = aty && (aty->kind == TY_STRUCT || aty->kind == TY_UNION || aty->kind == TY_COMPLEX);
+    bool is_struct = aty && (aty->kind == TY_STRUCT || aty->kind == TY_UNION || aty->kind == TY_COMPLEX || aty->kind == TY_VECTOR);
 
     if (arg_dest[i] >= 100) {
       popf(arg_dest[i] - 100);
@@ -1357,6 +1370,10 @@ static void gen_expr(Node *node) {
   }
 
   // Binary operations
+
+  // Vector binary/unary ops are decomposed into element-wise scalar ops
+  // in the parser. They should not reach codegen as vector-typed binary nodes.
+
   // Float binary ops
   if (is_flonum(node->lhs->ty)) {
     gen_expr(node->rhs);
@@ -1789,7 +1806,7 @@ static void assign_lvar_offsets(Obj *fn) {
   int gp2 = 0, fp2 = 0;
   for (Obj *param = fn->params; param; param = param->next) {
     bool is_fp = is_flonum(param->ty);
-    bool is_struct = (param->ty->kind == TY_STRUCT || param->ty->kind == TY_UNION || param->ty->kind == TY_COMPLEX);
+    bool is_struct = (param->ty->kind == TY_STRUCT || param->ty->kind == TY_UNION || param->ty->kind == TY_COMPLEX || param->ty->kind == TY_VECTOR);
 
     int gp_needed = is_struct ? ((param->ty->size > 16) ? 1 : (param->ty->size > 8) ? 2 : 1) : 1;
 
@@ -1982,9 +1999,9 @@ static void emit_text(Obj *prog) {
       // Skip stack-passed params (positive offset = on caller's stack)
       if (param->offset > 0) {
         if (is_flonum(param->ty)) fp++;
-        else if ((param->ty->kind == TY_STRUCT || param->ty->kind == TY_UNION || param->ty->kind == TY_COMPLEX) && param->ty->size > 16)
+        else if ((param->ty->kind == TY_STRUCT || param->ty->kind == TY_UNION || param->ty->kind == TY_COMPLEX || param->ty->kind == TY_VECTOR) && param->ty->size > 16)
           gp += 1;  // indirect reference
-        else if (param->ty->kind == TY_STRUCT || param->ty->kind == TY_UNION || param->ty->kind == TY_COMPLEX)
+        else if (param->ty->kind == TY_STRUCT || param->ty->kind == TY_UNION || param->ty->kind == TY_COMPLEX || param->ty->kind == TY_VECTOR)
           gp += (param->ty->size > 8) ? 2 : 1;
         else gp++;
         continue;
@@ -2000,7 +2017,7 @@ static void emit_text(Obj *prog) {
           }
           fp++;
         }
-      } else if (param->ty->kind == TY_STRUCT || param->ty->kind == TY_UNION || param->ty->kind == TY_COMPLEX) {
+      } else if (param->ty->kind == TY_STRUCT || param->ty->kind == TY_UNION || param->ty->kind == TY_COMPLEX || param->ty->kind == TY_VECTOR) {
         if (param->ty->size > 16 && gp < 8) {
           // Large struct: passed by indirect reference (pointer in GP reg).
           // Copy from the pointer to local storage.

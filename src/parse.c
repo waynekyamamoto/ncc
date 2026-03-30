@@ -48,6 +48,18 @@ static char *cont_label;
 static Node *current_switch;
 int label_cnt;
 
+// Nested function support: track captured outer variables
+typedef struct CapturedVar CapturedVar;
+struct CapturedVar {
+  CapturedVar *next;
+  Obj *outer_var;   // The variable in the outer function
+  Obj *inner_ptr;   // Pointer variable in the nested function (points to outer var)
+};
+
+static CapturedVar *captured_vars __attribute__((unused));
+static Obj *nesting_outer_fn __attribute__((unused));
+static Obj *nesting_outer_locals __attribute__((unused));
+
 static void enter_scope(void) {
   Scope *sc = calloc_checked(1, sizeof(Scope));
   sc->next = scope;
@@ -155,9 +167,66 @@ static Node *new_imag(Node *expr, Token *tok);
 static Node *new_complex_val(Node *real_part, Node *imag_part, Type *cty, Token *tok);
 static Node *new_complex_mul(Node *lhs, Node *rhs, Token *tok);
 static Node *new_complex_div(Node *lhs, Node *rhs, Token *tok);
+static Obj *new_lvar(char *name, Type *ty);
 
 Node *new_cast(Node *expr, Type *ty) {
   add_type(expr);
+
+  // Vector cast: bitwise reinterpretation through memory
+  if (ty->kind == TY_VECTOR && expr->ty->kind != TY_VECTOR) {
+    // Scalar/integer → vector: store scalar, load as vector
+    // Create temp of source type, assign, then read as vector type
+    Obj *tmp = new_lvar("", ty);
+    Node *tmp_var = new_var_node(tmp, expr->tok);
+    // Store expr into tmp's memory as the source type
+    // We need: *((source_type *)&tmp) = expr, then return tmp
+    Node *addr = new_unary(ND_ADDR, tmp_var, expr->tok);
+    Node *casted_addr = new_cast(addr, pointer_to(expr->ty));
+    Node *deref = new_unary(ND_DEREF, casted_addr, expr->tok);
+    Node *store = new_binary(ND_ASSIGN, deref, expr, expr->tok);
+    add_type(store);
+    // Return: (store, tmp)
+    Node *result = new_binary(ND_COMMA, store, new_var_node(tmp, expr->tok), expr->tok);
+    result->ty = ty;
+    return result;
+  }
+
+  if (ty->kind != TY_VECTOR && expr->ty->kind == TY_VECTOR) {
+    // Vector → scalar: store vector, load as scalar
+    Obj *tmp = new_lvar("", expr->ty);
+    Node *tmp_var = new_var_node(tmp, expr->tok);
+    Node *store = new_binary(ND_ASSIGN, tmp_var, expr, expr->tok);
+    add_type(store);
+    // Read as target type: *((target_type *)&tmp)
+    Node *addr = new_unary(ND_ADDR, new_var_node(tmp, expr->tok), expr->tok);
+    Node *casted_addr = new_cast(addr, pointer_to(ty));
+    Node *deref = new_unary(ND_DEREF, casted_addr, expr->tok);
+    add_type(deref);
+    Node *result = new_binary(ND_COMMA, store, deref, expr->tok);
+    result->ty = ty;
+    return result;
+  }
+
+  if (ty->kind == TY_VECTOR && expr->ty->kind == TY_VECTOR) {
+    // Vector → vector: bitwise reinterpretation (sizes must match)
+    if (ty->size == expr->ty->size && ty->base->kind == expr->ty->base->kind &&
+        ty->base->is_unsigned == expr->ty->base->is_unsigned)
+      return expr;  // same type, no-op
+    // Different vector types of same size: reinterpret through memory
+    Obj *tmp = new_lvar("", expr->ty);
+    Node *tmp_var = new_var_node(tmp, expr->tok);
+    Node *store = new_binary(ND_ASSIGN, tmp_var, expr, expr->tok);
+    add_type(store);
+    // Reinterpret as target vector type via pointer cast
+    Node *reinterp = new_unary(ND_DEREF,
+      new_cast(new_unary(ND_ADDR, new_var_node(tmp, expr->tok), expr->tok),
+               pointer_to(ty)),
+      expr->tok);
+    add_type(reinterp);
+    Node *result = new_binary(ND_COMMA, store, reinterp, expr->tok);
+    result->ty = ty;
+    return result;
+  }
 
   // Cast to complex from non-complex: create complex with real=expr, imag=0
   if (ty->kind == TY_COMPLEX && expr->ty->kind != TY_COMPLEX) {
@@ -205,6 +274,126 @@ static Node *new_imag(Node *expr, Token *tok) {
   Node *node = new_unary(ND_IMAG, expr, tok);
   add_type(node);
   return node;
+}
+
+// Helper: extract element i from a vector expression.
+// vec_expr must be a vector-typed node. Returns a scalar element.
+static Node *vec_elem(Node *vec_expr, int i, Token *tok) {
+  add_type(vec_expr);
+  Type *elem_ty = vec_expr->ty->base;
+  Node *addr = new_unary(ND_ADDR, vec_expr, tok);
+  Node *ptr = new_cast(addr, pointer_to(elem_ty));
+  Node *idx = new_num(i, tok);
+  return new_unary(ND_DEREF, new_binary(ND_ADD, ptr, new_binary(ND_MUL, idx, new_long(elem_ty->size, tok), tok), tok), tok);
+}
+
+// Helper: set element i of vector variable to val.
+// vec_var must be an ND_VAR node of vector type. Returns the assignment node.
+static Node *vec_set_elem(Obj *vec_var, int i, Node *val, Token *tok) {
+  Node *var_node = new_var_node(vec_var, tok);
+  Type *elem_ty = vec_var->ty->base;
+  Node *addr = new_unary(ND_ADDR, var_node, tok);
+  Node *ptr = new_cast(addr, pointer_to(elem_ty));
+  Node *idx = new_num(i, tok);
+  Node *deref = new_unary(ND_DEREF, new_binary(ND_ADD, ptr, new_binary(ND_MUL, idx, new_long(elem_ty->size, tok), tok), tok), tok);
+  Node *assign = new_binary(ND_ASSIGN, deref, val, tok);
+  add_type(assign);
+  return assign;
+}
+
+// Helper: decompose a vector binary operation into element-wise scalar ops.
+// Returns a comma expression: (result[0] = lhs[0] op rhs[0], ..., result)
+static Node *vec_binary_op(NodeKind kind, Node *lhs, Node *rhs, Token *tok) {
+  add_type(lhs);
+  add_type(rhs);
+  Type *vty = lhs->ty->kind == TY_VECTOR ? lhs->ty : rhs->ty;
+  (void)vty->base; // elem type used implicitly via array_len
+  int nelem = vty->array_len;
+  bool is_cmp = (kind == ND_EQ || kind == ND_NE || kind == ND_LT || kind == ND_LE);
+
+  // Create result temp
+  Obj *result = new_lvar("", vty);
+
+  // Store lhs and rhs into temps if they're not already variables
+  // (to avoid evaluating them multiple times)
+  Obj *lhs_tmp = new_lvar("", lhs->ty);
+  Obj *rhs_tmp = new_lvar("", rhs->ty);
+
+  Node *store_lhs = new_binary(ND_ASSIGN, new_var_node(lhs_tmp, tok), lhs, tok);
+  add_type(store_lhs);
+  Node *store_rhs = new_binary(ND_ASSIGN, new_var_node(rhs_tmp, tok), rhs, tok);
+  add_type(store_rhs);
+
+  // Chain: store_lhs, store_rhs
+  Node *chain = new_binary(ND_COMMA, store_lhs, store_rhs, tok);
+
+  // For each element, extract, operate, and store
+  for (int i = 0; i < nelem; i++) {
+    Node *l_elem, *r_elem;
+
+    if (lhs->ty->kind == TY_VECTOR)
+      l_elem = vec_elem(new_var_node(lhs_tmp, tok), i, tok);
+    else
+      l_elem = new_var_node(lhs_tmp, tok);  // scalar broadcast
+
+    if (rhs->ty->kind == TY_VECTOR)
+      r_elem = vec_elem(new_var_node(rhs_tmp, tok), i, tok);
+    else
+      r_elem = new_var_node(rhs_tmp, tok);  // scalar broadcast
+
+    add_type(l_elem);
+    add_type(r_elem);
+
+    Node *op_result = new_binary(kind, l_elem, r_elem, tok);
+    add_type(op_result);
+
+    if (is_cmp) {
+      // Comparison: result is 0 or -1 (all bits set)
+      // GCC vector comparison: true = -1, false = 0
+      // op_result is 0 or 1 from cmp; negate it: 0 stays 0, 1 becomes -1
+      op_result = new_unary(ND_NEG, op_result, tok);
+      add_type(op_result);
+    }
+
+    Node *store = vec_set_elem(result, i, op_result, tok);
+    chain = new_binary(ND_COMMA, chain, store, tok);
+  }
+
+  // Final value: the result variable
+  Node *result_node = new_var_node(result, tok);
+  chain = new_binary(ND_COMMA, chain, result_node, tok);
+  chain->ty = vty;
+  return chain;
+}
+
+// Helper: decompose vector unary operation (NEG, BITNOT).
+__attribute__((unused))
+static Node *vec_unary_op(NodeKind kind, Node *operand, Token *tok) {
+  add_type(operand);
+  Type *vty = operand->ty;
+  (void)vty->base; // elem type used implicitly via array_len
+  int nelem = vty->array_len;
+
+  Obj *result = new_lvar("", vty);
+  Obj *op_tmp = new_lvar("", vty);
+
+  Node *store_op = new_binary(ND_ASSIGN, new_var_node(op_tmp, tok), operand, tok);
+  add_type(store_op);
+  Node *chain = store_op;
+
+  for (int i = 0; i < nelem; i++) {
+    Node *elem_val = vec_elem(new_var_node(op_tmp, tok), i, tok);
+    add_type(elem_val);
+    Node *op_result = new_unary(kind, elem_val, tok);
+    add_type(op_result);
+    Node *store = vec_set_elem(result, i, op_result, tok);
+    chain = new_binary(ND_COMMA, chain, store, tok);
+  }
+
+  Node *result_node = new_var_node(result, tok);
+  chain = new_binary(ND_COMMA, chain, result_node, tok);
+  chain->ty = vty;
+  return chain;
 }
 
 //
@@ -280,6 +469,7 @@ typedef struct {
   bool is_tls;
   bool is_noreturn;
   int align;
+  int vector_size;  // __attribute__((vector_size(N)))
 } VarAttr;
 
 // Helper: check if a type (or any of its members) contains a VLA
@@ -476,6 +666,10 @@ static Token *attribute_list(Token *tok, Type *ty, VarAttr *attr);
 static bool is_end(Token *tok);
 typedef struct InitDesig InitDesig;
 static Node *init_desig_expr(InitDesig *desig, Token *tok);
+// Forward declarations for nested function support (not yet implemented)
+static Token *nested_function(Token *tok, Type *fn_ty, VarAttr *attr, Node **cur);
+__attribute__((unused))
+static void rewrite_nested_var_refs(Node *node, Obj *outer_fn);
 
 //
 // Determine if a token starts a type name
@@ -1210,6 +1404,18 @@ static Token *attribute_list(Token *tok, Type *ty, VarAttr *attr) {
           }
           tok = tok->next;
         }
+      } else if (equal(tok, "vector_size") || equal(tok, "__vector_size__")) {
+        tok = tok->next;
+        tok = skip(tok, "(");
+        int vs = const_expr_val(&tok, tok);
+        tok = skip(tok, ")");
+        if (attr) attr->vector_size = vs;
+        // If ty is provided directly (e.g. from typedef), convert it to vector type
+        if (ty && ty->kind != TY_VECTOR && ty->size > 0) {
+          Type *vec = vector_of(ty, vs);
+          // Copy vector info back into ty so the caller sees the change
+          *ty = *vec;
+        }
       } else if (equal(tok, "format") || equal(tok, "__format__") ||
                  equal(tok, "sentinel") || equal(tok, "alloc_size") ||
                  equal(tok, "cleanup") || equal(tok, "nonnull") ||
@@ -1371,12 +1577,16 @@ static Type *enum_specifier(Token **rest, Token *tok) {
 
   if (tag && !equal(tok, "{")) {
     Type *ty2 = find_tag(tag);
-    if (!ty2)
-      error_tok(tag, "unknown enum type");
-    if (ty2->kind != TY_ENUM)
-      error_tok(tag, "not an enum tag");
+    if (ty2) {
+      if (ty2->kind != TY_ENUM)
+        error_tok(tag, "not an enum tag");
+      *rest = tok;
+      return ty2;
+    }
+    // Forward declaration: allow incomplete enum (like incomplete struct)
+    push_tag_scope(tag, ty);
     *rest = tok;
-    return ty2;
+    return ty;
   }
 
   tok = skip(tok, "{");
@@ -1814,6 +2024,10 @@ static Node *new_add(Node *lhs, Node *rhs, Token *tok) {
   add_type(lhs);
   add_type(rhs);
 
+  // Vector addition: decompose into element-wise ops
+  if (lhs->ty->kind == TY_VECTOR || rhs->ty->kind == TY_VECTOR)
+    return vec_binary_op(ND_ADD, lhs, rhs, tok);
+
   // complex + complex (or complex + scalar, scalar + complex)
   if (is_complex(lhs->ty) || is_complex(rhs->ty)) {
     // Promote scalar to complex if needed
@@ -1869,6 +2083,10 @@ static Node *new_add(Node *lhs, Node *rhs, Token *tok) {
 static Node *new_sub(Node *lhs, Node *rhs, Token *tok) {
   add_type(lhs);
   add_type(rhs);
+
+  // Vector subtraction: decompose into element-wise ops
+  if (lhs->ty->kind == TY_VECTOR || rhs->ty->kind == TY_VECTOR)
+    return vec_binary_op(ND_SUB, lhs, rhs, tok);
 
   // complex - complex
   if (is_complex(lhs->ty) || is_complex(rhs->ty)) {
@@ -1954,11 +2172,20 @@ static Node *logand(Token **rest, Token *tok) {
   return node;
 }
 
+// Helper: create binary node, decomposing to element-wise if vector operands
+static Node *new_vec_or_binary(NodeKind kind, Node *lhs, Node *rhs, Token *tok) {
+  add_type(lhs);
+  add_type(rhs);
+  if (lhs->ty->kind == TY_VECTOR || rhs->ty->kind == TY_VECTOR)
+    return vec_binary_op(kind, lhs, rhs, tok);
+  return new_binary(kind, lhs, rhs, tok);
+}
+
 static Node *bitor_(Token **rest, Token *tok) {
   Node *node = bitxor(&tok, tok);
   while (equal(tok, "|")) {
     Token *start = tok;
-    node = new_binary(ND_BITOR, node, bitxor(&tok, tok->next), start);
+    node = new_vec_or_binary(ND_BITOR, node, bitxor(&tok, tok->next), start);
   }
   *rest = tok;
   return node;
@@ -1968,7 +2195,7 @@ static Node *bitxor(Token **rest, Token *tok) {
   Node *node = bitand(&tok, tok);
   while (equal(tok, "^")) {
     Token *start = tok;
-    node = new_binary(ND_BITXOR, node, bitand(&tok, tok->next), start);
+    node = new_vec_or_binary(ND_BITXOR, node, bitand(&tok, tok->next), start);
   }
   *rest = tok;
   return node;
@@ -1978,7 +2205,7 @@ static Node *bitand(Token **rest, Token *tok) {
   Node *node = equality(&tok, tok);
   while (equal(tok, "&")) {
     Token *start = tok;
-    node = new_binary(ND_BITAND, node, equality(&tok, tok->next), start);
+    node = new_vec_or_binary(ND_BITAND, node, equality(&tok, tok->next), start);
   }
   *rest = tok;
   return node;
@@ -1992,7 +2219,9 @@ static Node *equality(Token **rest, Token *tok) {
       Node *rhs = relational(&tok, tok->next);
       add_type(node);
       add_type(rhs);
-      if (is_complex(node->ty) || is_complex(rhs->ty)) {
+      if (node->ty->kind == TY_VECTOR || rhs->ty->kind == TY_VECTOR) {
+        node = vec_binary_op(ND_EQ, node, rhs, start);
+      } else if (is_complex(node->ty) || is_complex(rhs->ty)) {
         // Complex ==: both real and imag must be equal
         Node *lr = is_complex(node->ty) ? new_real(node, start) : node;
         Node *li = is_complex(node->ty) ? new_imag(node, start) : new_num(0, start);
@@ -2010,7 +2239,9 @@ static Node *equality(Token **rest, Token *tok) {
       Node *rhs = relational(&tok, tok->next);
       add_type(node);
       add_type(rhs);
-      if (is_complex(node->ty) || is_complex(rhs->ty)) {
+      if (node->ty->kind == TY_VECTOR || rhs->ty->kind == TY_VECTOR) {
+        node = vec_binary_op(ND_NE, node, rhs, start);
+      } else if (is_complex(node->ty) || is_complex(rhs->ty)) {
         // Complex !=: either real or imag differs
         Node *lr = is_complex(node->ty) ? new_real(node, start) : node;
         Node *li = is_complex(node->ty) ? new_imag(node, start) : new_num(0, start);
@@ -2034,19 +2265,19 @@ static Node *relational(Token **rest, Token *tok) {
   for (;;) {
     Token *start = tok;
     if (equal(tok, "<")) {
-      node = new_binary(ND_LT, node, shift(&tok, tok->next), start);
+      node = new_vec_or_binary(ND_LT, node, shift(&tok, tok->next), start);
       continue;
     }
     if (equal(tok, "<=")) {
-      node = new_binary(ND_LE, node, shift(&tok, tok->next), start);
+      node = new_vec_or_binary(ND_LE, node, shift(&tok, tok->next), start);
       continue;
     }
     if (equal(tok, ">")) {
-      node = new_binary(ND_LT, shift(&tok, tok->next), node, start);
+      node = new_vec_or_binary(ND_LT, shift(&tok, tok->next), node, start);
       continue;
     }
     if (equal(tok, ">=")) {
-      node = new_binary(ND_LE, shift(&tok, tok->next), node, start);
+      node = new_vec_or_binary(ND_LE, shift(&tok, tok->next), node, start);
       continue;
     }
     *rest = tok;
@@ -2059,11 +2290,11 @@ static Node *shift(Token **rest, Token *tok) {
   for (;;) {
     Token *start = tok;
     if (equal(tok, "<<")) {
-      node = new_binary(ND_SHL, node, add(&tok, tok->next), start);
+      node = new_vec_or_binary(ND_SHL, node, add(&tok, tok->next), start);
       continue;
     }
     if (equal(tok, ">>")) {
-      node = new_binary(ND_SHR, node, add(&tok, tok->next), start);
+      node = new_vec_or_binary(ND_SHR, node, add(&tok, tok->next), start);
       continue;
     }
     *rest = tok;
@@ -2158,7 +2389,7 @@ static Node *mul(Token **rest, Token *tok) {
       continue;
     }
     if (equal(tok, "%")) {
-      node = new_binary(ND_MOD, node, cast(&tok, tok->next), start);
+      node = new_vec_or_binary(ND_MOD, node, cast(&tok, tok->next), start);
       continue;
     }
     *rest = tok;
@@ -2199,6 +2430,8 @@ static Node *unary(Token **rest, Token *tok) {
   if (equal(tok, "-")) {
     Node *operand = cast(rest, tok->next);
     add_type(operand);
+    if (operand->ty->kind == TY_VECTOR)
+      return vec_unary_op(ND_NEG, operand, tok);
     if (is_complex(operand->ty)) {
       return new_complex_val(
         new_unary(ND_NEG, new_real(operand, tok), tok),
@@ -2223,6 +2456,8 @@ static Node *unary(Token **rest, Token *tok) {
   if (equal(tok, "~")) {
     Node *operand = cast(rest, tok->next);
     add_type(operand);
+    if (operand->ty->kind == TY_VECTOR)
+      return vec_unary_op(ND_BITNOT, operand, tok);
     if (is_complex(operand->ty)) {
       // Complex conjugate: negate the imaginary part
       return new_complex_val(
@@ -2329,7 +2564,11 @@ static Node *unary(Token **rest, Token *tok) {
     Node *node = unary(&tok, tok);
     add_type(node);
     *rest = skip(tok, ")");
-    return new_ulong(node->ty->align, tok);
+    // For variables/functions with explicit alignment, use the Obj's align
+    int al = node->ty->align;
+    if (node->kind == ND_VAR && node->var->align > al)
+      al = node->var->align;
+    return new_ulong(al, tok);
   }
 
   return postfix(rest, tok);
@@ -2425,12 +2664,23 @@ static Node *postfix(Token **rest, Token *tok) {
   Node *node = primary(&tok, tok);
 
   for (;;) {
-    // Array access: a[b] → *(a + b)
+    // Array/vector subscript
     if (equal(tok, "[")) {
       Token *start = tok;
       Node *idx = expr(&tok, tok->next);
       tok = skip(tok, "]");
-      node = new_unary(ND_DEREF, new_add(node, idx, start), start);
+      add_type(node);
+      if (node->ty->kind == TY_VECTOR) {
+        // Vector subscript: v[i] → extract element i
+        // Compute address: (elem_type *)&v + i, then dereference
+        Type *elem_ty = node->ty->base;
+        Node *addr = new_unary(ND_ADDR, node, start);
+        addr = new_cast(addr, pointer_to(elem_ty));
+        node = new_unary(ND_DEREF, new_add(addr, idx, start), start);
+      } else {
+        // Array access: a[b] → *(a + b)
+        node = new_unary(ND_DEREF, new_add(node, idx, start), start);
+      }
       continue;
     }
 
@@ -2836,6 +3086,32 @@ static Node *primary(Token **rest, Token *tok) {
     return node;
   }
 
+  // abs/labs/llabs — inline absolute value (GCC treats these as builtins)
+  if ((equal(tok, "abs") || equal(tok, "labs") || equal(tok, "llabs")) &&
+      equal(tok->next, "(")) {
+    bool is_long = equal(tok, "labs") || equal(tok, "llabs");
+    Token *start = tok;
+    tok = skip(tok->next, "(");
+    Node *arg = assign(&tok, tok);
+    *rest = skip(tok, ")");
+    add_type(arg);
+    // Generate: x < 0 ? -x : x  (using a temp variable to avoid double evaluation)
+    Type *rty = is_long ? ty_long : ty_int;
+    Obj *tmp = new_lvar("", rty);
+    Node *store = new_binary(ND_ASSIGN, new_var_node(tmp, start), new_cast(arg, rty), start);
+    Node *zero = new_num(0, start);
+    zero->ty = rty;
+    Node *cond = new_binary(ND_LT, new_var_node(tmp, start), zero, start);
+    Node *neg = new_unary(ND_NEG, new_var_node(tmp, start), start);
+    neg->ty = rty;
+    Node *ternary = new_node(ND_COND, start);
+    ternary->cond = cond;
+    ternary->then = neg;
+    ternary->els = new_var_node(tmp, start);
+    ternary->ty = rty;
+    return new_binary(ND_COMMA, store, ternary, start);
+  }
+
   // __builtin_classify_type(x) — return integer classification
   if (equal(tok, "__builtin_classify_type")) {
     tok = skip(tok->next, "(");
@@ -3070,8 +3346,22 @@ static Node *funcall(Token **rest, Token *tok, Node *fn) {
 
   *rest = skip(tok, ")");
 
+  // For nested function direct calls: append captured variable addresses
+  bool is_nested_call = vs && vs->var && vs->var->is_nested;
+  if (is_nested_call) {
+    CapturedVar *caps = (CapturedVar *)(void *)vs->var->chain_param;
+    for (CapturedVar *cv = caps; cv; cv = cv->next) {
+      Node *addr = new_unary(ND_ADDR, new_var_node(cv->outer_var, start), start);
+      add_type(addr);
+      cur = cur->next = addr;
+    }
+  }
+
   Node *node = new_node(ND_FUNCALL, start);
-  node->funcname = strndup_checked(start->loc, start->len);
+  if (is_nested_call)
+    node->funcname = vs->var->name;
+  else
+    node->funcname = strndup_checked(start->loc, start->len);
   node->func_ty = func_ty;
   node->ty = func_ty->return_ty;
   node->args = head.next;
@@ -3428,7 +3718,32 @@ static Node *compound_stmt(Token **rest, Token *tok) {
 
   enter_scope();
 
+  // Handle __label__ declarations (GCC extension) at start of block
+  while (equal(tok, "__label__")) {
+    tok = tok->next;
+    while (!equal(tok, ";")) {
+      if (tok->kind != TK_IDENT)
+        error_tok(tok, "expected label name");
+      tok = tok->next;
+      consume(&tok, tok, ",");
+    }
+    tok = skip(tok, ";");
+  }
+
   while (!equal(tok, "}")) {
+    // Handle __label__ declarations that appear later in block
+    if (equal(tok, "__label__")) {
+      tok = tok->next;
+      while (!equal(tok, ";")) {
+        if (tok->kind != TK_IDENT)
+          error_tok(tok, "expected label name");
+        tok = tok->next;
+        consume(&tok, tok, ",");
+      }
+      tok = skip(tok, ";");
+      continue;
+    }
+
     if (is_typename(tok) && !equal(tok->next, ":")) {
       VarAttr attr = {};
       Type *basety = declspec(&tok, tok, &attr);
@@ -3439,9 +3754,11 @@ static Node *compound_stmt(Token **rest, Token *tok) {
         continue;
       }
 
-      // Check for function definition (shouldn't appear here but handle gracefully)
-      if (is_function_definition(tok, basety)) {
-        error_tok(tok, "function definition not allowed here");
+      // GCC nested function definition
+      if (current_fn && is_function_definition(tok, basety)) {
+        Type *fn_ty = declarator(&tok, tok, basety);
+        tok = nested_function(tok, fn_ty, &attr, &cur);
+        continue;
       }
 
       cur = cur->next = declaration(&tok, tok, basety, &attr);
@@ -3697,7 +4014,7 @@ static void initializer2(Token **rest, Token *tok, Initializer *init) {
   }
 
   if (init->ty->kind == TY_STRUCT) {
-    if (equal(tok, "{")) {
+    if (equal(tok, "{") || equal(tok, ".")) {
       struct_initializer1(rest, tok, init);
       return;
     }
@@ -3805,9 +4122,24 @@ static void array_initializer1(Token **rest, Token *tok, Initializer *init) {
 
     // Designated initializer
     if (equal(tok, "[")) {
-      i = const_expr_val(&tok, tok->next);
+      int lo = const_expr_val(&tok, tok->next);
+      // Range designator: [lo ... hi] = val
+      if (equal(tok, "...")) {
+        int hi = const_expr_val(&tok, tok->next);
+        tok = skip(tok, "]");
+        if (!consume(&tok, tok, "="))
+          ; // = is optional in some modes
+        // Parse the value expression once, then assign to all elements
+        Node *val = assign(&tok, tok);
+        for (int j = lo; j <= hi && j < init->ty->array_len; j++)
+          init->children[j]->expr = val;
+        i = hi;
+        continue;
+      }
+      i = lo;
       tok = skip(tok, "]");
-      tok = skip(tok, "=");
+      if (!consume(&tok, tok, "="))
+        ; // = is optional
     }
 
     if (equal(tok, ".") || equal(tok, "[")) {
@@ -3853,9 +4185,11 @@ static void struct_initializer1(Token **rest, Token *tok, Initializer *init) {
       if (is_end(tok)) break; // trailing comma
     }
 
-    // Designated initializer
-    if (equal(tok, ".")) {
-      tok = tok->next;
+    // Designated initializer: .field = val  or  field: val (old GCC syntax)
+    if (equal(tok, ".") ||
+        (tok->kind == TK_IDENT && equal(tok->next, ":"))) {
+      bool old_style = !equal(tok, ".");
+      if (!old_style) tok = tok->next;
       // Find member
       Member *m = init->ty->members;
       for (; m; m = m->next) {
@@ -3868,8 +4202,28 @@ static void struct_initializer1(Token **rest, Token *tok, Initializer *init) {
       if (!m)
         error_tok(tok, "no such struct member");
       tok = tok->next;
-      if (!consume(&tok, tok, "="))
+
+      // Compute member index
+      int idx = 0;
+      Member *m2 = init->ty->members;
+      for (; m2 != mem; m2 = m2->next)
+        idx++;
+
+      // Nested designator: .a.j = 5 or .a[0] = 5
+      if (!old_style && (equal(tok, ".") || equal(tok, "["))) {
+        initializer2(&tok, tok, init->children[idx]);
+        mem = mem->next;
+        continue;
+      }
+
+      if (old_style)
+        tok = skip(tok, ":");
+      else if (!consume(&tok, tok, "="))
         ; // designator without = is allowed in some modes
+
+      initializer2(&tok, tok, init->children[idx]);
+      mem = mem->next;
+      continue;
     }
 
     int idx = 0;
@@ -3899,8 +4253,9 @@ static void union_initializer(Token **rest, Token *tok, Initializer *init) {
   // Initialize first member by default
   int idx = 0;
 
-  if (equal(tok, ".")) {
-    tok = tok->next;
+  if (equal(tok, ".") || (tok->kind == TK_IDENT && equal(tok->next, ":"))) {
+    bool old_style = !equal(tok, ".");
+    if (!old_style) tok = tok->next;
     Member *m = init->ty->members;
     int j = 0;
     for (; m; m = m->next, j++) {
@@ -3911,10 +4266,19 @@ static void union_initializer(Token **rest, Token *tok, Initializer *init) {
       }
     }
     tok = tok->next;
-    consume(&tok, tok, "=");
+    if (old_style) {
+      tok = skip(tok, ":");
+      initializer2(&tok, tok, init->children[idx]);
+    } else if (equal(tok, ".") || equal(tok, "[")) {
+      // Nested designator: .f.f9 = val
+      initializer2(&tok, tok, init->children[idx]);
+    } else {
+      consume(&tok, tok, "=");
+      initializer2(&tok, tok, init->children[idx]);
+    }
+  } else {
+    initializer2(&tok, tok, init->children[idx]);
   }
-
-  initializer2(&tok, tok, init->children[idx]);
 
   if (has_brace) {
     consume(&tok, tok, ",");
@@ -3941,9 +4305,18 @@ static int count_array_init_elements(Token *tok, Type *ty) {
       if (is_end(tok)) break;
     }
     if (equal(tok, "[")) {
-      i = const_expr_val(&tok, tok->next);
+      int lo = const_expr_val(&tok, tok->next);
+      if (equal(tok, "...")) {
+        int hi = const_expr_val(&tok, tok->next);
+        tok = skip(tok, "]");
+        consume(&tok, tok, "=");
+        initializer2(&tok, tok, dummy);
+        i = hi;
+        continue;
+      }
+      i = lo;
       tok = skip(tok, "]");
-      tok = skip(tok, "=");
+      consume(&tok, tok, "=");
     }
     initializer2(&tok, tok, dummy);
   }
@@ -4325,16 +4698,27 @@ Obj *parse(Token *tok) {
         continue;
       }
 
-      // Function declaration
-      // Create a global variable for the function
-      char *name = strndup_checked(ty->name->loc, ty->name->len);
-      Obj *fn = new_gvar(name, ty);
-      fn->is_function = true;
-      fn->is_definition = false;
-      fn->is_static = attr.is_static;
+      // Function declaration (possibly comma-separated: void foo(), bar();)
+      for (;;) {
+        char *name = strndup_checked(ty->name->loc, ty->name->len);
+        Obj *fn = new_gvar(name, ty);
+        fn->is_function = true;
+        fn->is_definition = false;
+        fn->is_static = attr.is_static;
 
-      tok = skip_asm_label(tok);
-      tok = attribute_list(tok, ty, &attr);
+        tok = skip_asm_label(tok);
+        tok = attribute_list(tok, ty, &attr);
+        // Update alignment from attributes (attribute_list may set ty->align/attr.align)
+        if (ty->align > fn->align)
+          fn->align = ty->align;
+        if (attr.align > fn->align)
+          fn->align = attr.align;
+
+        if (!equal(tok, ","))
+          break;
+        tok = tok->next; // skip comma
+        ty = declarator(&tok, tok, basety);
+      }
       tok = skip(tok, ";");
       continue;
     }
@@ -4356,8 +4740,16 @@ Obj *parse(Token *tok) {
 static Token *function(Token *tok, Type *fn_ty, VarAttr *attr) {
   char *name = strndup_checked(fn_ty->name->loc, fn_ty->name->len);
 
+  // Preserve alignment from prior declaration
+  VarScope *prev = find_var(fn_ty->name);
+  int prev_align = 0;
+  if (prev && prev->var && prev->var->is_function)
+    prev_align = prev->var->align;
+
   Obj *fn = new_gvar(name, fn_ty);
   fn->is_function = true;
+  if (prev_align > fn->align)
+    fn->align = prev_align;
   fn->is_definition = true;
   fn->is_static = attr->is_static;
   fn->is_inline = attr->is_inline;
@@ -4489,6 +4881,178 @@ static Token *function(Token *tok, Type *fn_ty, VarAttr *attr) {
   return tok;
 }
 
+// ---- Nested function support (GCC extension) ----
+
+static bool is_in_locals(Obj *var, Obj *locals_list) {
+  for (Obj *v = locals_list; v; v = v->next)
+    if (v == var) return true;
+  return false;
+}
+
+static CapturedVar *find_or_create_capture(Obj *outer_var) {
+  for (CapturedVar *cv = captured_vars; cv; cv = cv->next)
+    if (cv->outer_var == outer_var)
+      return cv;
+  char *ptr_name = format("__cap_%s__", outer_var->name);
+  Obj *inner_ptr = new_lvar(ptr_name, pointer_to(outer_var->ty));
+  CapturedVar *cv = calloc_checked(1, sizeof(CapturedVar));
+  cv->outer_var = outer_var;
+  cv->inner_ptr = inner_ptr;
+  cv->next = captured_vars;
+  captured_vars = cv;
+  return cv;
+}
+
+static void rewrite_nested_var_refs(Node *node, Obj *outer_fn) {
+  if (!node) return;
+  rewrite_nested_var_refs(node->lhs, outer_fn);
+  rewrite_nested_var_refs(node->rhs, outer_fn);
+  rewrite_nested_var_refs(node->cond, outer_fn);
+  rewrite_nested_var_refs(node->then, outer_fn);
+  rewrite_nested_var_refs(node->els, outer_fn);
+  rewrite_nested_var_refs(node->init, outer_fn);
+  rewrite_nested_var_refs(node->inc, outer_fn);
+  for (Node *n = node->body; n; n = n->next)
+    rewrite_nested_var_refs(n, outer_fn);
+  for (Node *n = node->args; n; n = n->next)
+    rewrite_nested_var_refs(n, outer_fn);
+  for (int i = 0; i < node->asm_num_outputs; i++)
+    rewrite_nested_var_refs(node->asm_output_exprs[i], outer_fn);
+  for (int i = 0; i < node->asm_num_inputs; i++)
+    rewrite_nested_var_refs(node->asm_input_exprs[i], outer_fn);
+  rewrite_nested_var_refs(node->cas_addr, outer_fn);
+  rewrite_nested_var_refs(node->cas_old, outer_fn);
+  rewrite_nested_var_refs(node->cas_new, outer_fn);
+  if (node->kind == ND_VAR && node->var && node->var->is_local) {
+    if (is_in_locals(node->var, outer_fn->locals)) {
+      CapturedVar *cv = find_or_create_capture(node->var);
+      Node *ptr_node = new_var_node(cv->inner_ptr, node->tok);
+      node->kind = ND_DEREF;
+      node->lhs = ptr_node;
+      node->var = NULL;
+      add_type(node);
+    }
+  }
+}
+
+static Token *nested_function(Token *tok, Type *fn_ty, VarAttr *attr, Node **cur) {
+  (void)attr;
+  if (!fn_ty->name)
+    error_tok(tok, "nested function has no name");
+  char *inner_name = strndup_checked(fn_ty->name->loc, fn_ty->name->len);
+  char *mangled_name = format("%s.%s", current_fn->name, inner_name);
+
+  Obj *saved_fn = current_fn;
+  Obj *saved_locals = locals;
+  Node *saved_gotos = gotos;
+  Node *saved_labels = labels;
+  char *saved_brk = brk_label;
+  char *saved_cont = cont_label;
+  Node *saved_switch = current_switch;
+  CapturedVar *saved_captures = captured_vars;
+
+  Obj *fn = new_gvar(mangled_name, fn_ty);
+  fn->is_function = true;
+  fn->is_definition = true;
+  fn->is_static = true;
+  fn->is_variadic = fn_ty->is_variadic;
+  fn->is_nested = true;
+  fn->enclosing_fn = saved_fn;
+
+  current_fn = fn;
+  locals = NULL;
+  gotos = NULL;
+  labels = NULL;
+  brk_label = NULL;
+  cont_label = NULL;
+  current_switch = NULL;
+  captured_vars = NULL;
+
+  enter_scope();
+
+  Type *nf_param_ty = fn_ty->params;
+  int nf_nparams = 0;
+  for (Type *t = nf_param_ty; t; t = t->next) nf_nparams++;
+  Type **nf_param_arr = calloc_checked(nf_nparams, sizeof(Type *));
+  { int i = 0; for (Type *t = nf_param_ty; t; t = t->next) nf_param_arr[i++] = t; }
+  for (int i = nf_nparams - 1; i >= 0; i--) {
+    if (!nf_param_arr[i]->name)
+      error_tok(fn_ty->name, "parameter name omitted");
+    char *pname = strndup_checked(nf_param_arr[i]->name->loc, nf_param_arr[i]->name->len);
+    new_lvar(pname, nf_param_arr[i]);
+  }
+  free(nf_param_arr);
+  fn->params = locals;
+
+  if (!equal(tok, "{")) {
+    while (!equal(tok, "{")) {
+      Type *nf_basety = declspec(&tok, tok, NULL);
+      bool first = true;
+      while (!consume(&tok, tok, ";")) {
+        if (!first) tok = skip(tok, ",");
+        first = false;
+        Type *ty2 = declarator(&tok, tok, nf_basety);
+        if (!ty2->name) error_tok(tok, "parameter name omitted");
+        char *pname = strndup_checked(ty2->name->loc, ty2->name->len);
+        for (Obj *p = fn->params; p; p = p->next)
+          if (!strcmp(p->name, pname)) { p->ty = ty2; p->align = ty2->align; break; }
+      }
+    }
+  }
+
+  if (fn_ty->is_variadic) {
+    fn->va_area = new_lvar("__va_area__", pointer_to(ty_char));
+    fn->va_area->align = 8;
+  }
+  fn->alloca_bottom = new_lvar("__alloca_bottom__", pointer_to(ty_char));
+
+  fn->body = compound_stmt(&tok, tok);
+
+  Obj temp_outer;
+  memset(&temp_outer, 0, sizeof(temp_outer));
+  temp_outer.locals = saved_locals;
+  rewrite_nested_var_refs(fn->body, &temp_outer);
+
+  CapturedVar *my_captures = captured_vars;
+
+  for (Node *g = gotos; g; g = g->goto_next) {
+    if (g->kind != ND_LABEL_VAL) continue;
+    for (Node *l = labels; l; l = l->goto_next)
+      if (!strcmp(g->label, l->label)) { l->unique_label = g->unique_label; break; }
+  }
+  for (Node *g = gotos; g; g = g->goto_next) {
+    if (g->kind == ND_LABEL_VAL) continue;
+    for (Node *l = labels; l; l = l->goto_next)
+      if (!strcmp(g->label, l->label)) { g->unique_label = l->unique_label; break; }
+    if (!g->unique_label && g->kind == ND_GOTO)
+      error_tok(g->tok, "use of undeclared label '%s'", g->label);
+  }
+
+  fn->locals = locals;
+  leave_scope();
+
+  current_fn = saved_fn;
+  locals = saved_locals;
+  gotos = saved_gotos;
+  labels = saved_labels;
+  brk_label = saved_brk;
+  cont_label = saved_cont;
+  current_switch = saved_switch;
+  captured_vars = saved_captures;
+
+  fn->chain_param = (Obj *)(void *)my_captures;
+
+  VarScope *vs = push_scope(inner_name);
+  vs->var = fn;
+
+  Node *nop = new_node(ND_NULL_EXPR, fn_ty->name);
+  *cur = (*cur)->next = nop;
+
+  return tok;
+}
+
+// ---- End nested function support ----
+
 static Token *global_variable(Token *tok, Type *ty, Type *basety, VarAttr *attr) {
   // ty already has the first declarator parsed (name, type suffix, etc.)
   // basety is the original base type from declspec (before array/pointer suffixes)
@@ -4526,4 +5090,15 @@ static Token *global_variable(Token *tok, Type *ty, Type *basety, VarAttr *attr)
   }
 
   return tok;
+}
+
+// Stub: nested function support (not yet fully implemented)
+static Token *nested_function(Token *tok, Type *fn_ty, VarAttr *attr, Node **cur) {
+  (void)attr; (void)cur;
+  error_tok(fn_ty->name, "nested functions are not supported");
+  return tok; // unreachable
+}
+
+static void rewrite_nested_var_refs(Node *node, Obj *outer_fn) {
+  (void)node; (void)outer_fn;
 }
