@@ -421,6 +421,7 @@ struct Type {
   // VLA
   Node *vla_len;   // number of elements
   Obj *vla_size;   // sizeof() value (runtime computed)
+  Token *vla_dim_tok; // token range for VLA dimension (for re-parsing side effects)
 
   // Struct / Union
   Member *members;

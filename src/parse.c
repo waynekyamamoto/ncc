@@ -471,6 +471,7 @@ typedef struct {
   int align;
   int vector_size;  // __attribute__((vector_size(N)))
   char *alias_target; // __attribute__((alias("name")))
+  int mode_kind;    // __attribute__((mode(X))): 1=QI, 2=HI, 4=SI, 8=DI
 } VarAttr;
 
 // Helper: check if a type (or any of its members) contains a VLA
@@ -940,6 +941,28 @@ static Type *declspec(Token **rest, Token *tok, VarAttr *attr) {
     if (is_volatile) ty->is_volatile = true;
   }
 
+  // Apply __attribute__((mode(X))) — changes the type's size.
+  // Must be done after type resolution to avoid corrupting global type singletons.
+  if (attr && attr->mode_kind) {
+    bool is_unsigned = ty->is_unsigned || (counter & UNSIGNED);
+    Type *new_ty;
+    switch (attr->mode_kind) {
+    case 1: new_ty = is_unsigned ? ty_uchar : ty_char; break;
+    case 2: new_ty = is_unsigned ? ty_ushort : ty_short; break;
+    case 4: new_ty = is_unsigned ? ty_uint : ty_int; break;
+    case 8: new_ty = is_unsigned ? ty_ulong : ty_long; break;
+    default: new_ty = ty; break;
+    }
+    ty = copy_type(new_ty);
+  }
+
+  // Apply __attribute__((vector_size(N))) — convert scalar type to vector.
+  // Deferred from attribute_list to avoid corrupting global type singletons.
+  if (attr && attr->vector_size && ty->kind != TY_VECTOR && ty->size > 0) {
+    Type *base_copy = copy_type(ty);
+    ty = vector_of(base_copy, attr->vector_size);
+  }
+
   *rest = tok;
   return ty;
 }
@@ -1023,8 +1046,12 @@ static Type *func_params(Token **rest, Token *tok, Type *ty) {
 
     // Array parameters decay to pointers
     if (ty2->kind == TY_ARRAY || ty2->kind == TY_VLA) {
+      // Save VLA length expression for side-effect evaluation in function body
+      // Save VLA dimension tokens for side-effect re-parsing in function body
+      Token *saved_vla_tok = (ty2->kind == TY_VLA) ? ty2->vla_dim_tok : NULL;
       ty2 = pointer_to(ty2->base);
       ty2->name = name;
+      ty2->vla_dim_tok = saved_vla_tok;
     }
     // Function parameters decay to pointers
     if (ty2->kind == TY_FUNC) {
@@ -1064,7 +1091,9 @@ static Type *array_dimensions(Token **rest, Token *tok, Type *ty) {
   }
 
   // Handle [N] or [expr]
+  Token *dim_start = tok;  // save for VLA param side-effect re-parsing
   Node *expr_node = cond_expr(&tok, tok);
+  Token *dim_end = tok;    // points to "]"
   tok = skip(tok, "]");
   ty = type_suffix(&tok, tok, ty);
 
@@ -1101,7 +1130,15 @@ static Type *array_dimensions(Token **rest, Token *tok, Type *ty) {
 
   // VLA
   *rest = tok;
-  return vla_of(ty, expr_node);
+  Type *vla = vla_of(ty, expr_node);
+  // Save token range for VLA parameter side-effect re-parsing
+  // Create a sentinel token at the end to mark the boundary
+  Token sentinel = *dim_end;
+  sentinel.kind = TK_EOF;
+  // We'll store the start token; the expression ends at dim_end ("]")
+  vla->vla_dim_tok = dim_start;
+  (void)dim_end;
+  return vla;
 }
 
 static Type *type_suffix(Token **rest, Token *tok, Type *ty) {
@@ -1458,22 +1495,40 @@ static Token *attribute_list(Token *tok, Type *ty, VarAttr *attr) {
         int vs = const_expr_val(&tok, tok);
         tok = skip(tok, ")");
         if (attr) attr->vector_size = vs;
-        // If ty is provided directly (e.g. from typedef), convert it to vector type
-        if (ty && ty->kind != TY_VECTOR && ty->size > 0) {
-          // Copy the base type to avoid self-reference when we overwrite *ty
+        // If ty is provided directly and we're NOT in declspec (attr is NULL),
+        // convert it to vector type immediately. When attr is available,
+        // vector_size is deferred to avoid corrupting global type singletons.
+        if (!attr && ty && ty->kind != TY_VECTOR && ty->size > 0) {
           Type *base_copy = copy_type(ty);
           Type *vec = vector_of(base_copy, vs);
-          // Preserve name and name_pos from original type
           Token *saved_name = ty->name;
           Token *saved_name_pos = ty->name_pos;
           *ty = *vec;
           ty->name = saved_name;
           ty->name_pos = saved_name_pos;
         }
+      } else if (equal(tok, "mode") || equal(tok, "__mode__")) {
+        tok = tok->next;
+        tok = skip(tok, "(");
+        // Parse the mode name: QI=1byte, HI=2bytes, SI=4bytes, DI=8bytes
+        // Store mode in attr; it will be applied after type copy in declspec/typedef.
+        if (attr) {
+          if (equal(tok, "QI") || equal(tok, "__QI__") ||
+              equal(tok, "byte") || equal(tok, "__byte__"))
+            attr->mode_kind = 1;
+          else if (equal(tok, "HI") || equal(tok, "__HI__"))
+            attr->mode_kind = 2;
+          else if (equal(tok, "SI") || equal(tok, "__SI__") ||
+                   equal(tok, "word") || equal(tok, "__word__"))
+            attr->mode_kind = 4;
+          else if (equal(tok, "DI") || equal(tok, "__DI__"))
+            attr->mode_kind = 8;
+        }
+        tok = tok->next;
+        tok = skip(tok, ")");
       } else if (equal(tok, "format") || equal(tok, "__format__") ||
                  equal(tok, "sentinel") || equal(tok, "alloc_size") ||
-                 equal(tok, "cleanup") || equal(tok, "nonnull") ||
-                 equal(tok, "mode")) {
+                 equal(tok, "cleanup") || equal(tok, "nonnull")) {
         tok = tok->next;
         tok = skip(tok, "(");
         int level = 1;
@@ -2598,9 +2653,10 @@ static Node *unary(Token **rest, Token *tok) {
         break;
       }
     }
-    // Use a non-temporary symbol name (no ".L" prefix) so it survives
-    // Mach-O linking when referenced from data sections.
-    node->unique_label = shared_label ? shared_label : format("L_cg_%d", label_cnt++);
+    // Use a non-local symbol name so it survives Mach-O linking when
+    // referenced from data sections. Labels starting with 'L' are local
+    // symbols on macOS and get stripped, so use '_cg_' prefix instead.
+    node->unique_label = shared_label ? shared_label : format("_cg_%d", label_cnt++);
     node->goto_next = gotos;
     gotos = node;
     *rest = tok->next->next;
@@ -5262,8 +5318,42 @@ static Token *function(Token *tok, Type *fn_ty, VarAttr *attr) {
   // alloca bottom
   fn->alloca_bottom = new_lvar("__alloca_bottom__", pointer_to(ty_char));
 
+  // Evaluate VLA parameter side-effect expressions (e.g., int array[i++]).
+  // Re-parse the saved token range in the function body scope so that
+  // variable references resolve to real parameter Objs and temp vars
+  // are allocated in the correct locals list.
+  Node *vla_side_effects = NULL;
+  for (Type *pt = fn_ty->params; pt; pt = pt->next) {
+    if (pt->vla_dim_tok) {
+      // Find the "]" token that ends this dimension expression
+      Token *end_tok = pt->vla_dim_tok;
+      while (end_tok && !equal(end_tok, "]")) end_tok = end_tok->next;
+      if (end_tok) {
+        // Temporarily insert EOF sentinel to bound the re-parse
+        Token saved = *end_tok;
+        end_tok->kind = TK_EOF;
+        Token *parse_tok = pt->vla_dim_tok;
+        Node *expr = cond_expr(&parse_tok, parse_tok);
+        *end_tok = saved;  // restore
+        add_type(expr);
+        Node *stmt = new_unary(ND_EXPR_STMT, expr, pt->vla_dim_tok);
+        add_type(stmt);
+        stmt->next = vla_side_effects;
+        vla_side_effects = stmt;
+      }
+    }
+  }
+
   // Parse function body — tok points at "{"
   fn->body = compound_stmt(&tok, tok);
+
+  // Prepend VLA side-effect expressions to function body
+  if (vla_side_effects) {
+    Node *last = vla_side_effects;
+    while (last->next) last = last->next;
+    last->next = fn->body->body;
+    fn->body->body = vla_side_effects;
+  }
 
 
   // Resolve goto labels.
@@ -5408,6 +5498,7 @@ static Token *nested_function(Token *tok, Type *fn_ty, VarAttr *attr, Node **cur
   temp_outer.locals = saved_locals;
   temp_outer.chain_param = chain_var;
   rewrite_nested_var_refs(fn->body, &temp_outer);
+  // Resolve labels within the nested function first
   for (Node *g = gotos; g; g = g->goto_next) {
     if (g->kind != ND_LABEL_VAL) continue;
     for (Node *l = labels; l; l = l->goto_next)
@@ -5420,12 +5511,36 @@ static Token *nested_function(Token *tok, Type *fn_ty, VarAttr *attr, Node **cur
     if (!g->unique_label && g->kind == ND_GOTO)
       error_tok(g->tok, "use of undeclared label '%s'", g->label);
   }
+  // Collect unresolved ND_LABEL_VAL nodes (referencing outer labels via __label__)
+  // to propagate to the outer function's gotos list for resolution.
+  Node *unresolved_label_vals = NULL;
+  for (Node *g = gotos; g; g = g->goto_next) {
+    if (g->kind != ND_LABEL_VAL) continue;
+    bool found = false;
+    for (Node *l = labels; l; l = l->goto_next)
+      if (!strcmp(g->label, l->label)) { found = true; break; }
+    if (!found) {
+      // Clone the node reference for the outer scope's gotos list
+      Node *copy = new_node(ND_LABEL_VAL, g->tok);
+      copy->label = g->label;
+      copy->unique_label = g->unique_label;
+      copy->goto_next = unresolved_label_vals;
+      unresolved_label_vals = copy;
+    }
+  }
   fn->locals = locals;
   leave_scope();
   current_fn = saved_fn;
   locals = saved_locals;
   gotos = saved_gotos;
   labels = saved_labels;
+  // Add unresolved ND_LABEL_VAL from nested function to outer gotos
+  for (Node *g = unresolved_label_vals; g; ) {
+    Node *next = g->goto_next;
+    g->goto_next = gotos;
+    gotos = g;
+    g = next;
+  }
   brk_label = saved_brk;
   cont_label = saved_cont;
   current_switch = saved_switch;

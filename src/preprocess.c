@@ -1175,20 +1175,23 @@ void init_macros(void) {
   define_macro("__builtin_trap()", "abort()");
   // Bit manipulation builtins - handled as special cases in parse.c primary()
   // We do NOT define these as macros; they are parsed directly.
-  define_macro("__builtin_memset(d,v,n)", "memset((d),(v),(n))");
-  define_macro("__builtin_memcpy(d,s,n)", "memcpy((d),(s),(n))");
-  define_macro("__builtin_memmove(d,s,n)", "memmove(d,s,n)");
-  define_macro("__builtin_memcmp(a,b,n)", "memcmp(a,b,n)");
-  define_macro("__builtin_strcmp(a,b)", "strcmp(a,b)");
-  define_macro("__builtin_strncmp(a,b,n)", "strncmp(a,b,n)");
-  define_macro("__builtin_strcpy(d,s)", "strcpy(d,s)");
-  define_macro("__builtin_strncpy(d,s,n)", "strncpy(d,s,n)");
-  define_macro("__builtin_strlen(s)", "strlen(s)");
+  // Define builtin string/memory functions as object-like macros.
+  // Object-like macros work better than function-like when the builtins
+  // are expanded through macro chains (e.g., #define strcmp __builtin_strcmp).
+  define_macro("__builtin_memset", "memset");
+  define_macro("__builtin_memcpy", "memcpy");
+  define_macro("__builtin_memmove", "memmove");
+  define_macro("__builtin_memcmp", "memcmp");
+  define_macro("__builtin_strcmp", "strcmp");
+  define_macro("__builtin_strncmp", "strncmp");
+  define_macro("__builtin_strcpy", "strcpy");
+  define_macro("__builtin_strncpy", "strncpy");
+  define_macro("__builtin_strlen", "strlen");
   define_macro("__builtin_abort()", "abort()");
   define_macro("__builtin_exit(n)", "exit(n)");
-  define_macro("__builtin_malloc(n)", "malloc(n)");
-  define_macro("__builtin_calloc(n,s)", "calloc(n,s)");
-  define_macro("__builtin_free(p)", "free(p)");
+  define_macro("__builtin_malloc", "malloc");
+  define_macro("__builtin_calloc", "calloc");
+  define_macro("__builtin_free", "free");
   // __builtin_printf/abort: redefine as the libc names.
   // Tests that use these usually also have "void abort(void);" declared,
   // but printf is often undeclared. For undeclared functions, our compiler

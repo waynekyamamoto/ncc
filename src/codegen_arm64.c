@@ -1349,7 +1349,14 @@ static void gen_expr(Node *node) {
     return;
 
   case ND_LABEL_VAL: {
-    println("adr x0, %s", node->unique_label);
+    // Computed goto label address. Use adrp+add for non-local symbols
+    // since adr doesn't support cross-section relocations on Mach-O.
+    if (!strncmp(node->unique_label, "_cg_", 4)) {
+      println("adrp x0, %s@PAGE", node->unique_label);
+      println("add x0, x0, %s@PAGEOFF", node->unique_label);
+    } else {
+      println("adr x0, %s", node->unique_label);
+    }
     return;
   }
 
@@ -1958,18 +1965,24 @@ static void gen_stmt(Node *node) {
     // Pop addresses in reverse order and store register values
     for (int i = node->asm_num_outputs - 1; i >= 0; i--) {
       if (addr_on_stack[i]) {
+        char *c = node->asm_output_constraints[i];
+        // For pure memory constraints ("=m", "+m"), the asm operates on memory
+        // directly; do NOT store back from a register (it may hold garbage).
+        bool is_mem_only = (strchr(c, 'm') != NULL && strchr(c, 'r') == NULL);
         println("ldr x0, [sp], #16"); // pop address
         depth--;
-        // Store the register value to the address
-        Type *ty = node->asm_output_exprs[i]->ty;
-        if (ty->size == 1)
-          println("strb w%d, [x0]", 19 + i);
-        else if (ty->size == 2)
-          println("strh w%d, [x0]", 19 + i);
-        else if (ty->size == 4)
-          println("str w%d, [x0]", 19 + i);
-        else
-          println("str x%d, [x0]", 19 + i);
+        if (!is_mem_only) {
+          // Store the register value to the address
+          Type *ty = node->asm_output_exprs[i]->ty;
+          if (ty->size == 1)
+            println("strb w%d, [x0]", 19 + i);
+          else if (ty->size == 2)
+            println("strh w%d, [x0]", 19 + i);
+          else if (ty->size == 4)
+            println("str w%d, [x0]", 19 + i);
+          else
+            println("str x%d, [x0]", 19 + i);
+        }
       }
     }
 
@@ -2089,10 +2102,10 @@ static void emit_data(Obj *prog) {
 
         if (rel) {
           // Emit a pointer relocation.
-          // Computed goto labels (L_cg_) don't get _ prefix; they are
-          // code labels defined without the Mach-O underscore convention.
+          // Computed goto labels (_cg_) already have the underscore prefix
+          // and are non-local symbols that can be referenced cross-section.
           char *sym = *rel->label;
-          if (!strncmp(sym, "L_cg_", 5))
+          if (!strncmp(sym, "_cg_", 4))
             println(".quad %s+%ld", sym, rel->addend);
           else
             println(".quad _%s+%ld", sym, rel->addend);
