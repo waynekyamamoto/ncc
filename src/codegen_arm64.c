@@ -1611,9 +1611,165 @@ static void gen_stmt(Node *node) {
     gen_expr(node->lhs);
     return;
 
-  case ND_ASM:
-    println("%s", node->asm_str);
+  case ND_ASM: {
+    // If no operands, just emit the template as before
+    if (node->asm_num_outputs == 0 && node->asm_num_inputs == 0) {
+      if (node->asm_str[0] != '\0')
+        println("%s", node->asm_str);
+      return;
+    }
+
+    // Inline asm with register constraints.
+    // We use callee-saved registers x19-x28 for operands so they
+    // don't conflict with the compiler's use of x0-x7.
+    // Operand numbering: outputs 0..N-1, then inputs N..N+M-1.
+    int total = node->asm_num_outputs + node->asm_num_inputs;
+    if (total > 10)
+      error_tok(node->tok, "too many asm operands (max 10)");
+
+    // reg_name[i] = register name for operand i
+    char *reg_name[10];
+    // For outputs we may need the address to store back to
+    // addr_saved[i] = 1 if we saved the address on the stack for output i
+    int addr_on_stack[10] = {0};
+
+    // --- Phase 1: Assign registers to each operand ---
+    // First pass: assign registers for outputs, determine tied inputs
+    for (int i = 0; i < node->asm_num_outputs; i++)
+      reg_name[i] = format("x%d", 19 + i);
+
+    for (int i = 0; i < node->asm_num_inputs; i++) {
+      char *c = node->asm_input_constraints[i];
+      if (c[0] >= '0' && c[0] <= '9') {
+        // Tied operand: use the same register as the referenced output
+        int tied = c[0] - '0';
+        if (tied >= node->asm_num_outputs)
+          error_tok(node->tok, "asm tied operand out of range");
+        reg_name[node->asm_num_outputs + i] = reg_name[tied];
+      } else {
+        reg_name[node->asm_num_outputs + i] = format("x%d", 19 + node->asm_num_outputs + i);
+      }
+    }
+
+    // --- Phase 2: Save callee-saved registers we'll use ---
+    // x19-x28 are callee-saved, so the function prologue/epilogue
+    // should already save/restore them. We just need to be careful
+    // not to clobber values the compiler put there. For safety,
+    // save and restore any registers we use.
+    // Collect unique registers used.
+    int regs_used[10] = {0}; // register numbers (19-28)
+    int num_regs_used = 0;
+    for (int i = 0; i < total; i++) {
+      int rn;
+      if (sscanf(reg_name[i], "x%d", &rn) == 1) {
+        bool found = false;
+        for (int j = 0; j < num_regs_used; j++)
+          if (regs_used[j] == rn) { found = true; break; }
+        if (!found)
+          regs_used[num_regs_used++] = rn;
+      }
+    }
+    for (int i = 0; i < num_regs_used; i++)
+      println("str x%d, [sp, #-16]!", regs_used[i]);
+
+    // --- Phase 3: Evaluate output operands ---
+    // For "+r" (read-write): evaluate address, load current value into reg
+    // For "=r" (write-only): evaluate address, save it for later store
+    for (int i = 0; i < node->asm_num_outputs; i++) {
+      char *c = node->asm_output_constraints[i];
+      bool is_rw = (strchr(c, '+') != NULL); // "+r"
+      // Evaluate the output lvalue to get its address
+      gen_addr(node->asm_output_exprs[i]);
+      // Save the address on the stack for later store-back
+      println("str x0, [sp, #-16]!");
+      depth++;
+      addr_on_stack[i] = 1;
+
+      if (is_rw) {
+        // Read-modify-write: load the current value into the register
+        // x0 still has the address, but we just pushed it. Peek from stack.
+        println("ldr x0, [sp]"); // peek the address
+        // Load the value according to the expression's type
+        Type *ty = node->asm_output_exprs[i]->ty;
+        if (ty->size == 1)
+          println(ty->is_unsigned ? "ldrb w0, [x0]" : "ldrsb w0, [x0]");
+        else if (ty->size == 2)
+          println(ty->is_unsigned ? "ldrh w0, [x0]" : "ldrsh w0, [x0]");
+        else if (ty->size == 4) {
+          println("ldr w0, [x0]");
+          if (!ty->is_unsigned)
+            println("sxtw x0, w0");
+        } else
+          println("ldr x0, [x0]");
+        println("mov %s, x0", reg_name[i]);
+      }
+    }
+
+    // --- Phase 4: Evaluate input operands ---
+    for (int i = 0; i < node->asm_num_inputs; i++) {
+      int idx = node->asm_num_outputs + i;
+      char *c = node->asm_input_constraints[i];
+      if (c[0] >= '0' && c[0] <= '9') {
+        // Tied operand: load value into the shared register
+        gen_expr(node->asm_input_exprs[i]);
+        println("mov %s, x0", reg_name[idx]);
+      } else {
+        // "r" constraint: load value into the assigned register
+        gen_expr(node->asm_input_exprs[i]);
+        println("mov %s, x0", reg_name[idx]);
+      }
+    }
+
+    // --- Phase 5: Emit the asm template ---
+    // Substitute %0, %1, etc. with register names
+    if (node->asm_str[0] != '\0') {
+      char buf[4096];
+      int bi = 0;
+      for (char *p = node->asm_str; *p; p++) {
+        if (*p == '%' && p[1] == '%') {
+          buf[bi++] = '%';
+          p++;
+        } else if (*p == '%' && p[1] >= '0' && p[1] <= '9') {
+          int operand_num = p[1] - '0';
+          if (operand_num >= total)
+            error_tok(node->tok, "asm operand %%%d out of range", operand_num);
+          char *rn = reg_name[operand_num];
+          for (char *r = rn; *r; r++)
+            buf[bi++] = *r;
+          p++;
+        } else {
+          buf[bi++] = *p;
+        }
+      }
+      buf[bi] = '\0';
+      println("%s", buf);
+    }
+
+    // --- Phase 6: Store output operands back ---
+    // Pop addresses in reverse order and store register values
+    for (int i = node->asm_num_outputs - 1; i >= 0; i--) {
+      if (addr_on_stack[i]) {
+        println("ldr x0, [sp], #16"); // pop address
+        depth--;
+        // Store the register value to the address
+        Type *ty = node->asm_output_exprs[i]->ty;
+        if (ty->size == 1)
+          println("strb w%d, [x0]", 19 + i);
+        else if (ty->size == 2)
+          println("strh w%d, [x0]", 19 + i);
+        else if (ty->size == 4)
+          println("str w%d, [x0]", 19 + i);
+        else
+          println("str x%d, [x0]", 19 + i);
+      }
+    }
+
+    // --- Phase 7: Restore callee-saved registers ---
+    for (int i = num_regs_used - 1; i >= 0; i--)
+      println("ldr x%d, [sp], #16", regs_used[i]);
+
     return;
+  }
 
   default:
     // Treat unknown node kinds as expression statements

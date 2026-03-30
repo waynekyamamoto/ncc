@@ -3309,25 +3309,93 @@ static Node *stmt(Token **rest, Token *tok) {
       error_tok(tok, "expected string literal");
     node->asm_str = tok->str;
     tok = tok->next;
-    // Skip output/input/clobber operands
+
+    // Parse output/input/clobber operands
+    // Format: asm(template : outputs : inputs : clobbers)
+    // Temporary arrays (max 16 operands each)
+    char *out_constraints[16], *in_constraints[16], *clobbers[16];
+    Node *out_exprs[16], *in_exprs[16];
+    int num_out = 0, num_in = 0, num_clob = 0;
+    int section = 0; // 0=outputs, 1=inputs, 2=clobbers
+
     while (equal(tok, ":")) {
       tok = tok->next;
-      while (!equal(tok, ":") && !equal(tok, ")")) {
-        if (tok->kind == TK_STR)
+      if (section < 2) {
+        // Parse operand list: "constraint"(expr), ...
+        while (!equal(tok, ":") && !equal(tok, ")")) {
+          // Optional [name] prefix
+          if (equal(tok, "[")) {
+            tok = tok->next;
+            tok = tok->next; // skip ident
+            tok = skip(tok, "]");
+          }
+          if (tok->kind != TK_STR)
+            error_tok(tok, "expected string literal for constraint");
+          char *constraint = tok->str;
           tok = tok->next;
-        if (equal(tok, "(")) {
-          tok = tok->next;
-          expr(&tok, tok);
+          tok = skip(tok, "(");
+          Node *operand = expr(&tok, tok);
+          add_type(operand);
           tok = skip(tok, ")");
+
+          if (section == 0) {
+            if (num_out >= 16)
+              error_tok(tok, "too many asm output operands");
+            out_constraints[num_out] = constraint;
+            out_exprs[num_out] = operand;
+            num_out++;
+          } else {
+            if (num_in >= 16)
+              error_tok(tok, "too many asm input operands");
+            in_constraints[num_in] = constraint;
+            in_exprs[num_in] = operand;
+            num_in++;
+          }
+          if (!consume(&tok, tok, ","))
+            break;
         }
-        if (equal(tok, "[")) {
+      } else {
+        // Parse clobber list: "reg", "memory", "cc", ...
+        while (!equal(tok, ":") && !equal(tok, ")")) {
+          if (tok->kind != TK_STR)
+            error_tok(tok, "expected string literal for clobber");
+          if (num_clob >= 16)
+            error_tok(tok, "too many asm clobbers");
+          clobbers[num_clob++] = tok->str;
           tok = tok->next;
-          tok = tok->next; // ident
-          tok = skip(tok, "]");
+          if (!consume(&tok, tok, ","))
+            break;
         }
-        consume(&tok, tok, ",");
+      }
+      section++;
+    }
+
+    // Copy parsed operands into node
+    if (num_out > 0) {
+      node->asm_num_outputs = num_out;
+      node->asm_output_constraints = calloc_checked(num_out, sizeof(char *));
+      node->asm_output_exprs = calloc_checked(num_out, sizeof(Node *));
+      for (int i = 0; i < num_out; i++) {
+        node->asm_output_constraints[i] = out_constraints[i];
+        node->asm_output_exprs[i] = out_exprs[i];
       }
     }
+    if (num_in > 0) {
+      node->asm_num_inputs = num_in;
+      node->asm_input_constraints = calloc_checked(num_in, sizeof(char *));
+      node->asm_input_exprs = calloc_checked(num_in, sizeof(Node *));
+      for (int i = 0; i < num_in; i++) {
+        node->asm_input_constraints[i] = in_constraints[i];
+        node->asm_input_exprs[i] = in_exprs[i];
+      }
+    }
+    if (num_clob > 0) {
+      node->asm_num_clobbers = num_clob;
+      node->asm_clobbers = calloc_checked(num_clob, sizeof(char *));
+      for (int i = 0; i < num_clob; i++)
+        node->asm_clobbers[i] = clobbers[i];
+    }
+
     *rest = skip(skip(tok, ")"), ";");
     return node;
   }

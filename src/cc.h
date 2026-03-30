@@ -267,6 +267,15 @@ struct Node {
 
   // Inline assembly
   char *asm_str;
+  // Asm operands: arrays of constraint/expression pairs
+  int asm_num_outputs;
+  int asm_num_inputs;
+  char **asm_output_constraints;  // array of constraint strings
+  Node **asm_output_exprs;        // array of output expression nodes
+  char **asm_input_constraints;   // array of constraint strings
+  Node **asm_input_exprs;         // array of input expression nodes
+  int asm_num_clobbers;
+  char **asm_clobbers;            // array of clobber strings
 
   // Atomic compare-and-swap
   Node *cas_addr;
