@@ -2565,39 +2565,42 @@ static Node *primary(Token **rest, Token *tok) {
     Type *t2 = typename_(&tok, tok);
     *rest = skip(tok, ")");
 
-    // Strip top-level qualifiers for comparison (const, volatile, restrict, atomic)
-    // We do this by clearing the relevant fields on copies
-    // GCC rule: top-level qualifiers are ignored
-
-    // Recursively compare types for compatibility
+    // Compare types for GCC __builtin_types_compatible_p semantics:
+    // - Top-level qualifiers (const, volatile) are ignored
+    // - Qualifiers on pointed-to types DO matter
+    // - Enums are compatible with int but not with other enum types
     int result = 0;
-    // Helper: compare two types for GCC __builtin_types_compatible_p semantics
-    // We implement this inline with a loop/goto structure
     {
       Type *a = t1, *b = t2;
 
-      // Resolve enums to int for comparison
-      if (a->kind == TY_ENUM) a = ty_int;
-      if (b->kind == TY_ENUM) b = ty_int;
+      // Note: enum types are NOT resolved to int here.
+      // GCC treats different enum types as incompatible.
+      // Enum constants (typeof(enum_val)) already have type int from the parser.
 
       if (a->kind != b->kind) {
         result = 0;
+      } else if (a->kind == TY_ENUM) {
+        // Two enum types: compatible only if they are the same enum.
+        // Follow origin chain to find the original type allocation.
+        Type *oa = a, *ob = b;
+        while (oa->origin) oa = oa->origin;
+        while (ob->origin) ob = ob->origin;
+        result = (oa == ob);
       } else if (a->kind == TY_PTR) {
-        // Pointers: base types must be fully compatible (including qualifiers)
-        // Recursively check base types but qualifiers DO matter here
+        // Pointers: pointed-to types must be fully compatible INCLUDING qualifiers
         Type *pa = a->base, *pb = b->base;
-        // For pointer targets, qualifiers matter
-        if (pa->kind == TY_ENUM) pa = ty_int;
-        if (pb->kind == TY_ENUM) pb = ty_int;
         if (pa->kind != pb->kind)
+          result = 0;
+        else if (pa->is_const != pb->is_const || pa->is_volatile != pb->is_volatile)
           result = 0;
         else if (pa->is_unsigned != pb->is_unsigned)
           result = 0;
-        else if (pa->kind == TY_PTR || pa->kind == TY_ARRAY) {
-          // Deep pointer/array comparison — check sizes match
-          result = (pa->size == pb->size && pa->base && pb->base &&
+        else if (pa->kind == TY_PTR) {
+          // Pointer to pointer: recursively compare
+          result = (pa->base && pb->base &&
                     pa->base->kind == pb->base->kind &&
-                    pa->base->is_unsigned == pb->base->is_unsigned);
+                    pa->base->is_unsigned == pb->base->is_unsigned &&
+                    pa->base->size == pb->base->size);
         } else if (pa->kind == TY_STRUCT || pa->kind == TY_UNION)
           result = (pa->size == pb->size && pa->members == pb->members);
         else
@@ -2614,12 +2617,11 @@ static Node *primary(Token **rest, Token *tok) {
         else
           result = 1;
       } else if (a->kind == TY_STRUCT || a->kind == TY_UNION) {
-        // Struct/union: must be the same type (same members pointer)
         result = (a->size == b->size && a->members == b->members);
       } else if (a->kind == TY_FUNC) {
-        result = 0; // function types — simplified
+        result = 0;
       } else {
-        // Scalar types: kind and signedness must match, ignore top-level qualifiers
+        // Scalar types: kind and signedness must match; top-level qualifiers ignored
         result = (a->is_unsigned == b->is_unsigned && a->size == b->size);
       }
     }
