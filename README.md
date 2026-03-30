@@ -42,7 +42,7 @@ Requires clang and macOS command line tools for linking.
 | Suite | Pass Rate | Details |
 |-------|-----------|---------|
 | Compliance | 15/15 (100%) | Basic C feature tests |
-| GCC Torture | 924/995 (92.9%) | GCC execute test suite |
+| GCC Torture | 933/995 (93.8%) | GCC execute test suite |
 | DOOM | Compiles and runs | doomgeneric port with graphics, sound, music |
 | SQLite | Compiles and works | CREATE TABLE, INSERT, SELECT, JOIN all pass |
 | Lua | 31/33 files compile | 2 remaining: function pointer in init, string deref |
