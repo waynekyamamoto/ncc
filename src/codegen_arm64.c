@@ -32,7 +32,19 @@ static void popf(int reg);
 static void gen_cond(Node *node) {
   gen_expr(node);
   add_type(node);
-  if (is_flonum(node->ty)) {
+  if (node->ty->kind == TY_COMPLEX) {
+    // Complex truthiness: nonzero if real != 0 || imag != 0
+    // x0 holds address of the complex value
+    int base_sz = node->ty->base->size;
+    println("ldr d1, [x0, #%d]", base_sz); // imag part
+    println("ldr d0, [x0]");               // real part
+    println("fcmp d0, #0.0");
+    println("cset w0, ne");
+    println("fcmp d1, #0.0");
+    println("cset w1, ne");
+    println("orr w0, w0, w1");
+    println("cmp x0, #0");
+  } else if (is_flonum(node->ty)) {
     println("fcmp d0, #0.0");
     println("cset w0, ne");
     println("cmp x0, #0");
