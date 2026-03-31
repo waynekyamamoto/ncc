@@ -4542,13 +4542,16 @@ static void array_initializer1(Token **rest, Token *tok, Initializer *init) {
     *init = *new_initializer(array_of(init->ty->base, len), false);
   }
 
-  for (int i = 0; i < init->ty->array_len && !is_end(tok); i++) {
+  for (int i = 0; !is_end(tok); i++) {
     if (i > 0) {
       tok = skip(tok, ",");
       if (is_end(tok)) break; // trailing comma
     }
+    // For non-designated elements, stop when past array bounds
+    if (i >= init->ty->array_len && !equal(tok, "["))
+      break;
 
-    // Designated initializer
+    // Designated initializer (may jump backward)
     if (equal(tok, "[")) {
       int lo = const_expr_val(&tok, tok->next);
       // Range designator: [lo ... hi] = val
@@ -4748,7 +4751,7 @@ static int count_array_init_elements(Token *tok, Type *ty) {
   // Don't consume another brace here
 
   Initializer *dummy = new_initializer(ty->base, false);
-  int i;
+  int i, max_i = 0;
   for (i = 0; !is_end(tok); i++) {
     if (i > 0) {
       tok = skip(tok, ",");
@@ -4762,6 +4765,7 @@ static int count_array_init_elements(Token *tok, Type *ty) {
         consume(&tok, tok, "=");
         initializer2(&tok, tok, dummy);
         i = hi;
+        if (i > max_i) max_i = i;
         continue;
       }
       i = lo;
@@ -4769,8 +4773,9 @@ static int count_array_init_elements(Token *tok, Type *ty) {
       consume(&tok, tok, "=");
     }
     initializer2(&tok, tok, dummy);
+    if (i > max_i) max_i = i;
   }
-  return i;
+  return max_i + 1;
 }
 
 // Create initialization code from an Initializer tree

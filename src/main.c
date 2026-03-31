@@ -96,6 +96,15 @@ static void link_files(StringArray *inputs, char *output) {
 
 // Compile a single file
 static void compile(char *input_path, char *output_path) {
+  // Make labels unique per compilation unit to avoid Mach-O symbol
+  // collisions (.L. labels are NOT stripped on Mach-O like on ELF).
+  {
+    unsigned hash = 0;
+    for (char *p = input_path; *p; p++)
+      hash = hash * 31 + (unsigned char)*p;
+    label_cnt = (int)(hash % 900000) * 1000;
+  }
+
   Token *tok = tokenize_file(input_path);
   if (!tok)
     error("%s: %s", input_path, strerror(errno));

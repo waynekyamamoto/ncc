@@ -2494,16 +2494,6 @@ static void emit_text(Obj *prog) {
 void codegen(Obj *prog, FILE *out) {
   output_file = out;
 
-  // Make labels unique per compilation unit to avoid Mach-O symbol
-  // collisions (labels like .L.else.3 are NOT stripped on Mach-O).
-  // Use a hash of the filename to offset the label counter.
-  if (base_file) {
-    unsigned hash = 0;
-    for (char *p = base_file; *p; p++)
-      hash = hash * 31 + (unsigned char)*p;
-    label_cnt = (int)(hash % 900000) * 1000;
-  }
-
   // Emit assembly
   emit_data(prog);
   emit_text(prog);
