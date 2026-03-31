@@ -298,6 +298,10 @@ struct Node {
 
   // Non-local goto (nested function → outer label via longjmp)
   Obj *nlgoto_buf;  // jmp_buf variable for non-local goto
+
+  // Multi-level chain access (doubly-nested functions)
+  int chain_depth;          // number of intermediate chain hops
+  Obj *chain_path[4];      // intermediate chain_param Objs to dereference
 };
 
 // Variable or function

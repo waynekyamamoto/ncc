@@ -427,7 +427,21 @@ static void gen_addr(Node *node) {
     return;
 
   case ND_CHAIN_VAR: {
-    gen_expr(node->lhs);
+    gen_expr(node->lhs);  // Load innermost chain pointer (outer fp)
+    // Follow intermediate chain pointers for multi-level nesting
+    for (int i = 0; i < node->chain_depth; i++) {
+      int cp_off = node->chain_path[i]->offset;
+      if (cp_off < 0) {
+        int abs_off = -cp_off;
+        if (abs_off <= 4095) println("sub x0, x0, #%d", abs_off);
+        else { load_imm("x9", (uint64_t)abs_off); println("sub x0, x0, x9"); }
+      } else if (cp_off > 0) {
+        if (cp_off <= 4095) println("add x0, x0, #%d", cp_off);
+        else { load_imm("x9", (uint64_t)cp_off); println("add x0, x0, x9"); }
+      }
+      println("ldr x0, [x0]");  // dereference to get next-level fp
+    }
+    // Compute final variable address
     int off = node->var->offset;
     if (off < 0) {
       int abs_off = -off;
@@ -2217,8 +2231,14 @@ static void emit_text(Obj *prog) {
     printlabel("_%s:", fn->name);
 
     current_fn = fn;
-    if (fn->is_nested && fn->enclosing_fn && fn->enclosing_fn->stack_size == 0)
-      assign_lvar_offsets(fn->enclosing_fn);
+    // Assign offsets for all enclosing functions first, so that
+    // chain variable accesses use correct offsets for outer locals.
+    if (fn->is_nested) {
+      for (Obj *enc = fn->enclosing_fn; enc; enc = enc->enclosing_fn) {
+        if (enc->stack_size == 0 && enc->is_function && enc->is_definition)
+          assign_lvar_offsets(enc);
+      }
+    }
     assign_lvar_offsets(fn);
 
     // Prologue

@@ -3716,11 +3716,18 @@ static Node *funcall(Token **rest, Token *tok, Node *fn) {
 
   *rest = skip(tok, ")");
 
-  // For nested function direct calls: pass chain pointer as last argument
+  // For nested function direct calls: pass chain pointer as last argument.
+  // If the callee is defined directly inside the current function, pass our fp.
+  // Otherwise (sibling or higher), pass our chain_param (enclosing fp).
   bool is_nested_call = vs && vs->var && vs->var->is_nested;
   if (is_nested_call) {
     Node *chain_arg;
-    if (current_fn->is_nested && current_fn->chain_param) {
+    if (vs->var->enclosing_fn == current_fn) {
+      // Callee is nested directly inside us — pass our fp
+      chain_arg = new_node(ND_FRAME_ADDR, start);
+      chain_arg->ty = pointer_to(ty_char);
+    } else if (current_fn->is_nested && current_fn->chain_param) {
+      // Callee is a sibling or defined at a higher level — pass chain
       chain_arg = new_var_node(current_fn->chain_param, start);
     } else {
       chain_arg = new_node(ND_FRAME_ADDR, start);
@@ -5436,13 +5443,44 @@ static void rewrite_nested_var_refs(Node *node, Obj *outer_fn) {
   rewrite_nested_var_refs(node->cas_new, outer_fn);
   if (node->kind == ND_VAR && node->var && node->var->is_local) {
     Obj *chain_var = outer_fn->chain_param;
-    if (chain_var && is_in_locals(node->var, outer_fn->locals)) {
+    if (!chain_var) return;
+
+    // Check immediate outer's locals (one level up, no chain following)
+    if (is_in_locals(node->var, outer_fn->locals)) {
       Node *chain_node = new_var_node(chain_var, node->tok);
       Obj *orig_var = node->var;
       node->kind = ND_CHAIN_VAR;
       node->lhs = chain_node;
       node->var = orig_var;
       node->ty = orig_var->ty;
+      return;
+    }
+
+    // Walk up through enclosing functions for multi-level nesting.
+    // Each chain_path[i] entry is a chain_param that, when loaded from
+    // the current frame, gives the next-level-up frame pointer.
+    int depth = 0;
+    Obj *chain_path[4] = {0};
+    Obj *cur_fn = outer_fn->enclosing_fn;
+    while (cur_fn && depth < 4) {
+      if (!cur_fn->chain_param) break;
+      chain_path[depth] = cur_fn->chain_param;
+      depth++;
+      Obj *parent = cur_fn->enclosing_fn;
+      if (!parent) break;
+      if (is_in_locals(node->var, parent->locals)) {
+        Node *chain_node = new_var_node(chain_var, node->tok);
+        Obj *orig_var = node->var;
+        node->kind = ND_CHAIN_VAR;
+        node->lhs = chain_node;
+        node->var = orig_var;
+        node->ty = orig_var->ty;
+        node->chain_depth = depth;
+        for (int i = 0; i < depth; i++)
+          node->chain_path[i] = chain_path[i];
+        return;
+      }
+      cur_fn = parent;
     }
   }
 }
@@ -5459,6 +5497,9 @@ static Token *nested_function(Token *tok, Type *fn_ty, VarAttr *attr, Node **cur
   char *saved_brk = brk_label;
   char *saved_cont = cont_label;
   Node *saved_switch = current_switch;
+  // Set saved_fn's locals early so deeper nesting levels can find
+  // variables through the enclosing_fn chain during rewrite.
+  saved_fn->locals = saved_locals;
   Obj *fn = new_gvar(mangled_name, fn_ty);
   fn->is_function = true;
   fn->is_definition = true;
@@ -5547,6 +5588,7 @@ static Token *nested_function(Token *tok, Type *fn_ty, VarAttr *attr, Node **cur
   memset(&temp_outer, 0, sizeof(temp_outer));
   temp_outer.locals = saved_locals;
   temp_outer.chain_param = chain_var;
+  temp_outer.enclosing_fn = saved_fn;
   rewrite_nested_var_refs(fn->body, &temp_outer);
 
   // Error on truly unresolved gotos (no nlgoto_buf means it wasn't converted)
