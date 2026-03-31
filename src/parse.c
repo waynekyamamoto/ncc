@@ -1323,9 +1323,9 @@ static void struct_members(Token **rest, Token *tok, Type *ty) {
 
 // Layout struct members (calculate offsets)
 static void struct_layout(Type *ty) {
-  int offset = 0;
+  long offset = 0;
   int max_align = 1;
-  int bits = 0;
+  long bits = 0;
 
   for (Member *mem = ty->members; mem; mem = mem->next) {
     if (mem->is_bitfield) {
@@ -1380,7 +1380,7 @@ static void struct_layout(Type *ty) {
 // Layout union members
 static void union_layout(Type *ty) {
   int max_align = 1;
-  int max_size = 0;
+  long max_size = 0;
 
   for (Member *mem = ty->members; mem; mem = mem->next) {
     mem->offset = 0;
@@ -5375,6 +5375,21 @@ static Token *function(Token *tok, Type *fn_ty, VarAttr *attr) {
   for (Node *g = gotos; g; g = g->goto_next) {
     if (g->kind == ND_LABEL_VAL)
       continue;
+    if (g->nlgoto_buf) {
+      // Non-local goto from nested function: resolve label and register
+      // the buf for prologue setup
+      for (Node *l = labels; l; l = l->goto_next) {
+        if (!strcmp(g->label, l->label)) {
+          NLGoto *nl = calloc_checked(1, sizeof(NLGoto));
+          nl->buf = g->nlgoto_buf;
+          nl->unique_label = l->unique_label;
+          nl->next = current_fn->nlgoto_targets;
+          current_fn->nlgoto_targets = nl;
+          break;
+        }
+      }
+      continue;
+    }
     for (Node *l = labels; l; l = l->goto_next) {
       if (!strcmp(g->label, l->label)) {
         g->unique_label = l->unique_label;
@@ -5492,12 +5507,10 @@ static Token *nested_function(Token *tok, Type *fn_ty, VarAttr *attr, Node **cur
     fn->va_area->align = 8;
   }
   fn->alloca_bottom = new_lvar("__alloca_bottom__", pointer_to(ty_char));
+  // Push nested function's own name into scope so recursive calls resolve
+  VarScope *self_vs = push_scope(inner_name);
+  self_vs->var = fn;
   fn->body = compound_stmt(&tok, tok);
-  Obj temp_outer;
-  memset(&temp_outer, 0, sizeof(temp_outer));
-  temp_outer.locals = saved_locals;
-  temp_outer.chain_param = chain_var;
-  rewrite_nested_var_refs(fn->body, &temp_outer);
   // Resolve labels within the nested function first
   for (Node *g = gotos; g; g = g->goto_next) {
     if (g->kind != ND_LABEL_VAL) continue;
@@ -5508,24 +5521,63 @@ static Token *nested_function(Token *tok, Type *fn_ty, VarAttr *attr, Node **cur
     if (g->kind == ND_LABEL_VAL) continue;
     for (Node *l = labels; l; l = l->goto_next)
       if (!strcmp(g->label, l->label)) { g->unique_label = l->unique_label; break; }
-    if (!g->unique_label && g->kind == ND_GOTO)
+  }
+
+  // For unresolved ND_GOTO nodes: set up non-local goto via longjmp.
+  // Create a jmp_buf variable in the outer function and set up the goto
+  // to do longjmp through the chain. This must happen BEFORE
+  // rewrite_nested_var_refs so the buf ND_VAR gets converted to ND_CHAIN_VAR.
+  for (Node *g = gotos; g; g = g->goto_next) {
+    if (g->kind != ND_GOTO || g->unique_label) continue;
+    // Unresolved goto — create non-local goto buf in outer function
+    Obj *buf = calloc_checked(1, sizeof(Obj));
+    buf->name = format("__nlgoto_%s", g->label);
+    buf->ty = array_of(pointer_to(ty_char), 3);
+    buf->align = 8;
+    buf->is_local = true;
+    buf->next = saved_locals;
+    saved_locals = buf;
+    // Set up the goto node for non-local goto
+    g->nlgoto_buf = buf;
+    g->lhs = new_var_node(buf, g->tok);
+  }
+
+  // Rewrite variable references to use the chain (outer frame pointer)
+  Obj temp_outer;
+  memset(&temp_outer, 0, sizeof(temp_outer));
+  temp_outer.locals = saved_locals;
+  temp_outer.chain_param = chain_var;
+  rewrite_nested_var_refs(fn->body, &temp_outer);
+
+  // Error on truly unresolved gotos (no nlgoto_buf means it wasn't converted)
+  for (Node *g = gotos; g; g = g->goto_next) {
+    if (g->kind != ND_GOTO) continue;
+    if (!g->unique_label && !g->nlgoto_buf)
       error_tok(g->tok, "use of undeclared label '%s'", g->label);
   }
-  // Collect unresolved ND_LABEL_VAL nodes (referencing outer labels via __label__)
+
+  // Collect unresolved ND_LABEL_VAL and non-local ND_GOTO nodes
   // to propagate to the outer function's gotos list for resolution.
-  Node *unresolved_label_vals = NULL;
+  Node *unresolved_nodes = NULL;
   for (Node *g = gotos; g; g = g->goto_next) {
-    if (g->kind != ND_LABEL_VAL) continue;
-    bool found = false;
-    for (Node *l = labels; l; l = l->goto_next)
-      if (!strcmp(g->label, l->label)) { found = true; break; }
-    if (!found) {
-      // Clone the node reference for the outer scope's gotos list
-      Node *copy = new_node(ND_LABEL_VAL, g->tok);
+    if (g->kind == ND_LABEL_VAL) {
+      bool found = false;
+      for (Node *l = labels; l; l = l->goto_next)
+        if (!strcmp(g->label, l->label)) { found = true; break; }
+      if (!found) {
+        Node *copy = new_node(ND_LABEL_VAL, g->tok);
+        copy->label = g->label;
+        copy->unique_label = g->unique_label;
+        copy->goto_next = unresolved_nodes;
+        unresolved_nodes = copy;
+      }
+    } else if (g->kind == ND_GOTO && g->nlgoto_buf) {
+      // Propagate non-local goto for outer label resolution
+      Node *copy = new_node(ND_GOTO, g->tok);
       copy->label = g->label;
-      copy->unique_label = g->unique_label;
-      copy->goto_next = unresolved_label_vals;
-      unresolved_label_vals = copy;
+      copy->nlgoto_buf = g->nlgoto_buf;
+      copy->goto_next = unresolved_nodes;
+      unresolved_nodes = copy;
     }
   }
   fn->locals = locals;
@@ -5534,8 +5586,8 @@ static Token *nested_function(Token *tok, Type *fn_ty, VarAttr *attr, Node **cur
   locals = saved_locals;
   gotos = saved_gotos;
   labels = saved_labels;
-  // Add unresolved ND_LABEL_VAL from nested function to outer gotos
-  for (Node *g = unresolved_label_vals; g; ) {
+  // Add unresolved nodes from nested function to outer gotos
+  for (Node *g = unresolved_nodes; g; ) {
     Node *next = g->goto_next;
     g->goto_next = gotos;
     gotos = g;

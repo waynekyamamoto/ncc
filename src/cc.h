@@ -28,6 +28,7 @@ typedef struct Hideset Hideset;
 typedef struct Token Token;
 typedef struct Obj Obj;
 typedef struct File File;
+typedef struct NLGoto NLGoto;
 
 //
 // alloc.c
@@ -294,6 +295,9 @@ struct Node {
   Node *cas_addr;
   Node *cas_old;
   Node *cas_new;
+
+  // Non-local goto (nested function → outer label via longjmp)
+  Obj *nlgoto_buf;  // jmp_buf variable for non-local goto
 };
 
 // Variable or function
@@ -335,11 +339,19 @@ struct Obj {
   bool is_nested;        // true if this is a nested function
   Obj *chain_param;      // hidden parameter holding outer's frame pointer
   Obj *enclosing_fn;     // the enclosing function (for nested functions)
+  NLGoto *nlgoto_targets; // non-local goto targets to set up in prologue
 
   // Static inline function
   bool is_live;
   bool is_root;
   StringArray refs;     // Functions referenced
+};
+
+// Non-local goto target: set up in function prologue
+struct NLGoto {
+  NLGoto *next;
+  Obj *buf;           // jmp_buf variable (24 bytes: [fp, sp, label_addr])
+  char *unique_label; // target label's assembly name
 };
 
 // Relocation entry for global variable initializers
@@ -358,7 +370,7 @@ struct Member {
   Token *name;
   int idx;
   int align;
-  int offset;
+  long offset;
 
   // Bitfield
   bool is_bitfield;
@@ -401,7 +413,7 @@ typedef enum {
 
 struct Type {
   TypeKind kind;
-  int size;         // sizeof() value
+  long size;        // sizeof() value
   int align;        // alignment
   bool is_unsigned; // unsigned or signed
   bool is_atomic;   // _Atomic
@@ -417,7 +429,7 @@ struct Type {
   Token *name_pos;
 
   // Array
-  int array_len;
+  long array_len;
   // VLA
   Node *vla_len;   // number of elements
   Obj *vla_size;   // sizeof() value (runtime computed)
@@ -463,7 +475,7 @@ bool is_compatible(Type *t1, Type *t2);
 Type *copy_type(Type *ty);
 Type *pointer_to(Type *base);
 Type *func_type(Type *return_ty);
-Type *array_of(Type *base, int len);
+Type *array_of(Type *base, long len);
 Type *vla_of(Type *base, Node *len);
 Type *enum_type(void);
 Type *struct_type(void);
@@ -477,7 +489,7 @@ void add_type(Node *node);
 //
 
 void codegen(Obj *prog, FILE *out);
-int align_to(int n, int align);
+long align_to(long n, int align);
 
 //
 // unicode.c

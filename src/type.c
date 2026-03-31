@@ -119,7 +119,7 @@ Type *func_type(Type *return_ty) {
   return ty;
 }
 
-Type *array_of(Type *base, int len) {
+Type *array_of(Type *base, long len) {
   Type *ty = calloc_checked(1, sizeof(Type));
   ty->kind = TY_ARRAY;
   ty->size = base->size * len;

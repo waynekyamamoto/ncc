@@ -11,7 +11,7 @@ static char *argreg64[] = {"x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"};
 static char *fpreg[] = {"d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7"};
 // static char *fpreg32[] = {"s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7"};
 
-int align_to(int n, int align) {
+long align_to(long n, int align) {
   return (n + align - 1) / align * align;
 }
 
@@ -20,6 +20,7 @@ int align_to(int n, int align) {
 
 static void gen_expr(Node *node);
 static void gen_stmt(Node *node);
+static void gen_stmt_dead(Node *node);
 static void gen_addr(Node *node);
 static void push(void);
 static void pop(char *reg);
@@ -384,7 +385,12 @@ static void gen_addr(Node *node) {
 
   case ND_MEMBER:
     gen_addr(node->lhs);
-    println("add x0, x0, #%d", node->member->offset);
+    if (node->member->offset <= 4095) {
+      println("add x0, x0, #%ld", node->member->offset);
+    } else {
+      load_imm("x1", (uint64_t)node->member->offset);
+      println("add x0, x0, x1");
+    }
     return;
 
   case ND_FUNCALL:
@@ -405,7 +411,7 @@ static void gen_addr(Node *node) {
     // Address of __imag__ expr: address of the imaginary part
     gen_addr(node->lhs);
     if (is_complex(node->lhs->ty))
-      println("add x0, x0, #%d", node->lhs->ty->base->size);
+      println("add x0, x0, #%ld", node->lhs->ty->base->size);
     return;
 
   case ND_ASSIGN:
@@ -463,15 +469,19 @@ static void cast(Type *from, Type *to) {
   }
 
   if (is_flonum(from) && is_integer(to)) {
-    // d0 → x0
-    if (to->is_unsigned) {
-      println("fcvtzu x0, d0");
-    } else {
-      println("fcvtzs x0, d0");
-    }
-    // Truncate to appropriate size
-    if (to->size <= 4)
+    // d0 → x0. Use w0 target for <=32-bit types so ARM64 saturates correctly.
+    if (to->size <= 4) {
+      if (to->is_unsigned)
+        println("fcvtzu w0, d0");
+      else
+        println("fcvtzs w0, d0");
       println("sxtw x0, w0");
+    } else {
+      if (to->is_unsigned)
+        println("fcvtzu x0, d0");
+      else
+        println("fcvtzs x0, d0");
+    }
     return;
   }
 
@@ -1701,10 +1711,56 @@ static void gen_expr(Node *node) {
 // Statement code generation
 //
 
+// Walk a dead code subtree emitting only case/default labels (for switch).
+// Everything else is skipped. Once a case label is found, its body is
+// generated normally (it's reachable via the switch dispatch).
+static void gen_stmt_dead(Node *node) {
+  if (!node) return;
+  switch (node->kind) {
+  case ND_BLOCK:
+    for (Node *n = node->body; n; n = n->next)
+      gen_stmt_dead(n);
+    return;
+  case ND_CASE:
+    // Case/default label — emit it and switch to normal codegen
+    printlabel("%s:", node->label);
+    gen_stmt(node->lhs);
+    return;
+  case ND_IF:
+    gen_stmt_dead(node->then);
+    if (node->els)
+      gen_stmt_dead(node->els);
+    return;
+  case ND_FOR:
+  case ND_DO:
+    gen_stmt_dead(node->then);
+    return;
+  default:
+    return;  // skip dead code
+  }
+}
+
 static void gen_stmt(Node *node) {
   add_type(node);
   switch (node->kind) {
   case ND_IF: {
+    // Constant condition optimization: avoid emitting dead code that
+    // references undefined symbols. Case labels inside dead branches
+    // are still emitted (they're reachable via switch dispatch).
+    if (node->cond->kind == ND_NUM && is_integer(node->cond->ty)) {
+      if (node->cond->val == 0) {
+        int c = label_cnt++;
+        println("b .L.end.%d", c);
+        gen_stmt_dead(node->then);
+        printlabel(".L.end.%d:", c);
+        if (node->els)
+          gen_stmt(node->els);
+        return;
+      } else {
+        gen_stmt(node->then);
+        return;
+      }
+    }
     int c = label_cnt++;
     gen_cond(node->cond);
     println("b.eq .L.else.%d", c);
@@ -1798,7 +1854,17 @@ static void gen_stmt(Node *node) {
     return;
 
   case ND_GOTO:
-    println("b %s", node->unique_label);
+    if (node->nlgoto_buf) {
+      // Non-local goto: longjmp via buf accessed through chain
+      gen_addr(node->lhs);  // buf address → x0
+      println("ldr x29, [x0]");       // restore fp
+      println("ldr x1, [x0, #8]");    // restore sp
+      println("mov sp, x1");
+      println("ldr x1, [x0, #16]");   // label address
+      println("br x1");
+    } else {
+      println("b %s", node->unique_label);
+    }
     return;
 
   case ND_GOTO_EXPR:
@@ -2116,7 +2182,7 @@ static void emit_data(Obj *prog) {
       }
     } else {
       // Uninitialized data
-      println(".space %d", var->ty->size);
+      println(".space %ld", var->ty->size);
     }
   }
 }
@@ -2364,6 +2430,29 @@ static void emit_text(Obj *prog) {
         println("add x9, x29, x9");
       }
       println("str x10, [x9]");
+    }
+
+    // Set up non-local goto buffers for nested function longjmp targets.
+    // Each buf stores [fp, sp, label_addr] so longjmp can restore the frame.
+    for (NLGoto *nl = fn->nlgoto_targets; nl; nl = nl->next) {
+      int off = nl->buf->offset;
+      // Compute buf address in x9
+      if (off < 0 && -off <= 4095) {
+        println("sub x9, x29, #%d", -off);
+      } else if (off < 0) {
+        load_imm("x9", (uint64_t)(-off));
+        println("sub x9, x29, x9");
+      } else if (off <= 4095) {
+        println("add x9, x29, #%d", off);
+      } else {
+        load_imm("x9", (uint64_t)off);
+        println("add x9, x29, x9");
+      }
+      println("str x29, [x9]");         // buf[0] = fp
+      println("mov x10, sp");
+      println("str x10, [x9, #8]");     // buf[1] = sp
+      println("adr x10, %s", nl->unique_label);
+      println("str x10, [x9, #16]");    // buf[2] = label addr
     }
 
     // Generate function body
