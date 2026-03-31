@@ -2212,21 +2212,13 @@ static void emit_text(Obj *prog) {
       continue;
     if (hashmap_get(&emitted_fns, fn->name))
       continue;
-    // Emit non-static inline functions as weak definitions so that
-    // the linker can deduplicate if the same inline appears in multiple TUs.
-    // (This handles both gnu89-inline and C99 inline semantics for single-TU builds.)
+    // Emit inline functions as local symbols (no .globl) to avoid
+    // duplicate symbol errors when the same inline appears in multiple TUs.
     hashmap_put(&emitted_fns, fn->name, (void *)1);
 
-    // Skip static inline functions that aren't used
-    // (simplified — emit all for now)
-
     printlabel(".section __TEXT,__text");
-    if (!fn->is_static) {
-      if (fn->is_inline) {
-        println(".weak_definition _%s", fn->name);
-      }
+    if (!fn->is_static && !fn->is_inline)
       println(".globl _%s", fn->name);
-    }
     println(".p2align 2");
     printlabel("_%s:", fn->name);
 
@@ -2508,4 +2500,5 @@ void codegen(Obj *prog, FILE *out) {
 
   // Ensure the file doesn't trigger NX protection issues
   printlabel(".section __DATA,__data");
+
 }

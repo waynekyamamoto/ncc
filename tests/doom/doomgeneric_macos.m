@@ -94,41 +94,39 @@ void DG_DrawFrame(void) {
         CGContextRelease(ctx);
         CGColorSpaceRelease(cs);
 
-        // Process events
+        // Process window/system events (resize, close, mouse, etc.)
         NSEvent *event;
         while ((event = [NSApp nextEventMatchingMask:NSEventMaskAny
                                            untilDate:nil
                                               inMode:NSDefaultRunLoopMode
                                              dequeue:YES])) {
-            if (event.type == NSEventTypeKeyDown) {
-                unsigned char dk = mapKey(event.keyCode);
-                if (dk) addKeyToQueue(1, dk);
-            } else if (event.type == NSEventTypeKeyUp) {
-                unsigned char dk = mapKey(event.keyCode);
-                if (dk) addKeyToQueue(0, dk);
-            } else if (event.type == NSEventTypeFlagsChanged) {
-                // Handle modifier keys (Ctrl, Shift, Alt)
-                static NSEventModifierFlags prevFlags = 0;
-                NSEventModifierFlags flags = event.modifierFlags;
-                // Ctrl
-                if ((flags & NSEventModifierFlagControl) && !(prevFlags & NSEventModifierFlagControl))
-                    addKeyToQueue(1, KEY_FIRE);
-                if (!(flags & NSEventModifierFlagControl) && (prevFlags & NSEventModifierFlagControl))
-                    addKeyToQueue(0, KEY_FIRE);
-                // Shift
-                if ((flags & NSEventModifierFlagShift) && !(prevFlags & NSEventModifierFlagShift))
-                    addKeyToQueue(1, KEY_RSHIFT);
-                if (!(flags & NSEventModifierFlagShift) && (prevFlags & NSEventModifierFlagShift))
-                    addKeyToQueue(0, KEY_RSHIFT);
-                // Alt → strafe
-                if ((flags & NSEventModifierFlagOption) && !(prevFlags & NSEventModifierFlagOption))
-                    addKeyToQueue(1, KEY_RALT);
-                if (!(flags & NSEventModifierFlagOption) && (prevFlags & NSEventModifierFlagOption))
-                    addKeyToQueue(0, KEY_RALT);
-                prevFlags = flags;
-            }
             [NSApp sendEvent:event];
         }
+
+        // Poll keyboard state directly. This avoids macOS swallowing
+        // arrow key events when modifier keys (Ctrl) are held down.
+        static const struct { unsigned short keyCode; unsigned char doomKey; } keymap[] = {
+            {126, KEY_UPARROW}, {125, KEY_DOWNARROW},
+            {123, KEY_LEFTARROW}, {124, KEY_RIGHTARROW},
+            {36, KEY_ENTER}, {53, KEY_ESCAPE}, {49, KEY_USE},
+            {59, KEY_FIRE}, {3, KEY_FIRE}, {56, KEY_RSHIFT},
+            {58, KEY_RALT}, {48, KEY_TAB},
+            {18, '1'}, {19, '2'}, {20, '3'}, {21, '4'},
+            {22, '5'}, {23, '6'}, {24, '7'}, {25, '8'},
+            {0, 'a'}, {1, 's'}, {2, 'd'}, {13, 'w'},
+        };
+        static unsigned int prevState = 0;
+        unsigned int curState = 0;
+        for (int i = 0; i < (int)(sizeof(keymap)/sizeof(keymap[0])); i++) {
+            if (CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, keymap[i].keyCode))
+                curState |= (1u << i);
+        }
+        unsigned int changed = prevState ^ curState;
+        for (int i = 0; i < (int)(sizeof(keymap)/sizeof(keymap[0])); i++) {
+            if (changed & (1u << i))
+                addKeyToQueue((curState >> i) & 1, keymap[i].doomKey);
+        }
+        prevState = curState;
     }
 }
 
