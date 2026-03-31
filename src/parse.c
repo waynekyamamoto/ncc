@@ -1444,10 +1444,11 @@ static Token *attribute_list(Token *tok, Type *ty, VarAttr *attr) {
           }
           if (attr) attr->align = a;
         }
-      } else if (equal(tok, "section")) {
+      } else if (equal(tok, "section") || equal(tok, "__section__")) {
         tok = tok->next;
         tok = skip(tok, "(");
-        if (tok->kind == TK_STR)
+        // Skip all tokens until closing ')' (handles string concat like SEG_DATA ",PyRuntime")
+        while (!equal(tok, ")"))
           tok = tok->next;
         tok = skip(tok, ")");
       } else if (equal(tok, "visibility")) {
@@ -4142,17 +4143,25 @@ static Node *compound_stmt(Token **rest, Token *tok) {
       continue;
     }
 
-    if (is_typename(tok) && !equal(tok->next, ":")) {
+    if (equal(tok, "_Static_assert") || equal(tok, "static_assert")) {
+      tok = skip(tok->next, "(");
+      const_expr_val(&tok, tok);
+      if (equal(tok, ",")) {
+        tok = tok->next;
+        if (tok->kind == TK_STR)
+          tok = tok->next;
+      }
+      tok = skip(tok, ")");
+      tok = skip(tok, ";");
+    } else if (is_typename(tok) && !equal(tok->next, ":")) {
       VarAttr attr = {};
       Type *basety = declspec(&tok, tok, &attr);
 
       if (attr.is_typedef) {
-        // typedef
         tok = parse_typedef(tok, basety, &cur);
         continue;
       }
 
-      // GCC nested function definition
       if (current_fn && is_function_definition(tok, basety)) {
         Type *fn_ty = declarator(&tok, tok, basety);
         tok = nested_function(tok, fn_ty, &attr, &cur);
@@ -4160,14 +4169,6 @@ static Node *compound_stmt(Token **rest, Token *tok) {
       }
 
       cur = cur->next = declaration(&tok, tok, basety, &attr);
-    } else if (equal(tok, "_Static_assert") || equal(tok, "static_assert")) {
-      tok = skip(tok->next, "(");
-      const_expr_val(&tok, tok);
-      tok = skip(tok, ",");
-      if (tok->kind == TK_STR)
-        tok = tok->next;
-      tok = skip(tok, ")");
-      tok = skip(tok, ";");
     } else {
       cur = cur->next = stmt(&tok, tok);
     }
@@ -4607,6 +4608,7 @@ static void struct_initializer1(Token **rest, Token *tok, Initializer *init) {
   int i = 0;
 
   while (!is_end(tok)) {
+    Token *before_comma = tok;
     if (i++ > 0) {
       tok = skip(tok, ",");
       if (is_end(tok)) break; // trailing comma
@@ -4617,28 +4619,45 @@ static void struct_initializer1(Token **rest, Token *tok, Initializer *init) {
         (tok->kind == TK_IDENT && equal(tok->next, ":"))) {
       bool old_style = !equal(tok, ".");
       if (!old_style) tok = tok->next;
-      // Find member
-      Member *m = init->ty->members;
-      for (; m; m = m->next) {
-        if (m->name && m->name->len == tok->len &&
-            !strncmp(m->name->loc, tok->loc, tok->len)) {
-          mem = m;
-          break;
-        }
+      // Find member (including anonymous struct/union members)
+      Token *member_tok = tok;
+      Member *m = get_struct_member(init->ty, tok);
+      if (!m) {
+        // Member not found in this struct. Return control to the outer
+        // scope so it can handle the designator at the correct level.
+        tok = before_comma;
+        break;
       }
-      if (!m)
-        error_tok(tok, "no such struct member");
+      mem = m;
       tok = tok->next;
 
-      // Compute member index
-      int idx = 0;
-      Member *m2 = init->ty->members;
-      for (; m2 != mem; m2 = m2->next)
-        idx++;
+      // Find the target initializer, descending into anonymous members
+      Initializer *target = init;
+      for (;;) {
+        int idx = 0;
+        Member *dm = target->ty->members;
+        bool found = false;
+        for (; dm; dm = dm->next, idx++) {
+          if (dm == m) { found = true; break; }
+          // Check anonymous members
+          if (!dm->name && (dm->ty->kind == TY_STRUCT || dm->ty->kind == TY_UNION)) {
+            if (get_struct_member(dm->ty, member_tok)) {
+              target = target->children[idx];
+              found = false;
+              break;
+            }
+          }
+        }
+        if (found) {
+          target = target->children[idx];
+          break;
+        }
+        if (!dm) break; // shouldn't happen
+      }
 
       // Nested designator: .a.j = 5 or .a[0] = 5
       if (!old_style && (equal(tok, ".") || equal(tok, "["))) {
-        initializer2(&tok, tok, init->children[idx]);
+        initializer2(&tok, tok, target);
         mem = mem->next;
         continue;
       }
@@ -4648,7 +4667,7 @@ static void struct_initializer1(Token **rest, Token *tok, Initializer *init) {
       else if (!consume(&tok, tok, "="))
         ; // designator without = is allowed in some modes
 
-      initializer2(&tok, tok, init->children[idx]);
+      initializer2(&tok, tok, target);
       mem = mem->next;
       continue;
     }

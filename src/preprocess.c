@@ -810,7 +810,18 @@ static Token *subst(Token *tok, MacroArg *args) {
       for (;;) {
         MacroArg *rhs = find_arg(args, tok);
         if (rhs) {
-          if (rhs->tok->kind != TK_EOF) {
+          if (rhs->tok->kind == TK_EOF && equal(cur, ",")) {
+            // GNU extension: , ## __VA_ARGS__ with empty args → delete comma
+            Token *prev = &head;
+            while (prev->next && prev->next != cur)
+              prev = prev->next;
+            prev->next = NULL;
+            cur = prev;
+          } else if (rhs->tok->kind != TK_EOF && equal(cur, ",")) {
+            // , ## __VA_ARGS__ with non-empty args → keep comma, expand args
+            for (Token *t = rhs->tok; t->kind != TK_EOF; t = t->next)
+              cur = cur->next = copy_token(t);
+          } else if (rhs->tok->kind != TK_EOF) {
             *cur = *paste(cur, rhs->tok);
             for (Token *t = rhs->tok->next; t->kind != TK_EOF; t = t->next)
               cur = cur->next = copy_token(t);
@@ -1127,6 +1138,21 @@ void init_macros(void) {
   define_macro("__GNUC__", "4");
   define_macro("__GNUC_MINOR__", "0");
   define_macro("__GNUC_PATCHLEVEL__", "0");
+  define_macro("__VERSION__", "\"ncc 1.0 compatible\"");
+
+  // GCC atomic memory order constants
+  define_macro("__ATOMIC_RELAXED", "0");
+  define_macro("__ATOMIC_CONSUME", "1");
+  define_macro("__ATOMIC_ACQUIRE", "2");
+  define_macro("__ATOMIC_RELEASE", "3");
+  define_macro("__ATOMIC_ACQ_REL", "4");
+  define_macro("__ATOMIC_SEQ_CST", "5");
+
+  // GCC atomic builtins (single-threaded stubs)
+  define_macro("__atomic_load_n(p,o)", "(*(p))");
+  define_macro("__atomic_store_n(p,v,o)", "(*(p)=(v))");
+  define_macro("__atomic_exchange_n(p,v,o)", "__sync_lock_test_and_set(p,v)");
+  define_macro("__atomic_compare_exchange_n(p,e,d,w,s,f)", "__sync_bool_compare_and_swap(p,*(e),d)");
   define_macro("__GCC_HAVE_SYNC_COMPARE_AND_SWAP_1", "1");
   define_macro("__GCC_HAVE_SYNC_COMPARE_AND_SWAP_2", "1");
   define_macro("__GCC_HAVE_SYNC_COMPARE_AND_SWAP_4", "1");
