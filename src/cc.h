@@ -547,5 +547,6 @@ extern char *base_file;
 
 // Counter for unique labels
 extern int label_cnt;
+extern int gvar_cnt;
 
 #endif // CC_H

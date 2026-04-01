@@ -103,6 +103,7 @@ static void compile(char *input_path, char *output_path) {
     for (char *p = input_path; *p; p++)
       hash = hash * 31 + (unsigned char)*p;
     label_cnt = (int)(hash % 900000) * 1000;
+    gvar_cnt = label_cnt;
   }
 
   Token *tok = tokenize_file(input_path);

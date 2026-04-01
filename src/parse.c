@@ -106,9 +106,9 @@ static VarScope *push_scope(char *name) {
   return vs;
 }
 
-// Create a new unique name for labels
+// Create a new unique name for labels (Ltmp prefix = Mach-O assembler-local)
 static char *new_unique_name(void) {
-  return format(".L..%d", label_cnt++);
+  return format("Ltmp_%d", label_cnt++);
 }
 
 //
@@ -443,9 +443,9 @@ static Obj *new_gvar(char *name, Type *ty) {
   return var;
 }
 
+int gvar_cnt = 0;
 static char *new_gvar_name(void) {
-  static int cnt = 0;
-  return format(".L.data.%d", cnt++);
+  return format(".L.data.%d", gvar_cnt++);
 }
 
 static Obj *new_anon_gvar(Type *ty) {

@@ -216,14 +216,14 @@ static void store(Type *ty) {
       // Runtime byte-copy loop: copy x3 bytes from [x0] to [x1]
       int c = label_cnt++;
       println("mov x4, #0");                      // x4 = offset
-      printlabel(".L.vla.copy.%d:", c);
+      printlabel("Ltmp_vla.copy.%d:", c);
       println("cmp x4, x3");
-      println("b.ge .L.vla.copy.end.%d", c);
+      println("b.ge Ltmp_vla.copy.end.%d", c);
       println("ldrb w5, [x0, x4]");
       println("strb w5, [x1, x4]");
       println("add x4, x4, #1");
-      println("b .L.vla.copy.%d", c);
-      printlabel(".L.vla.copy.end.%d:", c);
+      println("b Ltmp_vla.copy.%d", c);
+      printlabel("Ltmp_vla.copy.end.%d:", c);
       return;
     }
 
@@ -900,9 +900,9 @@ static void gen_expr(Node *node) {
         println("sub x9, x29, x9");
       }
       println("ldr x10, [x9]");
-      println("cbz x10, .L.vla.skip.%d", label_cnt);
+      println("cbz x10, Ltmp_vla.skip.%d", label_cnt);
       println("mov sp, x10");
-      printlabel(".L.vla.skip.%d:", label_cnt);
+      printlabel("Ltmp_vla.skip.%d:", label_cnt);
       label_cnt++;
       println("mov x10, sp");
       println("str x10, [x9]");
@@ -1134,12 +1134,12 @@ static void gen_expr(Node *node) {
   case ND_COND: {
     int c = label_cnt++;
     gen_cond(node->cond);
-    println("b.eq .L.else.%d", c);
+    println("b.eq Ltmp_else.%d", c);
     gen_expr(node->then);
-    println("b .L.end.%d", c);
-    printlabel(".L.else.%d:", c);
+    println("b Ltmp_end.%d", c);
+    printlabel("Ltmp_else.%d:", c);
     gen_expr(node->els);
-    printlabel(".L.end.%d:", c);
+    printlabel("Ltmp_end.%d:", c);
     return;
   }
 
@@ -1166,28 +1166,28 @@ static void gen_expr(Node *node) {
   case ND_LOGAND: {
     int c = label_cnt++;
     gen_cond(node->lhs);
-    println("b.eq .L.false.%d", c);
+    println("b.eq Ltmp_false.%d", c);
     gen_cond(node->rhs);
-    println("b.eq .L.false.%d", c);
+    println("b.eq Ltmp_false.%d", c);
     println("mov x0, #1");
-    println("b .L.end.%d", c);
-    printlabel(".L.false.%d:", c);
+    println("b Ltmp_end.%d", c);
+    printlabel("Ltmp_false.%d:", c);
     println("mov x0, #0");
-    printlabel(".L.end.%d:", c);
+    printlabel("Ltmp_end.%d:", c);
     return;
   }
 
   case ND_LOGOR: {
     int c = label_cnt++;
     gen_cond(node->lhs);
-    println("b.ne .L.true.%d", c);
+    println("b.ne Ltmp_true.%d", c);
     gen_cond(node->rhs);
-    println("b.ne .L.true.%d", c);
+    println("b.ne Ltmp_true.%d", c);
     println("mov x0, #0");
-    println("b .L.end.%d", c);
-    printlabel(".L.true.%d:", c);
+    println("b Ltmp_end.%d", c);
+    printlabel("Ltmp_true.%d:", c);
     println("mov x0, #1");
-    printlabel(".L.end.%d:", c);
+    printlabel("Ltmp_end.%d:", c);
     return;
   }
 
@@ -1206,12 +1206,12 @@ static void gen_expr(Node *node) {
     gen_expr(node->lhs);
     int c = label_cnt++;
     println("mov x1, x29"); // start from current frame
-    println("cbz x0, .L.ra.done.%d", c);
-    printlabel(".L.ra.loop.%d:", c);
+    println("cbz x0, Ltmp_ra.done.%d", c);
+    printlabel("Ltmp_ra.loop.%d:", c);
     println("ldr x1, [x1]"); // follow frame pointer chain
     println("sub x0, x0, #1");
-    println("cbnz x0, .L.ra.loop.%d", c);
-    printlabel(".L.ra.done.%d:", c);
+    println("cbnz x0, Ltmp_ra.loop.%d", c);
+    printlabel("Ltmp_ra.done.%d:", c);
     println("ldr x0, [x1, #8]"); // return address is at fp+8
     return;
   }
@@ -1223,12 +1223,12 @@ static void gen_expr(Node *node) {
     gen_expr(node->lhs);
     int c = label_cnt++;
     println("mov x1, x29");
-    println("cbz x0, .L.fa.done.%d", c);
-    printlabel(".L.fa.loop.%d:", c);
+    println("cbz x0, Ltmp_fa.done.%d", c);
+    printlabel("Ltmp_fa.loop.%d:", c);
     println("ldr x1, [x1]"); // follow frame pointer chain
     println("sub x0, x0, #1");
-    println("cbnz x0, .L.fa.loop.%d", c);
-    printlabel(".L.fa.done.%d:", c);
+    println("cbnz x0, Ltmp_fa.loop.%d", c);
+    printlabel("Ltmp_fa.done.%d:", c);
     println("mov x0, x1");
     return;
   }
@@ -1244,13 +1244,13 @@ static void gen_expr(Node *node) {
     println("mov x1, sp");
     println("str x1, [x0, #8]");    // buf[1] = sp
     int c = label_cnt++;
-    println("adr x1, .L.sjret.%d", c);
+    println("adr x1, Ltmp_sjret.%d", c);
     println("str x1, [x0, #16]");   // buf[2] = return label
     println("mov x0, #0");          // first call returns 0
-    println("b .L.sjdone.%d", c);
-    printlabel(".L.sjret.%d:", c);
+    println("b Ltmp_sjdone.%d", c);
+    printlabel("Ltmp_sjret.%d:", c);
     println("mov x0, #1");          // longjmp return returns 1
-    printlabel(".L.sjdone.%d:", c);
+    printlabel("Ltmp_sjdone.%d:", c);
     return;
   }
 
@@ -1396,19 +1396,19 @@ static void gen_expr(Node *node) {
     pop("x1");  // addr
     println("ldr x4, [x3]"); // expected old val
     int c = label_cnt++;
-    printlabel(".L.cas.%d:", c);
+    printlabel("Ltmp_cas.%d:", c);
     println("ldaxr x0, [x1]");
     println("cmp x0, x4");
-    println("b.ne .L.cas.fail.%d", c);
+    println("b.ne Ltmp_cas.fail.%d", c);
     println("stlxr w5, x2, [x1]");
-    println("cbnz w5, .L.cas.%d", c);
+    println("cbnz w5, Ltmp_cas.%d", c);
     println("str x0, [x3]");
     println("mov x0, #1");
-    println("b .L.cas.end.%d", c);
-    printlabel(".L.cas.fail.%d:", c);
+    println("b Ltmp_cas.end.%d", c);
+    printlabel("Ltmp_cas.fail.%d:", c);
     println("str x0, [x3]");
     println("mov x0, #0");
-    printlabel(".L.cas.end.%d:", c);
+    printlabel("Ltmp_cas.end.%d:", c);
     return;
   }
 
@@ -1418,10 +1418,10 @@ static void gen_expr(Node *node) {
     gen_expr(node->cas_new);
     pop("x1");
     int c = label_cnt++;
-    printlabel(".L.exch.%d:", c);
+    printlabel("Ltmp_exch.%d:", c);
     println("ldaxr x2, [x1]");
     println("stlxr w3, x0, [x1]");
-    println("cbnz w3, .L.exch.%d", c);
+    println("cbnz w3, Ltmp_exch.%d", c);
     println("mov x0, x2");
     return;
   }
@@ -1455,21 +1455,21 @@ static void gen_expr(Node *node) {
     int c = label_cnt++;
     if (node->val) { // 64-bit
       println("cmp x0, #0");
-      println("b.eq .L.ffs.zero.%d", c);
+      println("b.eq Ltmp_ffs.zero.%d", c);
       println("rbit x0, x0");
       println("clz x0, x0");
       println("add w0, w0, #1");
     } else {
       println("cmp w0, #0");
-      println("b.eq .L.ffs.zero.%d", c);
+      println("b.eq Ltmp_ffs.zero.%d", c);
       println("rbit w0, w0");
       println("clz w0, w0");
       println("add w0, w0, #1");
     }
-    println("b .L.ffs.end.%d", c);
-    printlabel(".L.ffs.zero.%d:", c);
+    println("b Ltmp_ffs.end.%d", c);
+    printlabel("Ltmp_ffs.zero.%d:", c);
     println("mov w0, #0");
-    printlabel(".L.ffs.end.%d:", c);
+    printlabel("Ltmp_ffs.end.%d:", c);
     return;
   }
 
@@ -1764,9 +1764,9 @@ static void gen_stmt(Node *node) {
     if (node->cond->kind == ND_NUM && is_integer(node->cond->ty)) {
       if (node->cond->val == 0) {
         int c = label_cnt++;
-        println("b .L.end.%d", c);
+        println("b Ltmp_end.%d", c);
         gen_stmt_dead(node->then);
-        printlabel(".L.end.%d:", c);
+        printlabel("Ltmp_end.%d:", c);
         if (node->els)
           gen_stmt(node->els);
         return;
@@ -1777,13 +1777,13 @@ static void gen_stmt(Node *node) {
     }
     int c = label_cnt++;
     gen_cond(node->cond);
-    println("b.eq .L.else.%d", c);
+    println("b.eq Ltmp_else.%d", c);
     gen_stmt(node->then);
-    println("b .L.end.%d", c);
-    printlabel(".L.else.%d:", c);
+    println("b Ltmp_end.%d", c);
+    printlabel("Ltmp_else.%d:", c);
     if (node->els)
       gen_stmt(node->els);
-    printlabel(".L.end.%d:", c);
+    printlabel("Ltmp_end.%d:", c);
     return;
   }
 
@@ -1791,7 +1791,7 @@ static void gen_stmt(Node *node) {
     int c = label_cnt++;
     if (node->init)
       gen_stmt(node->init);
-    printlabel(".L.begin.%d:", c);
+    printlabel("Ltmp_begin.%d:", c);
     if (node->cond) {
       gen_cond(node->cond);
       println("b.eq %s", node->unique_label);
@@ -1801,19 +1801,19 @@ static void gen_stmt(Node *node) {
       printlabel("%s:", node->cont_label);
     if (node->inc)
       gen_expr(node->inc);
-    println("b .L.begin.%d", c);
+    println("b Ltmp_begin.%d", c);
     printlabel("%s:", node->unique_label);
     return;
   }
 
   case ND_DO: {
     int c = label_cnt++;
-    printlabel(".L.begin.%d:", c);
+    printlabel("Ltmp_begin.%d:", c);
     gen_stmt(node->then);
     if (node->cont_label)
       printlabel("%s:", node->cont_label);
     gen_cond(node->cond);
-    println("b.ne .L.begin.%d", c);
+    println("b.ne Ltmp_begin.%d", c);
     printlabel("%s:", node->unique_label);
     return;
   }
@@ -1842,11 +1842,11 @@ static void gen_stmt(Node *node) {
         // Case range
         load_imm("x9", (uint64_t)(int64_t)n->begin);
         println("cmp x0, x9");
-        println("b.lt .L.next.%s", n->label);
+        println("b.lt Ltmp_next.%s", n->label);
         load_imm("x9", (uint64_t)(int64_t)n->end);
         println("cmp x0, x9");
         println("b.le %s", n->label);
-        printlabel(".L.next.%s:", n->label);
+        printlabel("Ltmp_next.%s:", n->label);
       }
     }
 
@@ -1900,7 +1900,7 @@ static void gen_stmt(Node *node) {
       // For struct returns, x0 has the address of the struct data.
       // The caller will copy from this address.
     }
-    println("b .L.return.%s", current_fn->name);
+    println("b Ltmp_return.%s", current_fn->name);
     return;
 
   case ND_EXPR_STMT:
@@ -2212,13 +2212,16 @@ static void emit_text(Obj *prog) {
       continue;
     if (hashmap_get(&emitted_fns, fn->name))
       continue;
-    // Emit inline functions as local symbols (no .globl) to avoid
-    // duplicate symbol errors when the same inline appears in multiple TUs.
+    // With .subsections_via_symbols, weak definitions are properly
+    // deduplicated by the linker across translation units.
     hashmap_put(&emitted_fns, fn->name, (void *)1);
 
     printlabel(".section __TEXT,__text");
-    if (!fn->is_static && !fn->is_inline)
+    if (!fn->is_static) {
+      if (fn->is_inline)
+        println(".weak_definition _%s", fn->name);
       println(".globl _%s", fn->name);
+    }
     println(".p2align 2");
     printlabel("_%s:", fn->name);
 
@@ -2474,7 +2477,7 @@ static void emit_text(Obj *prog) {
     assert(depth == 0);
 
     // Epilogue
-    printlabel(".L.return.%s:", fn->name);
+    printlabel("Ltmp_return.%s:", fn->name);
 
     // C99 5.1.2.2.3: implicit return 0 from main()
     if (!strcmp(fn->name, "main"))
@@ -2501,4 +2504,7 @@ void codegen(Obj *prog, FILE *out) {
   // Ensure the file doesn't trigger NX protection issues
   printlabel(".section __DATA,__data");
 
+  // Enable weak definition deduplication and dead-stripping.
+  // Safe now that code labels use Ltmp (assembler-local on Mach-O).
+  println(".subsections_via_symbols");
 }
