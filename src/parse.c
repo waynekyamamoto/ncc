@@ -1382,8 +1382,13 @@ static void struct_layout(Type *ty) {
       max_align = mem->align;
   }
 
-  ty->align = max_align;
-  ty->size = align_to(offset, max_align);
+  if (ty->is_packed) {
+    ty->align = 1;
+    ty->size = offset;
+  } else {
+    ty->align = max_align;
+    ty->size = align_to(offset, max_align);
+  }
 }
 
 // Layout union members
