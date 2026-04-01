@@ -1138,6 +1138,7 @@ void init_macros(void) {
   define_macro("__GNUC__", "4");
   define_macro("__GNUC_MINOR__", "0");
   define_macro("__GNUC_PATCHLEVEL__", "0");
+  define_macro("__GNUC_STDC_INLINE__", "1");
   define_macro("__VERSION__", "\"ncc 1.0 compatible\"");
 
   // GCC atomic memory order constants

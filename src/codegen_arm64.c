@@ -757,6 +757,13 @@ static void gen_funcall(Node *node) {
     }
   }
 
+  // Check for large struct return
+  Type *call_ret_ty = node->func_ty->return_ty;
+  bool large_ret = call_ret_ty &&
+    (call_ret_ty->kind == TY_STRUCT || call_ret_ty->kind == TY_UNION) &&
+    call_ret_ty->size > 16;
+  int ret_buf_size = large_ret ? align_to(call_ret_ty->size, 16) : 0;
+
   // Call the function
   if (node->lhs) {
     // Indirect call through expression (function pointer)
@@ -775,8 +782,16 @@ static void gen_funcall(Node *node) {
     for (int i = gp_reg - 1; i >= 0; i--)
       println("ldr %s, [sp], #16", argreg64[i]);
 
+    if (large_ret) {
+      println("sub sp, sp, #%d", ret_buf_size);
+      println("mov x8, sp");
+    }
     println("blr x9");
   } else {
+    if (large_ret) {
+      println("sub sp, sp, #%d", ret_buf_size);
+      println("mov x8, sp");
+    }
     println("bl _%s", node->funcname);
   }
 
@@ -784,12 +799,20 @@ static void gen_funcall(Node *node) {
   if (padded_stack > 0)
     println("add sp, sp, #%d", padded_stack);
 
-  // Result is in x0 (integer) or d0 (float)
-  Type *ret_ty = node->func_ty->return_ty;
-  if (ret_ty->kind == TY_BOOL)
+  // For large struct returns: result is in the buffer at [sp]
+  // (The callee wrote to [x8] which was sp before the call)
+  // Set x0 to point to the buffer, then free it. The data stays intact
+  // on the freed stack until the caller copies it (store happens next).
+  if (large_ret) {
+    println("mov x0, sp");
+    println("add sp, sp, #%d", ret_buf_size);
+  }
+
+  // Result is in x0 (integer/pointer) or d0 (float)
+  if (call_ret_ty->kind == TY_BOOL)
     println("and x0, x0, #1");
 
-  // For struct returns: our internal convention passes the address in x0.
+  // For struct returns: x0 has the address of the struct data.
   // The caller's store() will copy from this address.
 }
 
@@ -1740,6 +1763,11 @@ static void gen_stmt_dead(Node *node) {
     printlabel("%s:", node->label);
     gen_stmt(node->lhs);
     return;
+  case ND_LABEL:
+    // Goto label — emit it and switch to normal codegen (reachable via goto)
+    printlabel("%s:", node->unique_label);
+    gen_stmt(node->lhs);
+    return;
   case ND_IF:
     gen_stmt_dead(node->then);
     if (node->els)
@@ -2210,6 +2238,11 @@ static void emit_text(Obj *prog) {
   for (Obj *fn = prog; fn; fn = fn->next) {
     if (!fn->is_function || !fn->is_definition)
       continue;
+    // Extern inline functions (e.g. system header functions like isdigit,
+    // tolower) are inline-only definitions. Emit them as local symbols
+    // so they don't override system library implementations, but are
+    // still available if called from this compilation unit.
+    bool extern_inline = fn->is_inline && fn->is_extern;
     if (hashmap_get(&emitted_fns, fn->name))
       continue;
     // With .subsections_via_symbols, weak definitions are properly
@@ -2217,7 +2250,7 @@ static void emit_text(Obj *prog) {
     hashmap_put(&emitted_fns, fn->name, (void *)1);
 
     printlabel(".section __TEXT,__text");
-    if (!fn->is_static) {
+    if (!fn->is_static && !extern_inline) {
       if (fn->is_inline)
         println(".weak_definition _%s", fn->name);
       println(".globl _%s", fn->name);
@@ -2236,10 +2269,25 @@ static void emit_text(Obj *prog) {
     }
     assign_lvar_offsets(fn);
 
+    // Check if function returns a large struct (>16 bytes) via x8 indirect
+    Type *ret_ty = fn->ty->return_ty;
+    bool large_struct_ret = ret_ty &&
+      (ret_ty->kind == TY_STRUCT || ret_ty->kind == TY_UNION) &&
+      ret_ty->size > 16;
+
     // Prologue
+    // For large struct returns, save x28 BEFORE the frame pointer.
+    // This keeps x28 outside the fp-relative addressing of locals.
+    if (large_struct_ret)
+      println("str x28, [sp, #-16]!");
+
     // Save frame pointer and link register
     println("stp x29, x30, [sp, #-16]!");
     println("mov x29, sp");
+
+    // Save x8 (indirect result pointer) in x28
+    if (large_struct_ret)
+      println("mov x28, x8");
 
     // Allocate stack space for locals
     if (fn->stack_size > 0) {
@@ -2483,9 +2531,36 @@ static void emit_text(Obj *prog) {
     if (!strcmp(fn->name, "main"))
       println("mov x0, #0");
 
-    // Restore stack
+    // For large struct returns: copy result from x0 (local addr) to [x28]
+    // x28 = x8 (saved indirect result pointer from prologue)
+    if (large_struct_ret) {
+      // x0 = source address of struct on our stack frame
+      // Copy ret_ty->size bytes from [x0] to [x28]
+      int sz = ret_ty->size;
+      int off = 0;
+      while (off + 8 <= sz) {
+        println("ldr x9, [x0, #%d]", off);
+        println("str x9, [x28, #%d]", off);
+        off += 8;
+      }
+      if (off + 4 <= sz) {
+        println("ldr w9, [x0, #%d]", off);
+        println("str w9, [x28, #%d]", off);
+        off += 4;
+      }
+      while (off < sz) {
+        println("ldrb w9, [x0, #%d]", off);
+        println("strb w9, [x28, #%d]", off);
+        off++;
+      }
+      println("mov x0, x28");
+    }
+
+    // Restore stack and callee-saved registers
     println("mov sp, x29");
     println("ldp x29, x30, [sp], #16");
+    if (large_struct_ret)
+      println("ldr x28, [sp], #16");
     println("ret");
   }
 }

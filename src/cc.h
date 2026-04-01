@@ -320,6 +320,7 @@ struct Obj {
   bool is_function;
   bool is_definition;
   bool is_static;
+  bool is_extern;
   bool is_tentative;
   bool is_tls;        // thread-local storage
   bool is_inline;

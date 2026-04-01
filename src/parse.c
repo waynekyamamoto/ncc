@@ -1181,6 +1181,15 @@ static Type *declarator(Token **rest, Token *tok, Type *ty) {
       Type *inner = declarator(&tok, tok, placeholder);
       tok = skip(tok, ")");
       *placeholder = *type_suffix(rest, tok, ty);
+      // If inner is a direct copy of placeholder (no pointer/array indirection
+      // between them), copy_type disconnected it. Propagate the update.
+      if (inner != placeholder && inner->origin == placeholder) {
+        Token *saved_name = inner->name;
+        Token *saved_name_pos = inner->name_pos;
+        *inner = *placeholder;
+        inner->name = saved_name;
+        inner->name_pos = saved_name_pos;
+      }
       // Fix up sizes in the type chain from inner down to placeholder.
       // Array sizes were computed when placeholder was empty (size=0),
       // so we need to recompute them now that placeholder is filled.
@@ -3758,6 +3767,18 @@ static Node *funcall(Token **rest, Token *tok, Node *fn) {
 // Statement parsing
 //
 
+// Check if an AST subtree contains any ND_LABEL nodes (goto targets).
+// Used to prevent dead-code elimination of branches that have labels.
+static bool contains_label(Node *node) {
+  if (!node)
+    return false;
+  if (node->kind == ND_LABEL)
+    return true;
+  return contains_label(node->body) || contains_label(node->lhs) ||
+         contains_label(node->rhs) || contains_label(node->then) ||
+         contains_label(node->els) || contains_label(node->next);
+}
+
 static Node *stmt(Token **rest, Token *tok) {
   // Return statement
   if (equal(tok, "return")) {
@@ -3796,14 +3817,15 @@ static Node *stmt(Token **rest, Token *tok) {
     // replace the dead branch with an empty statement.
     // Only do this when NOT inside a switch, because case labels inside
     // if(0){} are still reachable via the switch.
+    // Also skip if the dead branch contains goto labels (reachable via goto).
     add_type(node->cond);
     if (!current_switch && node->cond->kind == ND_NUM && is_integer(node->cond->ty)) {
-      if (node->cond->val == 0) {
+      if (node->cond->val == 0 && !contains_label(node->then)) {
         // if (0) — then branch is dead
         if (node->els)
           return node->els;  // only else
         return new_node(ND_BLOCK, tok); // empty block
-      } else {
+      } else if (node->cond->val != 0 && !contains_label(node->els)) {
         // if (nonzero) — else branch is dead
         return node->then;
       }
@@ -5256,6 +5278,7 @@ static Token *function(Token *tok, Type *fn_ty, VarAttr *attr) {
     fn->align = prev_align;
   fn->is_definition = true;
   fn->is_static = attr->is_static;
+  fn->is_extern = attr->is_extern;
   fn->is_inline = attr->is_inline;
   fn->is_variadic = fn_ty->is_variadic;
 
