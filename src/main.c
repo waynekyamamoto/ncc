@@ -74,6 +74,9 @@ static void assemble(char *input, char *output) {
   run_cmd(&cmd);
 }
 
+// Linker flags collected from command line
+static StringArray ld_extra_flags;
+
 // Link .o files to executable
 static void link_files(StringArray *inputs, char *output) {
   StringArray cmd = {};
@@ -90,6 +93,9 @@ static void link_files(StringArray *inputs, char *output) {
 
   for (int i = 0; i < inputs->len; i++)
     strarray_push(&cmd, inputs->data[i]);
+
+  for (int i = 0; i < ld_extra_flags.len; i++)
+    strarray_push(&cmd, ld_extra_flags.data[i]);
 
   run_cmd(&cmd);
 }
@@ -241,6 +247,28 @@ int main(int argc, char **argv) {
       continue;
     }
 
+    // Library/linker flags (pass through to linker)
+    if (!strncmp(argv[i], "-l", 2) || !strncmp(argv[i], "-L", 2)) {
+      strarray_push(&ld_extra_flags, argv[i]);
+      continue;
+    }
+    if (!strcmp(argv[i], "-framework")) {
+      strarray_push(&ld_extra_flags, argv[i]);
+      if (++i < argc)
+        strarray_push(&ld_extra_flags, argv[i]);
+      continue;
+    }
+    if (!strncmp(argv[i], "-Wl,", 4)) {
+      // Split -Wl,arg1,arg2 into separate ld args
+      char *args = strdup(argv[i] + 4);
+      char *p = strtok(args, ",");
+      while (p) {
+        strarray_push(&ld_extra_flags, strdup(p));
+        p = strtok(NULL, ",");
+      }
+      continue;
+    }
+
     // Ignore common flags we don't support
     if (!strcmp(argv[i], "-w") || !strcmp(argv[i], "-g") ||
         !strcmp(argv[i], "-O0") || !strcmp(argv[i], "-O1") ||
@@ -263,11 +291,6 @@ int main(int argc, char **argv) {
       if (!strcmp(argv[i], "-MF") || !strcmp(argv[i], "-MT") ||
           !strcmp(argv[i], "-MQ"))
         i++; // skip argument
-      continue;
-    }
-
-    // Library flags (pass through to linker)
-    if (!strncmp(argv[i], "-l", 2) || !strncmp(argv[i], "-L", 2)) {
       continue;
     }
 
@@ -298,6 +321,14 @@ int main(int argc, char **argv) {
 
   for (int i = 0; i < input_files_list.len; i++) {
     char *input = input_files_list.data[i];
+    int len = strlen(input);
+
+    // .o and .a files go directly to the linker
+    if ((len > 2 && !strcmp(input + len - 2, ".o")) ||
+        (len > 2 && !strcmp(input + len - 2, ".a"))) {
+      strarray_push(&obj_files, input);
+      continue;
+    }
 
     if (opt_S) {
       // Output assembly
