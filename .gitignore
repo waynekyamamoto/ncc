@@ -1,9 +1,14 @@
 # Build artifacts
 build/
 ncc
+ncc_asan
+ncc_debug
 src/*.o
 *.o
 *.s
+
+# Test binaries
+tests/sqlite/test_*
 
 # macOS
 .DS_Store
