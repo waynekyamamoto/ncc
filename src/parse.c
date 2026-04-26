@@ -4457,8 +4457,16 @@ static Node *declaration(Token **rest, Token *tok, Type *basety, VarAttr *attr) 
       tok = skip(tok, ",");
 
     Type *ty = declarator(&tok, tok, basety);
-    if (ty->kind == TY_VOID)
-      error_tok(tok, "variable declared void");
+    if (ty->kind == TY_VOID) {
+      // Allow "extern void foo" / "extern const void foo" as linker symbol placeholder
+      if (attr && attr->is_extern) {
+        Token *name = ty->name;
+        ty = copy_type(ty_char);
+        ty->name = name;
+      } else {
+        error_tok(tok, "variable declared void");
+      }
+    }
     if (!ty->name)
       error_tok(tok, "variable name omitted");
 
@@ -4789,6 +4797,13 @@ static void array_initializer1(Token **rest, Token *tok, Initializer *init) {
       // the next element belongs to the parent struct — stop without consuming.
       if (!has_brace && equal(tok, ",") && equal(tok->next, "."))
         break;
+      // In brace-less mode, if we're past the array bounds and the next
+      // token after ',' is not a designator '[', leave the comma unconsumed
+      // for the parent initializer (e.g. when struct member is an array
+      // and the parent struct has more members after it).
+      if (!has_brace && equal(tok, ",") &&
+          i >= init->ty->array_len && !equal(tok->next, "["))
+        break;
       tok = skip(tok, ",");
       if (is_end(tok)) break; // trailing comma
     }
@@ -4820,8 +4835,20 @@ static void array_initializer1(Token **rest, Token *tok, Initializer *init) {
       }
       i = lo;
       tok = skip(tok, "]");
-      if (!consume(&tok, tok, "="))
+      // Multi-level array designator: [outer][inner] = v
+      // The inner [inner] belongs to the child element — pass through to initializer2.
+      bool is_multi_level = !has_brace && equal(tok, "[");
+      if (!is_multi_level && !consume(&tok, tok, "="))
         ; // = is optional
+      if (i < init->ty->array_len)
+        initializer2(&tok, tok, init->children[i]);
+      else
+        assign(&tok, tok); // skip excess
+      // In brace-less mode a designated element ends this initializer level;
+      // the parent handles subsequent elements (including [outer2]... forms).
+      if (!has_brace)
+        break;
+      continue;
     }
 
     if (i < init->ty->array_len)
