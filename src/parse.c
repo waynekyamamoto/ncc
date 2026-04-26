@@ -1303,8 +1303,15 @@ static void struct_members(Token **rest, Token *tok, Type *ty) {
         mem->bit_width = const_expr_val(&tok, tok);
       }
 
-      // Handle __attribute__ on struct members
-      tok = attribute_list(tok, mem->ty, NULL);
+      // Handle __attribute__ on struct members.
+      // Pass NULL for the type to avoid mutating the shared type object
+      // (e.g., aligned(N) must update mem->align, not the global type's align/size).
+      {
+        VarAttr mem_attr = {};
+        tok = attribute_list(tok, NULL, &mem_attr);
+        if (mem_attr.align)
+          mem->align = mem_attr.align;
+      }
 
       cur = cur->next = mem;
     }
@@ -1804,6 +1811,44 @@ static void eval_complex(Node *node, double *re, double *im);
 
 static int64_t eval(Node *node) {
   return eval2(node, NULL);
+}
+
+int64_t eval_node(Node *node) {
+  return eval2(node, NULL);
+}
+
+// Like eval_node but returns false instead of dying if not a compile-time constant.
+bool try_eval_node(Node *node, int64_t *out) {
+  add_type(node);
+  switch (node->kind) {
+  case ND_NUM:      *out = node->val; return true;
+  case ND_NEG:      { int64_t v; if (!try_eval_node(node->lhs, &v)) return false; *out = -v; return true; }
+  case ND_NOT:      { int64_t v; if (!try_eval_node(node->lhs, &v)) return false; *out = !v; return true; }
+  case ND_BITNOT:   { int64_t v; if (!try_eval_node(node->lhs, &v)) return false; *out = ~v; return true; }
+  case ND_CAST:     { int64_t v; if (!try_eval_node(node->lhs, &v)) return false; *out = v; return true; }
+  case ND_ADD:      { int64_t a, b; if (!try_eval_node(node->lhs, &a) || !try_eval_node(node->rhs, &b)) return false; *out = a + b; return true; }
+  case ND_SUB:      { int64_t a, b; if (!try_eval_node(node->lhs, &a) || !try_eval_node(node->rhs, &b)) return false; *out = a - b; return true; }
+  case ND_MUL:      { int64_t a, b; if (!try_eval_node(node->lhs, &a) || !try_eval_node(node->rhs, &b)) return false; *out = a * b; return true; }
+  case ND_DIV:      { int64_t a, b; if (!try_eval_node(node->lhs, &a) || !try_eval_node(node->rhs, &b) || b == 0) return false; *out = a / b; return true; }
+  case ND_MOD:      { int64_t a, b; if (!try_eval_node(node->lhs, &a) || !try_eval_node(node->rhs, &b) || b == 0) return false; *out = a % b; return true; }
+  case ND_BITAND:   { int64_t a, b; if (!try_eval_node(node->lhs, &a) || !try_eval_node(node->rhs, &b)) return false; *out = a & b; return true; }
+  case ND_BITOR:    { int64_t a, b; if (!try_eval_node(node->lhs, &a) || !try_eval_node(node->rhs, &b)) return false; *out = a | b; return true; }
+  case ND_BITXOR:   { int64_t a, b; if (!try_eval_node(node->lhs, &a) || !try_eval_node(node->rhs, &b)) return false; *out = a ^ b; return true; }
+  case ND_SHL:      { int64_t a, b; if (!try_eval_node(node->lhs, &a) || !try_eval_node(node->rhs, &b)) return false; *out = a << b; return true; }
+  case ND_SHR:      { int64_t a, b; if (!try_eval_node(node->lhs, &a) || !try_eval_node(node->rhs, &b)) return false; *out = a >> b; return true; }
+  case ND_EQ:       { int64_t a, b; if (!try_eval_node(node->lhs, &a) || !try_eval_node(node->rhs, &b)) return false; *out = a == b; return true; }
+  case ND_NE:       { int64_t a, b; if (!try_eval_node(node->lhs, &a) || !try_eval_node(node->rhs, &b)) return false; *out = a != b; return true; }
+  case ND_LT:       { int64_t a, b; if (!try_eval_node(node->lhs, &a) || !try_eval_node(node->rhs, &b)) return false; *out = a < b; return true; }
+  case ND_LE:       { int64_t a, b; if (!try_eval_node(node->lhs, &a) || !try_eval_node(node->rhs, &b)) return false; *out = a <= b; return true; }
+  case ND_LOGAND:   { int64_t a, b; if (!try_eval_node(node->lhs, &a) || !try_eval_node(node->rhs, &b)) return false; *out = a && b; return true; }
+  case ND_LOGOR:    { int64_t a, b; if (!try_eval_node(node->lhs, &a) || !try_eval_node(node->rhs, &b)) return false; *out = a || b; return true; }
+  case ND_COND:     {
+    int64_t cond;
+    if (!try_eval_node(node->cond, &cond)) return false;
+    return cond ? try_eval_node(node->then, out) : try_eval_node(node->els, out);
+  }
+  default: return false;
+  }
 }
 
 static int64_t eval2(Node *node, char ***label) {
@@ -4737,6 +4782,10 @@ static void array_initializer1(Token **rest, Token *tok, Initializer *init) {
 
   for (int i = 0; !is_end(tok); i++) {
     if (i > 0) {
+      // In brace-less mode, a ',' followed by a field designator '.' means
+      // the next element belongs to the parent struct — stop without consuming.
+      if (!has_brace && equal(tok, ",") && equal(tok->next, "."))
+        break;
       tok = skip(tok, ",");
       if (is_end(tok)) break; // trailing comma
     }
@@ -4764,10 +4813,6 @@ static void array_initializer1(Token **rest, Token *tok, Initializer *init) {
       tok = skip(tok, "]");
       if (!consume(&tok, tok, "="))
         ; // = is optional
-    }
-
-    if (equal(tok, ".") || equal(tok, "[")) {
-      // Nested designator — parse later
     }
 
     if (i < init->ty->array_len)

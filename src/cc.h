@@ -393,6 +393,8 @@ typedef struct Scope Scope;
 // Functions
 Obj *parse(Token *tok);
 Node *new_cast(Node *expr, Type *ty);
+int64_t eval_node(Node *node);
+bool try_eval_node(Node *node, int64_t *out);
 
 //
 // type.c

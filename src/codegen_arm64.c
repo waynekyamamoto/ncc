@@ -2018,23 +2018,42 @@ static void gen_stmt(Node *node) {
 
     // Track which operands are memory constraints (need address, emit [reg])
     bool is_mem_operand[10] = {0};
+    // Track which input operands are immediate constraints (emit #val, no register)
+    bool is_imm_operand[10] = {0};
     for (int i = 0; i < node->asm_num_outputs; i++) {
       char *c = node->asm_output_constraints[i];
       is_mem_operand[i] = (strchr(c, 'm') || strchr(c, 'Q') || strchr(c, 'o'));
     }
 
+    int reg_counter = 0; // tracks next x(19+reg_counter) to allocate
+    for (int i = 0; i < node->asm_num_outputs; i++)
+      reg_counter++;
+
     for (int i = 0; i < node->asm_num_inputs; i++) {
+      int idx = node->asm_num_outputs + i;
       char *c = node->asm_input_constraints[i];
       if (c[0] >= '0' && c[0] <= '9') {
         // Tied operand: use the same register as the referenced output
         int tied = c[0] - '0';
         if (tied >= node->asm_num_outputs)
           error_tok(node->tok, "asm tied operand out of range");
-        reg_name[node->asm_num_outputs + i] = reg_name[tied];
-        is_mem_operand[node->asm_num_outputs + i] = is_mem_operand[tied];
+        reg_name[idx] = reg_name[tied];
+        is_mem_operand[idx] = is_mem_operand[tied];
+      } else if (strchr(c, 'i') || strchr(c, 'I') || strchr(c, 'n') ||
+                 strchr(c, 'N') || strchr(c, 'K')) {
+        // Immediate constraint: if the expression is a compile-time constant,
+        // emit #val directly; otherwise fall back to a register (for "i" with
+        // non-constant arguments, which can happen in inlined inline functions).
+        int64_t val;
+        if (try_eval_node(node->asm_input_exprs[i], &val)) {
+          reg_name[idx] = format("#%lld", val);
+          is_imm_operand[idx] = true;
+        } else {
+          reg_name[idx] = format("x%d", 19 + reg_counter++);
+        }
       } else {
-        reg_name[node->asm_num_outputs + i] = format("x%d", 19 + node->asm_num_outputs + i);
-        is_mem_operand[node->asm_num_outputs + i] =
+        reg_name[idx] = format("x%d", 19 + reg_counter++);
+        is_mem_operand[idx] =
           (strchr(c, 'm') || strchr(c, 'Q') || strchr(c, 'o'));
       }
     }
@@ -2101,7 +2120,9 @@ static void gen_stmt(Node *node) {
     for (int i = 0; i < node->asm_num_inputs; i++) {
       int idx = node->asm_num_outputs + i;
       char *c = node->asm_input_constraints[i];
-      if (c[0] >= '0' && c[0] <= '9') {
+      if (is_imm_operand[idx]) {
+        // Immediate constraint: value already embedded in reg_name as "#val"
+      } else if (c[0] >= '0' && c[0] <= '9') {
         // Tied operand: use same register as output
         // For register tied operands, load value; for memory tied, already set
         if (!is_mem_operand[idx]) {

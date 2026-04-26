@@ -1452,7 +1452,7 @@ static Token *read_macro_definition(Token **rest, Token *tok) {
         break;
       }
 
-      if (tok->kind != TK_IDENT)
+      if (tok->kind != TK_IDENT && tok->kind != TK_KEYWORD)
         error_tok(tok, "expected parameter name");
 
       // Check for named variadic parameter: name...
