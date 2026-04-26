@@ -286,9 +286,8 @@ int main(int argc, char **argv) {
   atexit(cleanup);
   init_macros();
 
-  // Add default include paths
-  // Compiler-provided headers (stdarg.h, stddef.h, etc.) — search first
-  // Try to find the include dir relative to the executable
+  // Add compiler-provided headers first (stdarg.h, stddef.h, etc.)
+  // These must come before user -I paths and system paths.
   {
     char exe_path[1024];
     uint32_t size = sizeof(exe_path);
@@ -297,10 +296,6 @@ int main(int argc, char **argv) {
       add_include_path(format("%s/include", dir));
     }
   }
-  add_include_path("/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include");
-  add_include_path("/usr/local/include");
-  add_include_path("/usr/include");
-
 
   // Parse command-line arguments
   for (int i = 1; i < argc; i++) {
@@ -430,6 +425,12 @@ int main(int argc, char **argv) {
     // Input file
     strarray_push(&input_files_list, argv[i]);
   }
+
+  // Add system include paths AFTER user -I paths so that -I overrides system headers.
+  // This is standard GCC/Clang behavior: user -I paths shadow system paths.
+  add_include_path("/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include");
+  add_include_path("/usr/local/include");
+  add_include_path("/usr/include");
 
   if (input_files_list.len == 0)
     error("no input files");
