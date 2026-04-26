@@ -13,6 +13,7 @@ char *base_file;
 
 static StringArray input_files_list;
 static StringArray tmpfiles;
+static StringArray extra_includes;
 static char *opt_o;
 static bool opt_S;  // Output assembly only
 static bool opt_c;  // Compile only, don't link
@@ -64,13 +65,129 @@ static void run_cmd(StringArray *cmd) {
   free(buf);
 }
 
+// Filter GAS-only directives that macOS `as` doesn't support.
+// Handles the Linux kernel's use of: .subsection/.previous, .irp/.endr,
+// .macro/.endm (with subsequent invocations), .pushsection/.popsection.
+// Also strips \( GAS macro escapes from remaining lines.
+static char *filter_asm(char *input) {
+  FILE *in = fopen(input, "r");
+  if (!in) return input;
+
+  char *out_path = create_tmpfile();
+  FILE *out = fopen(out_path, "w");
+  if (!out) { fclose(in); return input; }
+
+  // Track names of GAS macros defined with .macro (and then skipped).
+  // Subsequent invocations of these macros are also skipped.
+  char *skipped_macros[32];
+  int n_skipped = 0;
+
+  typedef enum { ST_NORMAL, ST_SUBSECTION, ST_IREP, ST_MACRO, ST_PUSHSECT } State;
+  State state = ST_NORMAL;
+
+  char *line = NULL;
+  size_t cap = 0;
+
+  while (getline(&line, &cap, in) != -1) {
+    char *t = line;
+    while (*t == ' ' || *t == '\t') t++;
+
+    // Extract first word of line for matching
+    char word[64] = {0};
+    int wlen = 0;
+    for (char *p = t; *p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r'; p++)
+      if (wlen < 63) word[wlen++] = *p;
+    word[wlen] = '\0';
+
+    if (state != ST_NORMAL) {
+      // Check for block-ending directives
+      bool end_block = false;
+      if (state == ST_SUBSECTION && strcmp(word, ".previous") == 0) end_block = true;
+      if (state == ST_IREP      && strcmp(word, ".endr")     == 0) end_block = true;
+      if (state == ST_MACRO     && strcmp(word, ".endm")     == 0) end_block = true;
+      if (state == ST_PUSHSECT  && strcmp(word, ".popsection") == 0) end_block = true;
+      if (end_block) state = ST_NORMAL;
+      fputc('\n', out); // preserve line count
+      continue;
+    }
+
+    // NORMAL state — check for block-starting directives
+    if (strcmp(word, ".subsection") == 0) {
+      state = ST_SUBSECTION;
+      fputc('\n', out);
+      continue;
+    }
+    if (strcmp(word, ".irp") == 0 || strcmp(word, ".irpc") == 0) {
+      state = ST_IREP;
+      fputc('\n', out);
+      continue;
+    }
+    if (strcmp(word, ".pushsection") == 0) {
+      state = ST_PUSHSECT;
+      fputc('\n', out);
+      continue;
+    }
+    if (strcmp(word, ".macro") == 0) {
+      // Extract macro name (second word after .macro)
+      char *p = t + 6; // skip ".macro"
+      while (*p == ' ' || *p == '\t') p++;
+      char mname[64] = {0};
+      int ml = 0;
+      while (*p && *p != ',' && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r')
+        if (ml < 63) mname[ml++] = *p++;
+      mname[ml] = '\0';
+      if (ml > 0 && n_skipped < 32)
+        skipped_macros[n_skipped++] = strdup(mname);
+      state = ST_MACRO;
+      fputc('\n', out);
+      continue;
+    }
+    if (strcmp(word, ".purgem") == 0) {
+      // Always skip .purgem for macros we skipped (avoids "macro not defined" error)
+      fputc('\n', out);
+      continue;
+    }
+
+    // Check if this line is an invocation of a skipped macro
+    bool is_macro_call = false;
+    for (int i = 0; i < n_skipped; i++) {
+      if (strcmp(word, skipped_macros[i]) == 0) {
+        is_macro_call = true;
+        break;
+      }
+    }
+    if (is_macro_call) {
+      fputc('\n', out);
+      continue;
+    }
+
+    // Normal line — output it, stripping GAS macro escape \( -> (
+    for (char *p = line; *p; p++) {
+      if (p[0] == '\\' && p[1] == '(') {
+        fputc('(', out);
+        p++;
+      } else {
+        fputc(*p, out);
+      }
+    }
+  }
+
+  // Free skipped macro names
+  for (int i = 0; i < n_skipped; i++) free(skipped_macros[i]);
+  free(line);
+  fclose(in);
+  fclose(out);
+  return out_path;
+}
+
 // Assemble a .s file to .o
 static void assemble(char *input, char *output) {
+  char *filtered = filter_asm(input);
   StringArray cmd = {};
   strarray_push(&cmd, "as");
   strarray_push(&cmd, "-o");
   strarray_push(&cmd, output);
-  strarray_push(&cmd, input);
+  strarray_push(&cmd, filtered);
   run_cmd(&cmd);
 }
 
@@ -115,6 +232,18 @@ static void compile(char *input_path, char *output_path) {
   Token *tok = tokenize_file(input_path);
   if (!tok)
     error("%s: %s", input_path, strerror(errno));
+
+  // Prepend -include files (processed first, as if #include'd at top of file)
+  for (int j = extra_includes.len - 1; j >= 0; j--) {
+    Token *inc = tokenize_file(extra_includes.data[j]);
+    if (!inc)
+      error("-include %s: %s", extra_includes.data[j], strerror(errno));
+    Token *t = inc;
+    while (t->next->kind != TK_EOF)
+      t = t->next;
+    t->next = tok;
+    tok = inc;
+  }
 
   tok = preprocess(tok);
 
@@ -172,8 +301,6 @@ int main(int argc, char **argv) {
   add_include_path("/usr/local/include");
   add_include_path("/usr/include");
 
-  StringArray extra_includes = {};
-  (void)extra_includes;
 
   // Parse command-line arguments
   for (int i = 1; i < argc; i++) {
@@ -241,7 +368,7 @@ int main(int argc, char **argv) {
       continue;
     }
 
-    if (!strcmp(argv[i], "-include")) {
+    if (!strcmp(argv[i], "-include") || !strcmp(argv[i], "-include-pch")) {
       if (++i >= argc) usage(1);
       strarray_push(&extra_includes, argv[i]);
       continue;

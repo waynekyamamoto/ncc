@@ -286,10 +286,14 @@ struct Node {
   int asm_num_inputs;
   char **asm_output_constraints;  // array of constraint strings
   Node **asm_output_exprs;        // array of output expression nodes
+  char **asm_output_names;        // optional [name] for each output (may be NULL)
   char **asm_input_constraints;   // array of constraint strings
   Node **asm_input_exprs;         // array of input expression nodes
+  char **asm_input_names;         // optional [name] for each input (may be NULL)
   int asm_num_clobbers;
   char **asm_clobbers;            // array of clobber strings
+  int asm_num_goto_labels;
+  char **asm_goto_labels;         // label names for asm goto (section 4)
 
   // Atomic compare-and-swap
   Node *cas_addr;

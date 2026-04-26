@@ -514,11 +514,13 @@ Token *tokenize(File *file) {
   bool has_space = false;
 
   while (*p) {
-    // Skip line continuation
+    // Skip line continuation (\<newline>)
+    // Treat as whitespace for has_space: "no whitespace" check in #define
+    // must see \<nl> as whitespace to distinguish object/function-like macros.
     if (startswith(p, "\\\n")) {
       p += 2;
       at_bol = false;
-      has_space = false;
+      has_space = true;
       continue;
     }
 

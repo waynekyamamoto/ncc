@@ -23,7 +23,8 @@ struct MacroArg {
   MacroArg *next;
   char *name;
   bool is_va_args;
-  Token *tok;
+  Token *tok;          // original (unexpanded) argument tokens
+  Token *expanded;     // pre-expanded argument tokens (for regular substitution)
 };
 
 // Macro definition
@@ -178,7 +179,7 @@ static Macro *add_macro(char *name, bool is_objlike, Token *body) {
 }
 
 static Macro *find_macro(Token *tok) {
-  if (tok->kind != TK_IDENT)
+  if (tok->kind != TK_IDENT && tok->kind != TK_KEYWORD)
     return NULL;
   char *name = strndup_checked(tok->loc, tok->len);
   Macro *m = hashmap_get2(&macros, tok->loc, tok->len);
@@ -315,9 +316,107 @@ static Token *copy_line(Token **rest, Token *tok) {
 static Token *read_const_expr(Token **rest, Token *tok) {
   tok = copy_line(rest, tok);
 
-  // Handle __has_include(<file>) / __has_include("file") in the expression
-  // Replace with 0 or 1 based on whether the file exists
+  // Replace __has_attribute(x), __has_builtin(x), __has_feature(x),
+  // __has_include(...), __has_include_next(...) with 0 or 1 before
+  // the expression is evaluated as a constant.
   for (Token *t = tok; t->kind != TK_EOF; t = t->next) {
+    if ((t->kind == TK_IDENT || t->kind == TK_KEYWORD) &&
+        ((t->len == 15 && !strncmp(t->loc, "__has_attribute", 15)) ||
+         (t->len == 13 && !strncmp(t->loc, "__has_builtin",   13)) ||
+         (t->len == 13 && !strncmp(t->loc, "__has_feature",   13)))) {
+      // Consume the name and parenthesised argument, yield 0 or 1.
+      Token *start = t;
+      Token *u = t->next;
+      int result = 0;
+      if (u && equal(u, "(")) {
+        // Collect the single identifier argument.
+        Token *arg = u->next;
+        int arg_len = 0;
+        const char *arg_loc = NULL;
+        if (arg && (arg->kind == TK_IDENT || arg->kind == TK_KEYWORD)) {
+          arg_loc = arg->loc;
+          arg_len = arg->len;
+        }
+        // Skip to closing paren.
+        int level = 1;
+        Token *end = u->next;
+        while (end && end->kind != TK_EOF && level > 0) {
+          if (equal(end, "(")) level++;
+          if (equal(end, ")")) level--;
+          if (level > 0) end = end->next;
+        }
+
+        // __has_attribute: report attributes ncc actually handles.
+        if (!strncmp(t->loc, "__has_attribute", 15)) {
+          static const char *supported_attrs[] = {
+            "packed", "aligned", "section", "unused", "weak", "noinline",
+            "noreturn", "always_inline", "cold", "hot", "pure", "const",
+            "alias", "used", "warn_unused_result", "noclone", "nothrow",
+            "deprecated", "malloc", "flatten", "constructor", "destructor",
+            "transparent_union", "returns_nonnull", "may_alias",
+            "__packed__", "__aligned__", "__section__", "__unused__",
+            "__weak__", "__noinline__", "__noreturn__", "__always_inline__",
+            "__cold__", "__pure__", "__const__", "__alias__", "__used__",
+            "__deprecated__", "__malloc__",
+            NULL
+          };
+          if (arg_loc && arg_len) {
+            for (int i = 0; supported_attrs[i]; i++) {
+              if ((int)strlen(supported_attrs[i]) == arg_len &&
+                  !strncmp(supported_attrs[i], arg_loc, arg_len)) {
+                result = 1;
+                break;
+              }
+            }
+          }
+        }
+
+        // __has_builtin: report builtins ncc implements.
+        if (!strncmp(t->loc, "__has_builtin", 13)) {
+          static const char *supported_builtins[] = {
+            "__builtin_va_start", "__builtin_va_end", "__builtin_va_arg",
+            "__builtin_va_copy", "__builtin_va_list",
+            "__builtin_offsetof", "__builtin_types_compatible_p",
+            "__builtin_expect",
+            "__builtin_unreachable",
+            "__builtin_constant_p",
+            "__builtin_bswap16", "__builtin_bswap32", "__builtin_bswap64",
+            "__builtin_clz", "__builtin_clzl", "__builtin_clzll",
+            "__builtin_ctz", "__builtin_ctzl", "__builtin_ctzll",
+            "__builtin_popcount", "__builtin_popcountl", "__builtin_popcountll",
+            "__builtin_memset", "__builtin_memcpy", "__builtin_memcmp",
+            "__builtin_strlen", "__builtin_strcmp",
+            "__builtin_frame_address", "__builtin_return_address",
+            "__builtin_prefetch",
+            "__builtin_alloca",
+            NULL
+          };
+          if (arg_loc && arg_len) {
+            for (int i = 0; supported_builtins[i]; i++) {
+              if ((int)strlen(supported_builtins[i]) == arg_len &&
+                  !strncmp(supported_builtins[i], arg_loc, arg_len)) {
+                result = 1;
+                break;
+              }
+            }
+          }
+        }
+
+        // __has_feature: stub — return 0 for everything (we don't advertise
+        // Clang-specific features like address sanitizer, CFI, etc.)
+        // result stays 0.
+
+        Token *next = end ? end->next : new_eof(start);
+        *start = *new_eof(start);
+        start->kind = TK_PP_NUM;
+        start->loc = result ? "1" : "0";
+        start->len = 1;
+        start->next = next;
+        t = start;
+      }
+      continue;
+    }
+
     if ((t->kind == TK_IDENT || t->kind == TK_KEYWORD) &&
         ((t->len == 13 && !strncmp(t->loc, "__has_include", 13)) ||
          (t->len == 18 && !strncmp(t->loc, "__has_include_next", 18)))) {
@@ -841,13 +940,11 @@ static Token *subst(Token *tok, MacroArg *args) {
       continue;
     }
 
-    // Regular macro argument substitution
+    // Regular macro argument substitution (use pre-expanded arg)
     MacroArg *arg = find_arg(args, tok);
     if (arg) {
-      // Check if next is ##
-      Token *expanded = preprocess2(copy_token_list(arg->tok));
       bool first = true;
-      for (Token *t = expanded; t->kind != TK_EOF; t = t->next) {
+      for (Token *t = arg->expanded; t->kind != TK_EOF; t = t->next) {
         cur = cur->next = copy_token(t);
         // First token inherits spacing from the parameter token in the body
         if (first) {
@@ -944,6 +1041,10 @@ static bool expand_macro(Token **rest, Token *tok) {
   Token *macro_tok = tok;
   MacroArg *args = read_macro_args(&tok, tok, m->params, m->va_args_name);
   Token *rparen = tok;
+
+  // Pre-expand each argument once (C standard: args expanded before substitution)
+  for (MacroArg *ap = args; ap; ap = ap->next)
+    ap->expanded = preprocess2(copy_token_list(ap->tok));
 
   // Substitute parameters
   Hideset *hs = hideset_intersection(macro_tok->hideset, rparen->hideset);
@@ -1134,9 +1235,9 @@ void init_macros(void) {
   define_macro("TARGET_OS_MACCATALYST", "0");
   define_macro("TARGET_OS_DRIVERKIT", "0");
 
-  // GCC compatibility
-  define_macro("__GNUC__", "4");
-  define_macro("__GNUC_MINOR__", "0");
+  // GCC compatibility — advertise GCC 12 for modern kernel feature paths
+  define_macro("__GNUC__", "12");
+  define_macro("__GNUC_MINOR__", "1");
   define_macro("__GNUC_PATCHLEVEL__", "0");
   define_macro("__GNUC_STDC_INLINE__", "1");
   define_macro("__VERSION__", "\"ncc 1.0 compatible\"");

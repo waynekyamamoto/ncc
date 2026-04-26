@@ -375,9 +375,8 @@ void add_type(Node *node) {
   case ND_DEREF:
     if (!node->lhs->ty->base)
       error_tok(node->tok, "invalid pointer dereference");
-    if (node->lhs->ty->base->kind == TY_VOID)
-      error_tok(node->tok, "dereferencing a void pointer");
-
+    // Allow void pointer dereference (GCC extension): result has type void.
+    // This appears in sizeof(*(void*)p) patterns used by __is_constexpr etc.
     node->ty = node->lhs->ty->base;
     // Note: VLA types stay as VLA here (like arrays, they're address types).
     // load() will skip the load for VLA types, and VLA-to-pointer decay

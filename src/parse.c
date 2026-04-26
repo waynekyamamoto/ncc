@@ -684,7 +684,7 @@ static bool is_typename(Token *tok) {
     "struct", "union", "enum", "typedef", "static", "extern", "inline",
     "_Noreturn", "signed", "unsigned", "const", "volatile", "restrict",
     "_Atomic", "_Alignas", "auto", "register", "_Thread_local", "__thread",
-    "typeof", "__typeof__", "_Static_assert", "static_assert",
+    "typeof", "__typeof__",
     "__extension__", "__builtin_va_list", "__attribute__",
     "_Complex", "__complex__",
   };
@@ -751,7 +751,11 @@ static Type *declspec(Token **rest, Token *tok, VarAttr *attr) {
     }
 
     // __attribute__((...)) — consume in declspec context
+    // Copy non-struct/union/enum types before applying attributes to avoid
+    // corrupting global primitive type singletons (e.g. ty_ulong).
     if (equal(tok, "__attribute__")) {
+      if (ty->kind != TY_STRUCT && ty->kind != TY_UNION && ty->kind != TY_ENUM)
+        ty = copy_type(ty);
       tok = attribute_list(tok, ty, attr);
       continue;
     }
@@ -809,21 +813,6 @@ static Type *declspec(Token **rest, Token *tok, VarAttr *attr) {
       ty = pointer_to(ty_void);
       tok = tok->next;
       counter += OTHER;
-      continue;
-    }
-
-    // _Static_assert
-    if (equal(tok, "_Static_assert") || equal(tok, "static_assert")) {
-      tok = skip(tok->next, "(");
-      int64_t val = const_expr_val(&tok, tok);
-      tok = skip(tok, ",");
-      // Skip the message string
-      if (tok->kind == TK_STR)
-        tok = tok->next;
-      tok = skip(tok, ")");
-      tok = skip(tok, ";");
-      if (!val)
-        error_tok(tok, "static assertion failed");
       continue;
     }
 
@@ -1271,9 +1260,10 @@ static void struct_members(Token **rest, Token *tok, Type *ty) {
     if (equal(tok, "_Static_assert") || equal(tok, "static_assert")) {
       tok = skip(tok->next, "(");
       const_expr_val(&tok, tok);
-      tok = skip(tok, ",");
-      if (tok->kind == TK_STR)
-        tok = tok->next;
+      if (consume(&tok, tok, ",")) {
+        if (tok->kind == TK_STR)
+          tok = tok->next;
+      }
       tok = skip(tok, ")");
       tok = skip(tok, ";");
       continue;
@@ -2295,6 +2285,22 @@ static Node *cond_expr(Token **rest, Token *tok) {
     return node;
   }
 
+  // GNU Elvis operator: a ?: b  →  (tmp=a, tmp ? tmp : b)
+  if (equal(tok->next, ":")) {
+    Token *start = tok;
+    tok = tok->next->next; // skip "?:"
+    add_type(node);
+    Obj *tmp = new_lvar("", node->ty);
+    Node *tmp_var1 = new_var_node(tmp, start);
+    Node *tmp_var2 = new_var_node(tmp, start);
+    Node *store = new_binary(ND_ASSIGN, tmp_var1, node, start);
+    Node *cond = new_node(ND_COND, start);
+    cond->cond = tmp_var2;
+    cond->then = new_var_node(tmp, start);
+    cond->els = cond_expr(rest, tok);
+    return new_binary(ND_COMMA, store, cond, start);
+  }
+
   Node *cond = new_node(ND_COND, tok);
   cond->cond = node;
   tok = tok->next;
@@ -2746,7 +2752,8 @@ static Member *get_struct_member(Type *ty, Token *tok) {
   return NULL;
 }
 
-// Build a chain of member accesses for accessing nested anonymous struct members
+// Build a chain of member accesses for accessing nested anonymous struct members.
+// Returns NULL if the member is not found (callers must handle or error).
 static Node *struct_ref(Node *node, Token *tok) {
   add_type(node);
   Type *ty = node->ty;
@@ -2757,7 +2764,7 @@ static Node *struct_ref(Node *node, Token *tok) {
     ty = ty->origin;
 
   if (ty->kind != TY_STRUCT && ty->kind != TY_UNION)
-    error_tok(node->tok, "not a struct/union");
+    return NULL;
 
   // First try direct member
   for (Member *mem = ty->members; mem; mem = mem->next) {
@@ -2769,7 +2776,7 @@ static Node *struct_ref(Node *node, Token *tok) {
     }
   }
 
-  // Try anonymous struct/union members
+  // Try anonymous struct/union members (recursive search)
   for (Member *mem = ty->members; mem; mem = mem->next) {
     if (!mem->name && (mem->ty->kind == TY_STRUCT || mem->ty->kind == TY_UNION)) {
       Node *n = new_unary(ND_MEMBER, node, tok);
@@ -2780,7 +2787,7 @@ static Node *struct_ref(Node *node, Token *tok) {
     }
   }
 
-  error_tok(tok, "no such member");
+  return NULL;
 }
 
 // postfix = "(" type-name ")" "{" initializer-list "}" (compound literal)
@@ -2840,6 +2847,8 @@ static Node *postfix(Token **rest, Token *tok) {
     // Struct member access: a.b
     if (equal(tok, ".")) {
       node = struct_ref(node, tok->next);
+      if (!node)
+        error_tok(tok->next, "no such member");
       tok = tok->next->next;
       continue;
     }
@@ -2848,6 +2857,8 @@ static Node *postfix(Token **rest, Token *tok) {
     if (equal(tok, "->")) {
       node = new_unary(ND_DEREF, node, tok);
       node = struct_ref(node, tok->next);
+      if (!node)
+        error_tok(tok->next, "no such member");
       tok = tok->next->next;
       continue;
     }
@@ -2960,6 +2971,41 @@ static Node *new_inc_dec(Node *node, Token *tok, int addend) {
 static Node *primary(Token **rest, Token *tok) {
   Token *start = tok;
 
+  // __builtin_choose_expr(cond, expr1, expr2) — GCC extension
+  // Evaluates to expr1 if cond is a non-zero constant, expr2 otherwise.
+  // Unlike ternary, the unchosen branch is not evaluated or type-checked.
+  if (equal(tok, "__builtin_choose_expr")) {
+    tok = skip(tok->next, "(");
+    // Evaluate condition as integer constant
+    int64_t cond_val = const_expr_val(&tok, tok);
+    tok = skip(tok, ",");
+    if (cond_val) {
+      Node *result = assign(&tok, tok);
+      // Skip the false branch
+      tok = skip(tok, ",");
+      int level = 0;
+      while (!(equal(tok, ")") && level == 0)) {
+        if (equal(tok, "(") || equal(tok, "[") || equal(tok, "{")) level++;
+        else if (equal(tok, ")") || equal(tok, "]") || equal(tok, "}")) level--;
+        if (level >= 0) tok = tok->next;
+      }
+      *rest = skip(tok, ")");
+      return result;
+    } else {
+      // Skip the true branch
+      int level = 0;
+      while (!(equal(tok, ",") && level == 0)) {
+        if (equal(tok, "(") || equal(tok, "[") || equal(tok, "{")) level++;
+        else if (equal(tok, ")") || equal(tok, "]") || equal(tok, "}")) level--;
+        tok = tok->next;
+      }
+      tok = tok->next; // skip ","
+      Node *result = assign(rest, tok);
+      *rest = skip(*rest, ")");
+      return result;
+    }
+  }
+
   // __builtin_types_compatible_p(type1, type2) — GCC extension
   if (equal(tok, "__builtin_types_compatible_p")) {
     tok = skip(tok->next, "(");
@@ -3022,7 +3068,30 @@ static Node *primary(Token **rest, Token *tok) {
       } else if (a->kind == TY_STRUCT || a->kind == TY_UNION) {
         result = (a->size == b->size && a->members == b->members);
       } else if (a->kind == TY_FUNC) {
-        result = 0;
+        // Compare function types by return type and parameter list
+        Type *ra = a->return_ty, *rb = b->return_ty;
+        if (!ra || !rb || ra->kind != rb->kind || ra->size != rb->size ||
+            ra->is_unsigned != rb->is_unsigned) {
+          result = 0;
+        } else {
+          // Count and compare parameters
+          int cnt_a = 0, cnt_b = 0;
+          for (Type *p = a->params; p; p = p->next) cnt_a++;
+          for (Type *p = b->params; p; p = p->next) cnt_b++;
+          if (cnt_a != cnt_b) {
+            result = 0;
+          } else {
+            result = 1;
+            Type *pa = a->params, *pb = b->params;
+            for (; pa && pb; pa = pa->next, pb = pb->next) {
+              if (pa->kind != pb->kind || pa->size != pb->size ||
+                  pa->is_unsigned != pb->is_unsigned) {
+                result = 0;
+                break;
+              }
+            }
+          }
+        }
       } else {
         // Scalar types: kind and signedness must match; top-level qualifiers ignored
         result = (a->is_unsigned == b->is_unsigned && a->size == b->size);
@@ -4017,22 +4086,34 @@ static Node *stmt(Token **rest, Token *tok) {
   if (equal(tok, "asm") || equal(tok, "__asm__")) {
     Node *node = new_node(ND_ASM, tok);
     tok = tok->next;
-    // Skip volatile qualifier
-    if (equal(tok, "volatile") || equal(tok, "__volatile__"))
+    // Skip any combination of qualifiers: volatile, __volatile__, inline, goto
+    while (equal(tok, "volatile") || equal(tok, "__volatile__") ||
+           equal(tok, "inline") || equal(tok, "goto"))
       tok = tok->next;
     tok = skip(tok, "(");
     if (tok->kind != TK_STR)
       error_tok(tok, "expected string literal");
-    node->asm_str = tok->str;
-    tok = tok->next;
+    // Concatenate adjacent string literals (asm template split across lines)
+    {
+      int total_len = 0;
+      for (Token *t = tok; t->kind == TK_STR; t = t->next)
+        total_len += strlen(t->str);
+      char *buf = calloc_checked(total_len + 1, 1);
+      for (; tok->kind == TK_STR; tok = tok->next)
+        strcat(buf, tok->str);
+      node->asm_str = buf;
+    }
 
     // Parse output/input/clobber operands
     // Format: asm(template : outputs : inputs : clobbers)
     // Temporary arrays (max 16 operands each)
     char *out_constraints[16], *in_constraints[16], *clobbers[16];
+    char *out_names[16], *in_names[16];
     Node *out_exprs[16], *in_exprs[16];
     int num_out = 0, num_in = 0, num_clob = 0;
     int section = 0; // 0=outputs, 1=inputs, 2=clobbers
+    memset(out_names, 0, sizeof(out_names));
+    memset(in_names, 0, sizeof(in_names));
 
     while (equal(tok, ":")) {
       tok = tok->next;
@@ -4040,15 +4121,27 @@ static Node *stmt(Token **rest, Token *tok) {
         // Parse operand list: "constraint"(expr), ...
         while (!equal(tok, ":") && !equal(tok, ")")) {
           // Optional [name] prefix
+          char *op_name = NULL;
           if (equal(tok, "[")) {
             tok = tok->next;
+            if (tok->kind == TK_IDENT)
+              op_name = strndup(tok->loc, tok->len);
             tok = tok->next; // skip ident
             tok = skip(tok, "]");
           }
           if (tok->kind != TK_STR)
             error_tok(tok, "expected string literal for constraint");
-          char *constraint = tok->str;
-          tok = tok->next;
+          // Concatenate adjacent string literals (e.g. __stringify(c) "r")
+          char *constraint;
+          {
+            int total_len = 0;
+            for (Token *t = tok; t->kind == TK_STR; t = t->next)
+              total_len += strlen(t->str);
+            char *buf = calloc_checked(total_len + 1, 1);
+            for (; tok->kind == TK_STR; tok = tok->next)
+              strcat(buf, tok->str);
+            constraint = buf;
+          }
           tok = skip(tok, "(");
           Node *operand = expr(&tok, tok);
           add_type(operand);
@@ -4059,18 +4152,20 @@ static Node *stmt(Token **rest, Token *tok) {
               error_tok(tok, "too many asm output operands");
             out_constraints[num_out] = constraint;
             out_exprs[num_out] = operand;
+            out_names[num_out] = op_name;
             num_out++;
           } else {
             if (num_in >= 16)
               error_tok(tok, "too many asm input operands");
             in_constraints[num_in] = constraint;
             in_exprs[num_in] = operand;
+            in_names[num_in] = op_name;
             num_in++;
           }
           if (!consume(&tok, tok, ","))
             break;
         }
-      } else {
+      } else if (section == 2) {
         // Parse clobber list: "reg", "memory", "cc", ...
         while (!equal(tok, ":") && !equal(tok, ")")) {
           if (tok->kind != TK_STR)
@@ -4078,6 +4173,26 @@ static Node *stmt(Token **rest, Token *tok) {
           if (num_clob >= 16)
             error_tok(tok, "too many asm clobbers");
           clobbers[num_clob++] = tok->str;
+          tok = tok->next;
+          if (!consume(&tok, tok, ","))
+            break;
+        }
+      } else if (section == 3) {
+        // Section 3: asm goto label list — store label names
+        while (!equal(tok, ":") && !equal(tok, ")")) {
+          if (tok->kind == TK_IDENT && node->asm_num_goto_labels < 16) {
+            char *lname = strndup(tok->loc, tok->len);
+            if (!node->asm_goto_labels)
+              node->asm_goto_labels = calloc_checked(16, sizeof(char *));
+            node->asm_goto_labels[node->asm_num_goto_labels++] = lname;
+          }
+          tok = tok->next;
+          if (!consume(&tok, tok, ","))
+            break;
+        }
+      } else {
+        // Section 4+: skip
+        while (!equal(tok, ":") && !equal(tok, ")")) {
           tok = tok->next;
           if (!consume(&tok, tok, ","))
             break;
@@ -4091,18 +4206,22 @@ static Node *stmt(Token **rest, Token *tok) {
       node->asm_num_outputs = num_out;
       node->asm_output_constraints = calloc_checked(num_out, sizeof(char *));
       node->asm_output_exprs = calloc_checked(num_out, sizeof(Node *));
+      node->asm_output_names = calloc_checked(num_out, sizeof(char *));
       for (int i = 0; i < num_out; i++) {
         node->asm_output_constraints[i] = out_constraints[i];
         node->asm_output_exprs[i] = out_exprs[i];
+        node->asm_output_names[i] = out_names[i];
       }
     }
     if (num_in > 0) {
       node->asm_num_inputs = num_in;
       node->asm_input_constraints = calloc_checked(num_in, sizeof(char *));
       node->asm_input_exprs = calloc_checked(num_in, sizeof(Node *));
+      node->asm_input_names = calloc_checked(num_in, sizeof(char *));
       for (int i = 0; i < num_in; i++) {
         node->asm_input_constraints[i] = in_constraints[i];
         node->asm_input_exprs[i] = in_exprs[i];
+        node->asm_input_names[i] = in_names[i];
       }
     }
     if (num_clob > 0) {
@@ -5192,18 +5311,39 @@ Obj *parse(Token *tok) {
       continue;
     }
 
+    // _Static_assert at file scope
+    if (equal(tok, "_Static_assert") || equal(tok, "static_assert")) {
+      tok = skip(tok->next, "(");
+      int64_t val = const_expr_val(&tok, tok);
+      Token *msg_tok = NULL;
+      if (consume(&tok, tok, ",")) {
+        if (tok->kind == TK_STR) {
+          msg_tok = tok;
+          tok = tok->next;
+        }
+      }
+      tok = skip(tok, ")");
+      tok = skip(tok, ";");
+      if (!val) {
+        if (msg_tok)
+          fprintf(stderr, "DEBUG: assertion failed: %.*s\n", msg_tok->len - 2, msg_tok->loc + 1);
+        error_tok(tok, "static assertion failed");
+      }
+      continue;
+    }
+
+    // Skip bare semicolons at file scope
+    if (equal(tok, ";")) {
+      tok = tok->next;
+      continue;
+    }
+
     VarAttr attr = {};
     Type *basety = declspec(&tok, tok, &attr);
 
     // Typedef
     if (attr.is_typedef) {
       tok = parse_typedef(tok, basety, NULL);
-      continue;
-    }
-
-    // _Static_assert at file scope
-    if (equal(tok, ";")) {
-      tok = tok->next;
       continue;
     }
 

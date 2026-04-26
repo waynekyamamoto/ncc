@@ -24,6 +24,24 @@ static void gen_stmt_dead(Node *node);
 static void gen_addr(Node *node);
 static void push(void);
 static void pop(char *reg);
+
+// Find the unique_label for a C goto label by name in the AST subtree.
+static const char *find_label_by_name(Node *node, const char *name) {
+  if (!node) return NULL;
+  if (node->kind == ND_LABEL && node->label && strcmp(node->label, name) == 0)
+    return node->unique_label;
+  const char *r;
+  if ((r = find_label_by_name(node->lhs, name))) return r;
+  if ((r = find_label_by_name(node->rhs, name))) return r;
+  if ((r = find_label_by_name(node->cond, name))) return r;
+  if ((r = find_label_by_name(node->then, name))) return r;
+  if ((r = find_label_by_name(node->els,  name))) return r;
+  if ((r = find_label_by_name(node->init, name))) return r;
+  if ((r = find_label_by_name(node->inc,  name))) return r;
+  for (Node *n = node->body; n; n = n->next)
+    if ((r = find_label_by_name(n, name))) return r;
+  return NULL;
+}
 static void pushf(void);
 static void popf(int reg);
 
@@ -1936,10 +1954,35 @@ static void gen_stmt(Node *node) {
     return;
 
   case ND_ASM: {
-    // If no operands, just emit the template as before
+    // If no operands, just emit the template (with %l[name] substitution if needed)
     if (node->asm_num_outputs == 0 && node->asm_num_inputs == 0) {
-      if (node->asm_str[0] != '\0')
-        println("%s", node->asm_str);
+      if (node->asm_str[0] != '\0') {
+        if (node->asm_num_goto_labels == 0 || !strstr(node->asm_str, "%l[")) {
+          println("%s", node->asm_str);
+        } else {
+          // Substitute %l[name] with the actual assembly label
+          char buf[4096];
+          int bi = 0;
+          for (char *p = node->asm_str; *p && bi < 4090; p++) {
+            if (p[0] == '%' && p[1] == 'l' && p[2] == '[') {
+              char *q = p + 3;
+              char name[64] = {0};
+              int nl = 0;
+              while (*q && *q != ']' && nl < 63) name[nl++] = *q++;
+              name[nl] = '\0';
+              if (*q == ']') q++;
+              const char *ul = find_label_by_name(current_fn->body, name);
+              if (!ul) ul = name; // fallback: emit C name as-is
+              for (const char *r = ul; *r; r++) buf[bi++] = *r;
+              p = q - 1;
+            } else {
+              buf[bi++] = *p;
+            }
+          }
+          buf[bi] = '\0';
+          println("%s", buf);
+        }
+      }
       return;
     }
 
@@ -1962,6 +2005,13 @@ static void gen_stmt(Node *node) {
     for (int i = 0; i < node->asm_num_outputs; i++)
       reg_name[i] = format("x%d", 19 + i);
 
+    // Track which operands are memory constraints (need address, emit [reg])
+    bool is_mem_operand[10] = {0};
+    for (int i = 0; i < node->asm_num_outputs; i++) {
+      char *c = node->asm_output_constraints[i];
+      is_mem_operand[i] = (strchr(c, 'm') || strchr(c, 'Q') || strchr(c, 'o'));
+    }
+
     for (int i = 0; i < node->asm_num_inputs; i++) {
       char *c = node->asm_input_constraints[i];
       if (c[0] >= '0' && c[0] <= '9') {
@@ -1970,8 +2020,11 @@ static void gen_stmt(Node *node) {
         if (tied >= node->asm_num_outputs)
           error_tok(node->tok, "asm tied operand out of range");
         reg_name[node->asm_num_outputs + i] = reg_name[tied];
+        is_mem_operand[node->asm_num_outputs + i] = is_mem_operand[tied];
       } else {
         reg_name[node->asm_num_outputs + i] = format("x%d", 19 + node->asm_num_outputs + i);
+        is_mem_operand[node->asm_num_outputs + i] =
+          (strchr(c, 'm') || strchr(c, 'Q') || strchr(c, 'o'));
       }
     }
 
@@ -1999,6 +2052,7 @@ static void gen_stmt(Node *node) {
     // --- Phase 3: Evaluate output operands ---
     // For "+r" (read-write): evaluate address, load current value into reg
     // For "=r" (write-only): evaluate address, save it for later store
+    // For "=Q"/memory: put address in reg (asm writes directly to memory)
     for (int i = 0; i < node->asm_num_outputs; i++) {
       char *c = node->asm_output_constraints[i];
       bool is_rw = (strchr(c, '+') != NULL); // "+r"
@@ -2009,7 +2063,10 @@ static void gen_stmt(Node *node) {
       depth++;
       addr_on_stack[i] = 1;
 
-      if (is_rw) {
+      if (is_mem_operand[i]) {
+        // Memory constraint: load address into register so asm can use [reg]
+        println("ldr %s, [sp]", reg_name[i]); // peek address into assigned reg
+      } else if (is_rw) {
         // Read-modify-write: load the current value into the register
         // x0 still has the address, but we just pushed it. Peek from stack.
         println("ldr x0, [sp]"); // peek the address
@@ -2034,8 +2091,15 @@ static void gen_stmt(Node *node) {
       int idx = node->asm_num_outputs + i;
       char *c = node->asm_input_constraints[i];
       if (c[0] >= '0' && c[0] <= '9') {
-        // Tied operand: load value into the shared register
-        gen_expr(node->asm_input_exprs[i]);
+        // Tied operand: use same register as output
+        // For register tied operands, load value; for memory tied, already set
+        if (!is_mem_operand[idx]) {
+          gen_expr(node->asm_input_exprs[i]);
+          println("mov %s, x0", reg_name[idx]);
+        }
+      } else if (is_mem_operand[idx]) {
+        // Memory constraint: load address into register
+        gen_addr(node->asm_input_exprs[i]);
         println("mov %s, x0", reg_name[idx]);
       } else {
         // "r" constraint: load value into the assigned register
@@ -2045,22 +2109,125 @@ static void gen_stmt(Node *node) {
     }
 
     // --- Phase 5: Emit the asm template ---
-    // Substitute %0, %1, etc. with register names
+    // Substitute %0, %1, %[name], %w0, %aN, etc. with register names.
+    // Helper: look up named operand (returns -1 if not found)
     if (node->asm_str[0] != '\0') {
       char buf[4096];
       int bi = 0;
       for (char *p = node->asm_str; *p; p++) {
         if (*p == '%' && p[1] == '%') {
+          // Escaped %
           buf[bi++] = '%';
           p++;
+        } else if (*p == '%' && p[1] == 'l' && p[2] == '[') {
+          // %l[name] — asm goto label reference
+          char *q = p + 3;
+          char name[64] = {0};
+          int nl = 0;
+          while (*q && *q != ']' && nl < 63) name[nl++] = *q++;
+          name[nl] = '\0';
+          if (*q == ']') q++;
+          const char *ul = find_label_by_name(current_fn->body, name);
+          if (!ul) ul = name;
+          for (const char *r = ul; *r; r++) buf[bi++] = *r;
+          p = q - 1;
+        } else if (*p == '%' && p[1] == '[') {
+          // %[name] or %w[name] / %x[name] — named operand reference
+          // (size modifier before '[' is NOT supported here; %w[n] handled below)
+          char *q = p + 2;
+          char name[64] = {0};
+          int nl = 0;
+          while (*q && *q != ']' && nl < 63) name[nl++] = *q++;
+          name[nl] = '\0';
+          if (*q == ']') q++;
+          int operand_num = -1;
+          for (int i = 0; i < node->asm_num_outputs && operand_num < 0; i++)
+            if (node->asm_output_names && node->asm_output_names[i] &&
+                strcmp(node->asm_output_names[i], name) == 0)
+              operand_num = i;
+          for (int i = 0; i < node->asm_num_inputs && operand_num < 0; i++)
+            if (node->asm_input_names && node->asm_input_names[i] &&
+                strcmp(node->asm_input_names[i], name) == 0)
+              operand_num = node->asm_num_outputs + i;
+          if (operand_num < 0)
+            error_tok(node->tok, "asm: unknown operand name [%s]", name);
+          char *rn = reg_name[operand_num];
+          if (is_mem_operand[operand_num]) {
+            buf[bi++] = '[';
+            for (char *r = rn; *r; r++) buf[bi++] = *r;
+            buf[bi++] = ']';
+          } else {
+            for (char *r = rn; *r; r++) buf[bi++] = *r;
+          }
+          p = q - 1; // -1 because loop does p++
+        } else if (*p == '%' && (p[1] == 'w' || p[1] == 'x') && p[2] == '[') {
+          // %w[name] or %x[name] — named operand with size modifier
+          char size_mod = p[1];
+          char *q = p + 3;
+          char name[64] = {0};
+          int nl = 0;
+          while (*q && *q != ']' && nl < 63) name[nl++] = *q++;
+          name[nl] = '\0';
+          if (*q == ']') q++;
+          int operand_num = -1;
+          for (int i = 0; i < node->asm_num_outputs && operand_num < 0; i++)
+            if (node->asm_output_names && node->asm_output_names[i] &&
+                strcmp(node->asm_output_names[i], name) == 0)
+              operand_num = i;
+          for (int i = 0; i < node->asm_num_inputs && operand_num < 0; i++)
+            if (node->asm_input_names && node->asm_input_names[i] &&
+                strcmp(node->asm_input_names[i], name) == 0)
+              operand_num = node->asm_num_outputs + i;
+          if (operand_num < 0)
+            error_tok(node->tok, "asm: unknown operand name [%s]", name);
+          char *rn = reg_name[operand_num];
+          if (size_mod == 'w' && rn[0] == 'x') {
+            buf[bi++] = 'w';
+            for (char *r = rn + 1; *r; r++) buf[bi++] = *r;
+          } else {
+            for (char *r = rn; *r; r++) buf[bi++] = *r;
+          }
+          p = q - 1;
+        } else if (*p == '%' && p[1] == 'a' && p[2] >= '0' && p[2] <= '9') {
+          // %aN — address modifier: always emit [reg] form
+          int operand_num = p[2] - '0';
+          if (operand_num >= total)
+            error_tok(node->tok, "asm operand %%a%d out of range", operand_num);
+          char *rn = reg_name[operand_num];
+          buf[bi++] = '[';
+          for (char *r = rn; *r; r++) buf[bi++] = *r;
+          buf[bi++] = ']';
+          p += 2;
         } else if (*p == '%' && p[1] >= '0' && p[1] <= '9') {
+          // %N — numbered operand
           int operand_num = p[1] - '0';
           if (operand_num >= total)
             error_tok(node->tok, "asm operand %%%d out of range", operand_num);
           char *rn = reg_name[operand_num];
-          for (char *r = rn; *r; r++)
-            buf[bi++] = *r;
+          if (is_mem_operand[operand_num]) {
+            buf[bi++] = '[';
+            for (char *r = rn; *r; r++) buf[bi++] = *r;
+            buf[bi++] = ']';
+          } else {
+            for (char *r = rn; *r; r++) buf[bi++] = *r;
+          }
           p++;
+        } else if (*p == '%' && (p[1] == 'w' || p[1] == 'x') && p[2] >= '0' && p[2] <= '9') {
+          // %w0-%w9: 32-bit (w) register; %x0-%x9: explicit 64-bit (x) register
+          char size_mod = p[1];
+          int operand_num = p[2] - '0';
+          if (operand_num >= total)
+            error_tok(node->tok, "asm operand %%%c%d out of range", size_mod, operand_num);
+          char *rn = reg_name[operand_num];
+          if (size_mod == 'w' && rn[0] == 'x') {
+            buf[bi++] = 'w';
+            for (char *r = rn + 1; *r; r++)
+              buf[bi++] = *r;
+          } else {
+            for (char *r = rn; *r; r++)
+              buf[bi++] = *r;
+          }
+          p += 2;
         } else {
           buf[bi++] = *p;
         }
@@ -2073,10 +2240,9 @@ static void gen_stmt(Node *node) {
     // Pop addresses in reverse order and store register values
     for (int i = node->asm_num_outputs - 1; i >= 0; i--) {
       if (addr_on_stack[i]) {
-        char *c = node->asm_output_constraints[i];
-        // For pure memory constraints ("=m", "+m"), the asm operates on memory
-        // directly; do NOT store back from a register (it may hold garbage).
-        bool is_mem_only = (strchr(c, 'm') != NULL && strchr(c, 'r') == NULL);
+        // For memory constraints (Q, m, o), the asm operates on memory
+        // directly via address in register; do NOT store back from a register.
+        bool is_mem_only = is_mem_operand[i];
         println("ldr x0, [sp], #16"); // pop address
         depth--;
         if (!is_mem_only) {
@@ -2521,15 +2687,17 @@ static void emit_text(Obj *prog) {
     // Generate function body
     gen_stmt(fn->body);
 
+    // C99 5.1.2.2.3: implicit return 0 from main() — only for the fallthrough
+    // path (when main ends without an explicit return). Explicit returns branch
+    // over this to Ltmp_return.<name> with x0 already set.
+    if (!strcmp(fn->name, "main"))
+      println("mov x0, #0");
+
     // Check stack depth
     assert(depth == 0);
 
     // Epilogue
     printlabel("Ltmp_return.%s:", fn->name);
-
-    // C99 5.1.2.2.3: implicit return 0 from main()
-    if (!strcmp(fn->name, "main"))
-      println("mov x0, #0");
 
     // For large struct returns: copy result from x0 (local addr) to [x28]
     // x28 = x8 (saved indirect result pointer from prologue)
