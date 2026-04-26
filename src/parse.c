@@ -974,6 +974,9 @@ static Type *pointers(Token **rest, Token *tok, Type *ty) {
     }
     if (pconst) ty->is_const = true;
     if (pvolatile) ty->is_volatile = true;
+    // __attribute__ may appear between pointer stars, e.g.:
+    // char * __attribute__((unused)) *name
+    tok = attribute_list(tok, ty, NULL);
   }
   *rest = tok;
   return ty;
@@ -4802,10 +4805,16 @@ static void array_initializer1(Token **rest, Token *tok, Initializer *init) {
         tok = skip(tok, "]");
         if (!consume(&tok, tok, "="))
           ; // = is optional in some modes
-        // Parse the value expression once, then assign to all elements
-        Node *val = assign(&tok, tok);
-        for (int j = lo; j <= hi && j < init->ty->array_len; j++)
-          init->children[j]->expr = val;
+        // Parse the value via initializer2 for each element (handles
+        // both scalar "= 42" and struct "= { .f = v }" forms).
+        Token *val_start = tok;
+        for (int j = lo; j <= hi; j++) {
+          tok = val_start;
+          if (j < init->ty->array_len)
+            initializer2(&tok, tok, init->children[j]);
+          else
+            assign(&tok, tok); // skip excess (runs once if lo > array_len)
+        }
         i = hi;
         continue;
       }
