@@ -184,7 +184,7 @@ static bool is_keyword(Token *tok) {
     "const", "volatile", "restrict", "_Atomic", "_Alignof",
     "_Alignas", "auto", "register", "switch", "case", "default",
     "break", "continue", "goto", "__attribute__", "_Thread_local",
-    "__thread", "typeof", "__typeof__", "asm", "__asm__",
+    "__thread", "typeof", "__typeof", "__typeof__", "asm", "__asm__",
     "_Static_assert", "static_assert",
     "_Generic",
     "_Complex", "__complex__", "__real__", "__imag__",

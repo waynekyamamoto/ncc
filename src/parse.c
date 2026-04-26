@@ -684,7 +684,7 @@ static bool is_typename(Token *tok) {
     "struct", "union", "enum", "typedef", "static", "extern", "inline",
     "_Noreturn", "signed", "unsigned", "const", "volatile", "restrict",
     "_Atomic", "_Alignas", "auto", "register", "_Thread_local", "__thread",
-    "typeof", "__typeof__",
+    "typeof", "__typeof", "__typeof__",
     "__extension__", "__builtin_va_list", "__attribute__",
     "_Complex", "__complex__",
   };
@@ -794,7 +794,7 @@ static Type *declspec(Token **rest, Token *tok, VarAttr *attr) {
     }
 
     // typeof
-    if (equal(tok, "typeof") || equal(tok, "__typeof__")) {
+    if (equal(tok, "typeof") || equal(tok, "__typeof") || equal(tok, "__typeof__")) {
       tok = skip(tok->next, "(");
       if (is_typename(tok)) {
         ty = typename_(&tok, tok);

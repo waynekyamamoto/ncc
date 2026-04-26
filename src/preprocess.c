@@ -910,7 +910,11 @@ static MacroArg *read_macro_args(Token **rest, Token *tok, MacroParam *params,
     arg->name = va_args_name;
     arg->is_va_args = true;
 
-    if (pp == NULL && equal(tok, ","))
+    // Skip the separator comma between the last fixed param and the first
+    // variadic arg only when fixed params were actually consumed (cur != &head).
+    // If cur == &head, the macro has no fixed params, so any leading comma is
+    // part of the variadic args (e.g. an empty first variadic argument).
+    if (pp == NULL && cur != &head && equal(tok, ","))
       tok = tok->next;
 
     Token arg_head = {};
@@ -926,9 +930,7 @@ static MacroArg *read_macro_args(Token **rest, Token *tok, MacroParam *params,
       if (equal(tok, "(")) level++;
       if (equal(tok, ")")) level--;
       if (level >= 0) {
-        if (arg_cur != &arg_head || !equal(tok, ",")) {
-          arg_cur = arg_cur->next = copy_token(tok);
-        }
+        arg_cur = arg_cur->next = copy_token(tok);
       }
       tok = tok->next;
     }
@@ -1418,6 +1420,10 @@ void init_macros(void) {
     define_macro("__TIME__", format("\"%02d:%02d:%02d\"",
                  tm->tm_hour, tm->tm_min, tm->tm_sec));
   }
+
+  // _Pragma(x) — C99 operator: equivalent to #pragma x.
+  // ncc ignores all pragmas so this is a no-op.
+  define_macro("_Pragma(x)", "");
 
   // Built-in handler macros
   {
