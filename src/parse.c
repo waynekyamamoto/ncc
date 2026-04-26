@@ -1917,6 +1917,34 @@ static int64_t eval2(Node *node, char ***label) {
       error_tok(node->tok, "not a compile-time constant");
     *label = &node->unique_label;
     return 0;
+  case ND_BUILTIN_CLZ: {
+    int64_t v = eval(node->lhs);
+    return node->val ? __builtin_clzll((uint64_t)v) : __builtin_clz((uint32_t)v);
+  }
+  case ND_BUILTIN_CTZ: {
+    int64_t v = eval(node->lhs);
+    return node->val ? __builtin_ctzll((uint64_t)v) : __builtin_ctz((uint32_t)v);
+  }
+  case ND_BUILTIN_FFS: {
+    int64_t v = eval(node->lhs);
+    return node->val ? __builtin_ffsll((uint64_t)v) : __builtin_ffs((uint32_t)v);
+  }
+  case ND_BUILTIN_POPCOUNT: {
+    uint64_t v = (uint64_t)eval(node->lhs);
+    return __builtin_popcountll(v);
+  }
+  case ND_BUILTIN_PARITY: {
+    uint64_t v = (uint64_t)eval(node->lhs);
+    return __builtin_parityll(v);
+  }
+  case ND_BUILTIN_CLRSB: {
+    int64_t v = eval(node->lhs);
+    return node->val ? __builtin_clrsbll(v) : __builtin_clrsb((int32_t)v);
+  }
+  case ND_BUILTIN_BSWAP32:
+    return __builtin_bswap32((uint32_t)eval(node->lhs));
+  case ND_BUILTIN_BSWAP64:
+    return __builtin_bswap64((uint64_t)eval(node->lhs));
   default:
     error_tok(node->tok, "not a compile-time constant");
   }

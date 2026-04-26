@@ -813,18 +813,17 @@ static void gen_funcall(Node *node) {
     println("bl _%s", node->funcname);
   }
 
-  // Clean up stack
-  if (padded_stack > 0)
-    println("add sp, sp, #%d", padded_stack);
-
-  // For large struct returns: result is in the buffer at [sp]
-  // (The callee wrote to [x8] which was sp before the call)
-  // Set x0 to point to the buffer, then free it. The data stays intact
-  // on the freed stack until the caller copies it (store happens next).
+  // For large struct returns: capture ret buf pointer BEFORE cleaning stack args.
+  // Stack layout at call time (low to high): [ret_buf][stack_args][frame...]
+  // After the call sp is still at ret_buf start; capture it first, then free both.
   if (large_ret) {
     println("mov x0, sp");
     println("add sp, sp, #%d", ret_buf_size);
   }
+
+  // Clean up stack args that were passed on the stack
+  if (padded_stack > 0)
+    println("add sp, sp, #%d", padded_stack);
 
   // Result is in x0 (integer/pointer) or d0 (float)
   if (call_ret_ty->kind == TY_BOOL)
