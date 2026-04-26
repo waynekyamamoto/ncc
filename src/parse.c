@@ -4621,6 +4621,25 @@ static void initializer2(Token **rest, Token *tok, Initializer *init) {
       return;
     }
 
+    // String literal initializing a struct whose first member is a char array.
+    // E.g.: struct { char w[8]; } q[2] = { "abc", "def" }
+    // By C brace-elision rules, "abc" initializes the first char-array member.
+    if (tok->kind == TK_STR && init->ty->members) {
+      Initializer *target = init;
+      // Descend through nested struct/union first members to find a char array.
+      while (target->children && target->children[0]) {
+        Type *child_ty = target->children[0]->ty;
+        if (child_ty->kind == TY_ARRAY && child_ty->base->kind == TY_CHAR) {
+          string_initializer(rest, tok, target->children[0]);
+          return;
+        }
+        if (child_ty->kind == TY_STRUCT || child_ty->kind == TY_UNION)
+          target = target->children[0];
+        else
+          break;
+      }
+    }
+
     // Struct can be initialized with a single expression
     Node *expr_node = assign(&tok, tok);
     add_type(expr_node);

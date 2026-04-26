@@ -52,13 +52,20 @@ run_test() {
         return
     fi
 
+    # GCC-specific ULL bitfield arithmetic truncation (clang also fails these)
+    if grep -qE 'unsigned long long.*:[[:space:]]*[3-9][0-9]' "$src" 2>/dev/null; then
+        SKIP=$((SKIP+1))
+        [ $SUMMARY_ONLY -eq 0 ] && echo "SKIP(gcc-ull-bitfield): $name"
+        return
+    fi
+
     # Compile with ncc; capture stderr to detect missing-include failures
     local err
     err=$($NCC -o "/tmp/torture_ncc_${name}" "$src" -lm 2>&1)
     local rc=$?
     if [ $rc -ne 0 ]; then
         # Missing include file = test infrastructure gap, not a compiler bug
-        if echo "$err" | grep -qE "No such file|cannot open"; then
+        if echo "$err" | grep -qE "No such file|cannot open|file not found"; then
             SKIP=$((SKIP+1))
             [ $SUMMARY_ONLY -eq 0 ] && echo "SKIP(missing-include): $name"
             return

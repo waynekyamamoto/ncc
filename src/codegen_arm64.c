@@ -1023,6 +1023,18 @@ static void gen_expr(Node *node) {
     return;
 
   case ND_ASSIGN:
+    // For VLA struct assignments, generate RHS first so any VLA allocations inside
+    // the RHS don't corrupt the expression stack entry holding the LHS address.
+    if ((node->ty->kind == TY_STRUCT || node->ty->kind == TY_UNION) && node->ty->vla_size) {
+      gen_expr(node->rhs);   // x0 = &rhs; all VLA allocs complete
+      push();                 // save &rhs on expr stack (safe: no more VLA allocs)
+      gen_addr(node->lhs);   // x0 = &lhs
+      pop("x1");              // x1 = &rhs (temporarily)
+      push();                 // push x0 (&lhs) so store() can pop it as dst
+      println("mov x0, x1"); // x0 = &rhs (src)
+      store(node->ty);        // pop x1=&lhs, copy x0=&rhs → x1
+      return;
+    }
     gen_addr(node->lhs);
     push();
     gen_expr(node->rhs);
