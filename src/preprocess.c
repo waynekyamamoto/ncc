@@ -67,6 +67,9 @@ static Macro *find_macro(Token *tok);
 static Token *copy_line(Token **rest, Token *tok);
 static Token *copy_token_list(Token *tok);
 static long const_expr(Token **rest, Token *tok);
+static void push_cond_incl(Token *tok, bool included);
+static Token *skip_cond_incl(Token *tok);
+static long eval_const_expr(Token **rest, Token *tok);
 
 //
 // Utility
@@ -804,6 +807,61 @@ static MacroArg *find_arg(MacroArg *args, Token *tok) {
   return NULL;
 }
 
+// Handle a preprocessing directive encountered inside a macro argument list.
+// Processes #if/#ifdef/#ifndef/#else/#elif/#endif so that conditional blocks
+// within macro arguments are resolved correctly (e.g. the ternary split in
+// linux/lib/decompress_inflate.c). Returns tok past the directive.
+static Token *handle_pp_directive_in_arg(Token *tok) {
+  tok = tok->next; // skip '#'
+  if (equal(tok, "ifdef") || equal(tok, "ifndef")) {
+    bool is_ifdef = equal(tok, "ifdef");
+    bool defined = hashmap_get2(&macros, tok->next->loc, tok->next->len);
+    push_cond_incl(tok, is_ifdef ? defined : !defined);
+    tok = skip_line(tok->next->next);
+    if (is_ifdef ? !defined : defined)
+      tok = skip_cond_incl(tok);
+    return tok;
+  }
+  if (equal(tok, "if")) {
+    long val = eval_const_expr(&tok, tok->next);
+    push_cond_incl(tok, val);
+    if (!val)
+      tok = skip_cond_incl(tok);
+    return tok;
+  }
+  if (equal(tok, "elif")) {
+    if (cond_incl && cond_incl->ctx != IN_ELSE) {
+      cond_incl->ctx = IN_ELIF;
+      if (!cond_incl->included && eval_const_expr(&tok, tok->next))
+        cond_incl->included = true;
+      else
+        tok = skip_cond_incl(tok);
+    }
+    return tok;
+  }
+  if (equal(tok, "else")) {
+    if (cond_incl && cond_incl->ctx != IN_ELSE) {
+      cond_incl->ctx = IN_ELSE;
+      tok = skip_line(tok->next);
+      if (cond_incl->included)
+        tok = skip_cond_incl(tok);
+      else
+        cond_incl->included = true;
+    }
+    return tok;
+  }
+  if (equal(tok, "endif")) {
+    if (cond_incl)
+      cond_incl = cond_incl->next;
+    tok = skip_line(tok->next);
+    return tok;
+  }
+  // Other directives (#define, #undef, etc.) inside args: skip the line.
+  while (!tok->at_bol && tok->kind != TK_EOF)
+    tok = tok->next;
+  return tok;
+}
+
 // Read macro arguments
 static MacroArg *read_macro_args(Token **rest, Token *tok, MacroParam *params,
                                   char *va_args_name) {
@@ -821,13 +879,20 @@ static MacroArg *read_macro_args(Token **rest, Token *tok, MacroParam *params,
     MacroArg *arg = calloc_checked(1, sizeof(MacroArg));
     arg->name = pp->name;
 
-    // Read tokens until ',' or ')' respecting nesting
+    // Read tokens until ',' or ')' respecting nesting.
+    // Handle preprocessing directives (#if/#ifdef/etc.) in-line so that
+    // code like "malloc(cond ? a :\n#ifdef X\n  b);\n#else\n  c);\n#endif"
+    // is resolved correctly before the argument is collected.
     Token arg_head = {};
     Token *arg_cur = &arg_head;
     int level = 0;
     while (level > 0 || (!equal(tok, ",") && !equal(tok, ")"))) {
       if (tok->kind == TK_EOF)
         error_tok(start, "unclosed macro argument list");
+      if (is_hash(tok)) {
+        tok = handle_pp_directive_in_arg(tok);
+        continue;
+      }
       if (equal(tok, "(")) level++;
       if (equal(tok, ")")) level--;
       arg_cur = arg_cur->next = copy_token(tok);
@@ -854,6 +919,10 @@ static MacroArg *read_macro_args(Token **rest, Token *tok, MacroParam *params,
     while (level > 0 || !equal(tok, ")")) {
       if (tok->kind == TK_EOF)
         error_tok(start, "unclosed macro argument list");
+      if (is_hash(tok)) {
+        tok = handle_pp_directive_in_arg(tok);
+        continue;
+      }
       if (equal(tok, "(")) level++;
       if (equal(tok, ")")) level--;
       if (level >= 0) {
