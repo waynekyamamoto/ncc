@@ -18,5 +18,15 @@ tests/sqlite/test_*
 .default.cfg
 .savegame/
 
+# Bootstrap stages (generated)
+stage1/
+stage2/
+
+# Claude internal state
+.claude/
+
+# Word lock files
+~$*
+
 # Temp files
 /tmp/

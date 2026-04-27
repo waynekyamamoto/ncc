@@ -1909,8 +1909,15 @@ static int64_t eval2(Node *node, char ***label) {
     return eval(node->lhs) || eval(node->rhs);
   case ND_NOT:
     return !eval(node->lhs);
-  case ND_COND:
-    return eval(node->cond) ? eval2(node->then, label) : eval2(node->els, label);
+  case ND_COND: {
+    // Try plain eval first; if it fails (e.g. pointer condition),
+    // fall back to eval2 with relocation context: a non-zero relocation is truthy.
+    char **cond_lbl = NULL;
+    int64_t cond_val = eval2(node->cond, &cond_lbl);
+    bool cond_true = cond_lbl ? (cond_val != 0 || cond_lbl != NULL) : (cond_val != 0);
+    if (cond_lbl) cond_true = true; // non-null pointer is always truthy
+    return cond_true ? eval2(node->then, label) : eval2(node->els, label);
+  }
   case ND_COMMA:
     return eval2(node->rhs, label);
   case ND_CAST: {
@@ -4316,7 +4323,11 @@ static Node *stmt(Token **rest, Token *tok) {
     Node *node = new_node(ND_LABEL, tok);
     node->label = strndup_checked(tok->loc, tok->len);
     node->unique_label = new_unique_name();
-    node->lhs = stmt(rest, tok->next->next);
+    Token *after_colon = tok->next->next;
+    // Skip __attribute__((...)) applied to labels (GCC extension)
+    while (equal(after_colon, "__attribute__"))
+      after_colon = attribute_list(after_colon, NULL, NULL);
+    node->lhs = stmt(rest, after_colon);
     node->goto_next = labels;
     labels = node;
     return node;
@@ -4977,44 +4988,58 @@ static void struct_initializer1(Token **rest, Token *tok, Initializer *init) {
 static void union_initializer(Token **rest, Token *tok, Initializer *init) {
   bool has_brace = consume(&tok, tok, "{");
 
-  // Initialize first member by default
-  int idx = 0;
+  // Empty braces {} = zero-initialize
+  if (has_brace && is_end(tok)) {
+    *rest = skip(tok, "}");
+    return;
+  }
 
-  if (equal(tok, ".") || (tok->kind == TK_IDENT && equal(tok->next, ":"))) {
-    bool old_style = !equal(tok, ".");
-    if (!old_style) tok = tok->next;
-    Member *m = init->ty->members;
-    int j = 0;
-    for (; m; m = m->next, j++) {
-      if (m->name && m->name->len == tok->len &&
-          !strncmp(m->name->loc, tok->loc, tok->len)) {
-        idx = j;
-        break;
-      }
-    }
-    tok = tok->next;
-    if (old_style) {
-      tok = skip(tok, ":");
-      initializer2(&tok, tok, init->children[idx]);
-    } else if (equal(tok, ".") || equal(tok, "[")) {
-      // Nested designator: .f.f9 = val
-      initializer2(&tok, tok, init->children[idx]);
+  // Without braces: process exactly one element, then return.
+  // With braces: process all elements inside { ... }.
+  bool first = true;
+  while (true) {
+    if (first) first = false;
+    else if (has_brace) {
+      if (!consume(&tok, tok, ",")) break;
+      if (is_end(tok)) break;
     } else {
-      consume(&tok, tok, "=");
-      initializer2(&tok, tok, init->children[idx]);
+      break; // no-brace: only one element
     }
-  } else {
-    initializer2(&tok, tok, init->children[idx]);
+
+    int idx = 0;
+    if (equal(tok, ".") || (tok->kind == TK_IDENT && equal(tok->next, ":"))) {
+      bool old_style = !equal(tok, ".");
+      if (!old_style) tok = tok->next;
+      Member *m = init->ty->members;
+      int j = 0;
+      for (; m; m = m->next, j++) {
+        if (m->name && m->name->len == tok->len &&
+            !strncmp(m->name->loc, tok->loc, tok->len)) {
+          idx = j;
+          break;
+        }
+      }
+      tok = tok->next;
+      if (old_style) {
+        tok = skip(tok, ":");
+        initializer2(&tok, tok, init->children[idx]);
+      } else if (equal(tok, ".") || equal(tok, "[")) {
+        // Nested designator: .f.sub = val
+        initializer2(&tok, tok, init->children[idx]);
+      } else {
+        consume(&tok, tok, "=");
+        initializer2(&tok, tok, init->children[idx]);
+      }
+    } else {
+      initializer2(&tok, tok, init->children[idx]);
+      break;
+    }
   }
 
   if (has_brace) {
     consume(&tok, tok, ",");
-    while (!consume(&tok, tok, "}")) {
-      if (!consume(&tok, tok, ",")) tok = tok->next;
-      if (equal(tok, "}")) { tok = tok->next; break; }
-      if (!equal(tok, "}") && !equal(tok, ","))
-        assign(&tok, tok);
-    }
+    *rest = skip(tok, "}");
+    return;
   }
 
   *rest = tok;

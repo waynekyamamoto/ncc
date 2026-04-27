@@ -1,37 +1,13 @@
 #!/bin/bash
-# Build Doom with ncc2 (ncc compiled by ncc1, which was compiled by clang)
+# Build Doom with ncc2 (the bootstrap-validated compiler)
 set -e
 
 ROOT=$(cd "$(dirname "$0")" && pwd)
-NCC1=$ROOT/ncc
-SRCDIR=$ROOT/src
+NCC2=$ROOT/ncc2
 DOOMDIR=$ROOT/tests/doom
 BUILDDIR=$ROOT/build/doom_ncc2
 
 mkdir -p "$BUILDDIR"
-
-echo "=== Step 1: Build ncc2 (ncc1 compiles ncc source) ==="
-
-NCC_SRCS=(
-  alloc.c codegen_arm64.c hashmap.c main.c parse.c
-  preprocess.c tokenize.c type.c unicode.c
-)
-
-NCC2_OBJS=()
-for f in "${NCC_SRCS[@]}"; do
-  obj="$BUILDDIR/ncc2_${f%.c}.o"
-  echo "  ncc1: $f"
-  "$NCC1" -c -o "$obj" "$SRCDIR/$f"
-  NCC2_OBJS+=("$obj")
-done
-
-NCC2=$BUILDDIR/ncc2
-echo "  link → $NCC2"
-clang -o "$NCC2" "${NCC2_OBJS[@]}"
-echo "  ncc2 built: $NCC2"
-
-echo ""
-echo "=== Step 2: Build Doom with ncc2 ==="
 
 DOOM_C_SRCS=(
   am_map.c d_event.c d_items.c d_iwad.c d_loop.c d_main.c d_mode.c d_net.c
@@ -52,15 +28,17 @@ DOOM_C_SRCS=(
   wi_stuff.c z_zone.c
 )
 
+echo "=== Building Doom with ncc2 (${#DOOM_C_SRCS[@]} files) ==="
+
 DOOM_OBJS=()
 FAILED=()
 for f in "${DOOM_C_SRCS[@]}"; do
   obj="$BUILDDIR/${f%.c}.o"
-  echo "  ncc2: $f"
-  if "$NCC2" -c -I "$DOOMDIR" -I "$ROOT/include" -o "$obj" "$DOOMDIR/$f" 2>"$BUILDDIR/${f%.c}.err"; then
+  if "$NCC2" -c -I "$DOOMDIR" -o "$obj" "$DOOMDIR/$f" 2>"$BUILDDIR/${f%.c}.err"; then
+    echo "  OK: $f"
     DOOM_OBJS+=("$obj")
   else
-    echo "    FAILED: $f"
+    echo "  FAIL: $f"
     cat "$BUILDDIR/${f%.c}.err"
     FAILED+=("$f")
   fi
@@ -71,15 +49,8 @@ echo "  clang: doomgeneric_macos.m"
 clang -ObjC -c -I "$DOOMDIR" -o "$BUILDDIR/doomgeneric_macos.o" "$DOOMDIR/doomgeneric_macos.m"
 DOOM_OBJS+=("$BUILDDIR/doomgeneric_macos.o")
 
-if [ ${#FAILED[@]} -gt 0 ]; then
-  echo ""
-  echo "=== Compile failures (${#FAILED[@]}) ==="
-  for f in "${FAILED[@]}"; do echo "  $f"; done
-  echo "Attempting link with successfully compiled files..."
-fi
-
 echo ""
-echo "=== Step 3: Link ==="
+echo "=== Linking ==="
 clang -o "$BUILDDIR/doom" "${DOOM_OBJS[@]}" \
   -framework AppKit \
   -framework CoreGraphics \
@@ -92,7 +63,7 @@ clang -o "$BUILDDIR/doom" "${DOOM_OBJS[@]}" \
 echo ""
 if [ ${#FAILED[@]} -eq 0 ]; then
   echo "SUCCESS: $BUILDDIR/doom"
-  echo "  All ${#DOOM_C_SRCS[@]} C files compiled by ncc2, doomgeneric_macos.m by clang"
+  echo "  All ${#DOOM_C_SRCS[@]} C files compiled by ncc2"
 else
-  echo "PARTIAL: $BUILDDIR/doom (${#FAILED[@]} files fell back)"
+  echo "PARTIAL: $BUILDDIR/doom (${#FAILED[@]} compile failures)"
 fi

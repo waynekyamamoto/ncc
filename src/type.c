@@ -373,6 +373,11 @@ void add_type(Node *node) {
     return;
   }
   case ND_DEREF:
+    // Function-to-pointer decay: *(func) = func type (GCC typeof extension)
+    if (node->lhs->ty->kind == TY_FUNC) {
+      node->ty = node->lhs->ty;
+      return;
+    }
     if (!node->lhs->ty->base)
       error_tok(node->tok, "invalid pointer dereference");
     // Allow void pointer dereference (GCC extension): result has type void.
