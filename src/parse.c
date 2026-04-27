@@ -1624,8 +1624,13 @@ static Type *struct_decl(Token **rest, Token *tok) {
 
   struct_members(&tok, tok, ty);
   struct_layout(ty);
-  // Apply attributes AFTER layout (so aligned() overrides computed alignment)
+  // Apply attributes AFTER layout (so aligned() overrides computed alignment).
+  // If trailing __attribute__((packed)) was seen, re-run layout — the first
+  // pass had is_packed=false so it inserted alignment padding between members.
+  bool was_packed = ty->is_packed;
   tok = attribute_list(tok, ty, NULL);
+  if (!was_packed && ty->is_packed)
+    struct_layout(ty);
   *rest = tok;
   return ty;
 }
@@ -1949,6 +1954,10 @@ static int64_t eval2(Node *node, char ***label) {
     return 0;
   case ND_ADDR:
     return eval_rval(node->lhs, label);
+  case ND_DEREF:
+    // Nested array access in offsetof-like patterns: bps[0][1] is
+    // *(*(bps+0)+1). Treat *p in eval-as-rval context as p's value.
+    return eval2(node->lhs, label);
   case ND_VAR:
     if (!label)
       error_tok(node->tok, "not a compile-time constant");
@@ -3552,14 +3561,35 @@ static Node *primary(Token **rest, Token *tok) {
         }
         break;
       case ND_COND:
+        // If cond is a constant, only the live branch matters. The dead
+        // branch may contain function calls (e.g. ilog2's else path) that
+        // would otherwise force is_const to false.
         if (sp < 61) {
           if (n->cond) stack[sp++] = n->cond;
-          if (n->then) stack[sp++] = n->then;
-          if (n->els) stack[sp++] = n->els;
+          if (n->cond && n->cond->kind == ND_NUM) {
+            Node *live = n->cond->val ? n->then : n->els;
+            if (live) stack[sp++] = live;
+          } else {
+            if (n->then) stack[sp++] = n->then;
+            if (n->els) stack[sp++] = n->els;
+          }
         }
         break;
       case ND_MEMBER:
       case ND_DEREF:
+        if (sp < 63 && n->lhs) stack[sp++] = n->lhs;
+        break;
+      // Builtins that fold to constants when their operand is constant.
+      // Without these, ilog2(constant) — which contains __builtin_clzll —
+      // is incorrectly seen as non-constant by __builtin_constant_p.
+      case ND_BUILTIN_CLZ:
+      case ND_BUILTIN_CTZ:
+      case ND_BUILTIN_FFS:
+      case ND_BUILTIN_POPCOUNT:
+      case ND_BUILTIN_PARITY:
+      case ND_BUILTIN_CLRSB:
+      case ND_BUILTIN_BSWAP32:
+      case ND_BUILTIN_BSWAP64:
         if (sp < 63 && n->lhs) stack[sp++] = n->lhs;
         break;
       default:
@@ -4596,7 +4626,9 @@ static Initializer *new_initializer(Type *ty, bool is_flexible) {
   init->ty = ty;
 
   if (ty->kind == TY_ARRAY) {
-    if (is_flexible && ty->size < 0) {
+    // array_len < 0 means incomplete (e.g. T[]) — never calloc with negative count.
+    // This also covers zero-size element types where ty->size would be 0, not negative.
+    if (ty->array_len < 0) {
       init->is_flexible = true;
       return init;
     }
@@ -5294,7 +5326,8 @@ static void gvar_initializer(Token **rest, Token *tok, Obj *var) {
   Relocation head = {};
   var->rel = &head;
 
-  char *buf = calloc_checked(1, alloc_size);
+  if (alloc_size < 0) alloc_size = 0; // incomplete element type — don't crash
+  char *buf = alloc_size > 0 ? calloc_checked(1, alloc_size) : NULL;
   Relocation *rel_tail = &head;
   write_gvar_data(init, var->ty, buf, 0, &rel_tail);
   var->init_data = buf;
