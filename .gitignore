@@ -30,3 +30,6 @@ stage2/
 
 # Temp files
 /tmp/
+
+# Generated reports
+linux_port_report.*
