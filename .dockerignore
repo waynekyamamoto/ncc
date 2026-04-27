@@ -1,0 +1,12 @@
+xv6-aarch64/
+stage1/
+stage2/
+src/
+include/
+tests/
+build/doom_ncc2/
+*.o
+*.s
+*.d
+ncc
+ncc2

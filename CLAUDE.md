@@ -65,8 +65,10 @@ The ARM64 instructions themselves are identical — only directives change.
 - Build `fs.img` with xv6's `mkfs`
 - Milestone: ncc-compiled programs running on ncc-compiled kernel
 
-### Phase 5 — Docker
-- `Dockerfile`: install QEMU, copy kernel + fs.img, boot on `docker run`
+### Phase 5 — Docker ✅
+- `Dockerfile`: ubuntu:22.04 + qemu-system-arm + ipxe-qemu, copies kernel + fs.img
+- `docker build -t xv6-ncc .`
+- `docker run --rm -it xv6-ncc`  → xv6 boots to shell prompt
 
 ### Key facts
 - xv6 repo: https://github.com/k-mrm/xv6-aarch64
