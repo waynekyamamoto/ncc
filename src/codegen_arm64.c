@@ -1,5 +1,4 @@
-// codegen_arm64.c — ARM64 (Apple Silicon / macOS) code generator
-// Generates ARM64 assembly in GNU as syntax for Mach-O.
+// codegen_arm64.c — ARM64 code generator for Mach-O (macOS) and ELF (bare-metal).
 #include "cc.h"
 
 // Output file
@@ -17,6 +16,11 @@ long align_to(long n, int align) {
 
 #define println(...)  do { fprintf(output_file, "\t"); fprintf(output_file, __VA_ARGS__); fprintf(output_file, "\n"); } while(0)
 #define printlabel(...) do { fprintf(output_file, __VA_ARGS__); fprintf(output_file, "\n"); } while(0)
+
+// ELF uses no leading underscore on symbols; Mach-O uses '_'.
+static char *sn(const char *name) {
+  return opt_elf ? (char *)name : format("_%s", name);
+}
 
 static void gen_expr(Node *node);
 static void gen_stmt(Node *node);
@@ -381,14 +385,19 @@ static void gen_addr(Node *node) {
           node->var->ty->vla_size) {
         println("ldr x0, [x0]");
       }
-    } else if (!node->var->is_definition) {
-      // External variable: use GOT for PIC on macOS
+    } else if (!node->var->is_definition && !opt_elf) {
+      // External variable: use GOT for PIC on Mach-O
       println("adrp x0, _%s@GOTPAGE", node->var->name);
       println("ldr x0, [x0, _%s@GOTPAGEOFF]", node->var->name);
     } else {
-      // Local global variable: PIC addressing on macOS
-      println("adrp x0, _%s@PAGE", node->var->name);
-      println("add x0, x0, _%s@PAGEOFF", node->var->name);
+      // PC-relative addressing: used for defined vars on Mach-O, and all vars on ELF
+      if (opt_elf) {
+        println("adrp x0, %s", node->var->name);
+        println("add x0, x0, :lo12:%s", node->var->name);
+      } else {
+        println("adrp x0, _%s@PAGE", node->var->name);
+        println("add x0, x0, _%s@PAGEOFF", node->var->name);
+      }
     }
     return;
 
@@ -593,6 +602,63 @@ static void count_params(Type *func_ty, int *gp_count, int *fp_count) {
 // - Variadic args are ALL passed on the stack (not in registers)
 // - Stack must be 16-byte aligned before the call
 static void gen_funcall(Node *node) {
+
+  // Emit __sync_* GCC builtins inline (needed for bare-metal ELF where
+  // there is no libgcc, but correct on all ARM64 targets).
+  if (node->funcname && !strcmp(node->funcname, "__sync_synchronize")) {
+    println("dmb ish");
+    return;
+  }
+  if (node->funcname && !strcmp(node->funcname, "__sync_lock_release")) {
+    // __sync_lock_release(int *ptr) — store 0 with release semantics
+    if (node->args) {
+      gen_expr(node->args);   // evaluate pointer arg into x0
+      println("stlr wzr, [x0]");
+    }
+    return;
+  }
+  if (node->funcname && !strcmp(node->funcname, "__sync_lock_test_and_set")) {
+    // __sync_lock_test_and_set(int *ptr, int val) — atomic exchange, return old
+    if (node->args && node->args->next) {
+      gen_expr(node->args->next); push();  // val → x0, push
+      gen_expr(node->args);                // ptr → x0
+      println("mov x1, x0");              // ptr in x1
+      pop("x0");                           // val in x0
+      int c = label_cnt++;
+      printlabel("Ltmp_ldxr.%d:", c);
+      println("ldaxr w2, [x1]");
+      println("stlxr w3, w0, [x1]");
+      println("cbnz w3, Ltmp_ldxr.%d", c);
+      println("mov w0, w2");              // return old value
+    }
+    return;
+  }
+  if (node->funcname && !strcmp(node->funcname, "__sync_bool_compare_and_swap")) {
+    // __sync_bool_compare_and_swap(int *ptr, int old, int new)
+    // Returns true if swap succeeded
+    if (node->args && node->args->next && node->args->next->next) {
+      gen_expr(node->args->next->next); push();  // new → x0, push
+      gen_expr(node->args->next);       push();  // old → x0, push
+      gen_expr(node->args);                       // ptr → x0
+      println("mov x3, x0");                     // ptr in x3
+      pop("x1");                                  // old in x1
+      pop("x2");                                  // new in x2
+      int c = label_cnt++;
+      printlabel("Ltmp_cas.cmpxchg.%d:", c);
+      println("ldaxr w0, [x3]");
+      println("cmp w0, w1");
+      println("b.ne Ltmp_cas.fail.%d", c);
+      println("stlxr w4, w2, [x3]");
+      println("cbnz w4, Ltmp_cas.cmpxchg.%d", c);
+      println("mov x0, #1");
+      println("b Ltmp_cas.end.%d", c);
+      printlabel("Ltmp_cas.fail.%d:", c);
+      println("clrex");
+      println("mov x0, #0");
+      printlabel("Ltmp_cas.end.%d:", c);
+    }
+    return;
+  }
 
   Node *args[64];
   int nargs = 0;
@@ -810,7 +876,7 @@ static void gen_funcall(Node *node) {
       println("sub sp, sp, #%d", ret_buf_size);
       println("mov x8, sp");
     }
-    println("bl _%s", node->funcname);
+    println("bl %s", sn(node->funcname));
   }
 
   // For large struct returns: capture ret buf pointer BEFORE cleaning stack args.
@@ -1426,10 +1492,15 @@ static void gen_expr(Node *node) {
 
   case ND_LABEL_VAL: {
     // Computed goto label address. Use adrp+add for non-local symbols
-    // since adr doesn't support cross-section relocations on Mach-O.
+    // since adr doesn't support cross-section relocations.
     if (!strncmp(node->unique_label, "_cg_", 4)) {
-      println("adrp x0, %s@PAGE", node->unique_label);
-      println("add x0, x0, %s@PAGEOFF", node->unique_label);
+      if (opt_elf) {
+        println("adrp x0, %s", node->unique_label);
+        println("add x0, x0, :lo12:%s", node->unique_label);
+      } else {
+        println("adrp x0, %s@PAGE", node->unique_label);
+        println("add x0, x0, %s@PAGEOFF", node->unique_label);
+      }
     } else {
       println("adr x0, %s", node->unique_label);
     }
@@ -2369,16 +2440,16 @@ static void emit_data(Obj *prog) {
     // Alias: emit .set directive
     if (var->alias_target) {
       if (!var->is_static)
-        println(".globl _%s", var->name);
-      println(".set _%s, _%s", var->name, var->alias_target);
+        println(".globl %s", sn(var->name));
+      println(".set %s, %s", sn(var->name), sn(var->alias_target));
       continue;
     }
 
     // Section
     if (var->init_data) {
-      printlabel(".section __DATA,__data");
+      printlabel("%s", opt_elf ? ".section .data" : ".section __DATA,__data");
     } else {
-      printlabel(".section __DATA,__bss");
+      printlabel("%s", opt_elf ? ".section .bss" : ".section __DATA,__bss");
     }
 
     // Alignment
@@ -2389,9 +2460,9 @@ static void emit_data(Obj *prog) {
 
     // Visibility
     if (!var->is_static)
-      println(".globl _%s", var->name);
+      println(".globl %s", sn(var->name));
 
-    printlabel("_%s:", var->name);
+    printlabel("%s:", sn(var->name));
 
     if (var->init_data) {
       // Emit initialized data (use init_data_size for flexible array members)
@@ -2408,10 +2479,8 @@ static void emit_data(Obj *prog) {
 
         if (rel) {
           // Emit a pointer relocation.
-          // Computed goto labels (_cg_) already have the underscore prefix
-          // and are non-local symbols that can be referenced cross-section.
           char *sym = *rel->label;
-          if (!strncmp(sym, "_cg_", 4))
+          if (opt_elf || !strncmp(sym, "_cg_", 4))
             println(".quad %s+%ld", sym, rel->addend);
           else
             println(".quad _%s+%ld", sym, rel->addend);
@@ -2447,14 +2516,18 @@ static void emit_text(Obj *prog) {
     // deduplicated by the linker across translation units.
     hashmap_put(&emitted_fns, fn->name, (void *)1);
 
-    printlabel(".section __TEXT,__text");
+    printlabel("%s", opt_elf ? ".section .text" : ".section __TEXT,__text");
     if (!fn->is_static && !extern_inline) {
-      if (fn->is_inline)
-        println(".weak_definition _%s", fn->name);
-      println(".globl _%s", fn->name);
+      if (fn->is_inline) {
+        if (opt_elf)
+          println(".weak %s", fn->name);
+        else
+          println(".weak_definition _%s", fn->name);
+      }
+      println(".globl %s", sn(fn->name));
     }
     println(".p2align 2");
-    printlabel("_%s:", fn->name);
+    printlabel("%s:", sn(fn->name));
 
     current_fn = fn;
     // Assign offsets for all enclosing functions first, so that
@@ -2776,10 +2849,10 @@ void codegen(Obj *prog, FILE *out) {
   emit_data(prog);
   emit_text(prog);
 
-  // Ensure the file doesn't trigger NX protection issues
-  printlabel(".section __DATA,__data");
-
-  // Enable weak definition deduplication and dead-stripping.
-  // Safe now that code labels use Ltmp (assembler-local on Mach-O).
-  println(".subsections_via_symbols");
+  if (!opt_elf) {
+    // Ensure the file doesn't end in the text section (NX protection on macOS).
+    printlabel(".section __DATA,__data");
+    // Enable weak definition deduplication and dead-stripping.
+    println(".subsections_via_symbols");
+  }
 }
