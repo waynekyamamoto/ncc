@@ -1,5 +1,13 @@
 # ncc — ARM64/macOS C Compiler
 
+## Branches
+- `main` — stable; Linux kernel scan work happens here
+- `xv6-aarch64` — xv6 port; ELF output mode for ncc, xv6 kernel compilation, QEMU boot
+
+## Active work
+- **main**: Linux kernel subsystem scan (mm/, kernel/, fs/, net/*). Pre-include fix file at `/tmp/ncc_linux_fix.h`. Scan script at `/tmp/ncc_scan.sh`.
+- **xv6-aarch64**: Port ncc to emit ELF assembly, compile xv6-aarch64 kernel + user programs with ncc, boot under QEMU. xv6 source at `~/xv6-aarch64` (to be cloned). Cross-toolchain: `aarch64-elf-binutils` (brew).
+
 ## bootstrap_validate
 
 Clean build with clang, then confirm the compiler reaches a fixed point when compiling itself:
