@@ -2805,7 +2805,7 @@ static Node *unary(Token **rest, Token *tok) {
   }
 
   // _Alignof
-  if (equal(tok, "_Alignof") || equal(tok, "__alignof__")) {
+  if (equal(tok, "_Alignof") || equal(tok, "__alignof__") || equal(tok, "__alignof")) {
     tok = skip(tok->next, "(");
     if (is_typename(tok)) {
       Type *ty = typename_(&tok, tok);
