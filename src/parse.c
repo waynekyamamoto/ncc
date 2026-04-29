@@ -1106,7 +1106,9 @@ static Type *array_dimensions(Token **rest, Token *tok, Type *ty) {
     while (sp > 0 && is_const) {
       Node *n = stack[--sp];
       if (!n) continue;
-      if (n->kind == ND_VAR || n->kind == ND_FUNCALL)
+      // ND_STMT_EXPR is `({ ... })`; its statements live in node->body, not
+      // lhs/rhs, so the lhs/rhs walk would silently pass over it. Force VLA.
+      if (n->kind == ND_VAR || n->kind == ND_FUNCALL || n->kind == ND_STMT_EXPR)
         is_const = false;
       if (sp < 62) {
         if (n->lhs) stack[sp++] = n->lhs;
