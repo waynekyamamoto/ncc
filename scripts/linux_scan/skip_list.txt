@@ -48,3 +48,93 @@ fs/cifs/asn1.c
 fs/cifs/trace.c
 fs/nfs/nfs4trace.c
 fs/nfs/nfstrace.c
+
+# drivers/usb/host — files #include'd into ehci-hcd.c / ohci-hcd.c / uhci-hcd.c
+# (kbuild never compiles them as standalone TUs).
+drivers/usb/host/ehci-dbg.c
+drivers/usb/host/ehci-grlib.c
+drivers/usb/host/ehci-hub.c
+drivers/usb/host/ehci-mem.c
+drivers/usb/host/ehci-ppc-of.c
+drivers/usb/host/ehci-ps3.c
+drivers/usb/host/ehci-q.c
+drivers/usb/host/ehci-sched.c
+drivers/usb/host/ehci-sh.c
+drivers/usb/host/ehci-sysfs.c
+drivers/usb/host/ehci-timer.c
+drivers/usb/host/ehci-xilinx-of.c
+drivers/usb/host/ohci-dbg.c
+drivers/usb/host/ohci-hub.c
+drivers/usb/host/ohci-mem.c
+drivers/usb/host/ohci-ppc-of.c
+drivers/usb/host/ohci-ps3.c
+drivers/usb/host/ohci-q.c
+drivers/usb/host/ohci-sa1111.c
+drivers/usb/host/ohci-sm501.c
+drivers/usb/host/ohci-tmio.c
+drivers/usb/host/uhci-debug.c
+drivers/usb/host/uhci-grlib.c
+drivers/usb/host/uhci-hub.c
+drivers/usb/host/uhci-pci.c
+drivers/usb/host/uhci-platform.c
+drivers/usb/host/uhci-q.c
+
+# drivers/usb/host — arch-specific standalone TUs.
+drivers/usb/host/fhci-hcd.c
+drivers/usb/host/fhci-sched.c
+drivers/usb/host/octeon-hcd.c
+drivers/usb/host/ohci-omap.c
+
+# drivers/scsi — m68k Amiga / Atari / Mac, MVME, SPARC, MIPS, PA-RISC, PowerPC.
+drivers/scsi/a2091.c
+drivers/scsi/a3000.c
+drivers/scsi/a4000t.c
+drivers/scsi/gvp11.c
+drivers/scsi/zorro_esp.c
+drivers/scsi/zorro7xx.c
+drivers/scsi/atari_scsi.c
+drivers/scsi/bvme6000_scsi.c
+drivers/scsi/mac_esp.c
+drivers/scsi/mac_scsi.c
+drivers/scsi/mac53c94.c
+drivers/scsi/mvme147.c
+drivers/scsi/mvme16x_scsi.c
+drivers/scsi/sun3_scsi.c
+drivers/scsi/sun3_scsi_vme.c
+drivers/scsi/mesh.c
+drivers/scsi/ps3rom.c
+drivers/scsi/qlogicpti.c
+drivers/scsi/sun_esp.c
+drivers/scsi/sun3x_esp.c
+drivers/scsi/jazz_esp.c
+drivers/scsi/sgiwd93.c
+drivers/scsi/sni_53c710.c
+drivers/scsi/lasi700.c
+drivers/scsi/zalon.c
+
+# drivers/scsi — generated headers / config-gated builds.
+drivers/scsi/53c700.c
+drivers/scsi/scsi_sysfs.c
+drivers/scsi/aha152x.c
+drivers/scsi/aha1542.c
+drivers/scsi/FlashPoint.c
+
+# drivers/scsi — files #include'd into peers (not standalone TUs).
+drivers/scsi/NCR5380.c
+drivers/scsi/nsp32_debug.c
+
+# drivers/ata — arch-specific (Octeon MIPS, Amiga m68k, RiscPC ARM32, PowerMac, MPC52xx, Geode x86).
+drivers/ata/ahci_octeon.c
+drivers/ata/pata_octeon_cf.c
+drivers/ata/pata_buddha.c
+drivers/ata/pata_gayle.c
+drivers/ata/pata_falcon.c
+drivers/ata/pata_icside.c
+drivers/ata/pata_macio.c
+drivers/ata/pata_mpc52xx.c
+drivers/ata/pata_cs5535.c
+drivers/ata/pata_rb532_cf.c
+
+# sound/usb — Makefile-gated and #include'd-only fragments.
+sound/usb/media.c
+sound/usb/mixer_maps.c

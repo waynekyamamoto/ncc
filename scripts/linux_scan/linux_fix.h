@@ -316,3 +316,42 @@
 /* drivers/pci IOV (or pci_sriov_configure_simple becomes NULL macro). */
 #define CONFIG_PCI_IOV 1
 #define CONFIG_PCI_P2PDMA 1
+
+/* drivers/hid sub-features and friends (Phase B 2026-04-29). */
+#define CONFIG_GPIOLIB 1
+#define CONFIG_GPIOLIB_IRQCHIP 1
+#define CONFIG_DEBUG_FS 1
+#define CONFIG_LOGIWHEELS_FF 1
+#define CONFIG_HID_PICOLCD 1
+#define CONFIG_HID_PICOLCD_FB 1
+#define CONFIG_HID_PICOLCD_BACKLIGHT 1
+#define CONFIG_HID_PICOLCD_LCD 1
+#define CONFIG_HID_PICOLCD_LEDS 1
+#define CONFIG_HID_PICOLCD_CIR 1
+#define CONFIG_FB_DEFERRED_IO 1
+
+/* drivers/thermal — REGMAP gates many struct fields. */
+#define CONFIG_REGMAP 1
+#define CONFIG_THERMAL_DEFAULT_GOV_STEP_WISE 1
+#define CONFIG_THERMAL_EMERGENCY_POWEROFF_DELAY_MS 0
+
+/* drivers/usb/host. */
+#define CONFIG_USB_PCI 1
+#define CONFIG_FHCI_DEBUG 1
+#define CONFIG_USB_UHCI_SUPPORT_NON_PCI_HC 1
+
+/* drivers/ata — the libata.h family of features. */
+#define CONFIG_ATA 1
+#define CONFIG_ATA_SFF 1
+#define CONFIG_ATA_BMDMA 1
+#define CONFIG_ATA_ACPI 1
+#define CONFIG_SATA_PMP 1
+#define CONFIG_SATA_HOST 1
+#define CONFIG_PATA_TIMINGS 1
+#define CONFIG_ACPI 1
+#define CONFIG_SATA_ZPODD 1
+#define CONFIG_SATA_MOBILE_LPM_POLICY 0
+
+/* drivers/scsi top-level — proc + netlink unblock 2 files; rest skip-listed. */
+#define CONFIG_SCSI_PROC_FS 1
+#define CONFIG_SCSI_NETLINK 1
