@@ -63,14 +63,25 @@ _Noreturn void error_at(const char *loc, const char *fmt, ...) {
   exit(1);
 }
 
+// If the token was produced by a macro expansion, walk up the origin
+// chain to find the macro INVOCATION site in user code. Diagnostics there
+// are far more useful than at the macro definition (which is often deep
+// in a system header).
+static Token *macro_use_site(Token *tok) {
+  while (tok && tok->origin)
+    tok = tok->origin;
+  return tok;
+}
+
 _Noreturn void error_tok(Token *tok, const char *fmt, ...) {
   va_list ap;
   va_start(ap, fmt);
 
-  if (tok && tok->file) {
+  Token *src = macro_use_site(tok);
+  if (src && src->file) {
     File *saved = current_file;
-    current_file = tok->file;
-    verror_at(tok->line_no, tok->loc, fmt, ap);
+    current_file = src->file;
+    verror_at(src->line_no, src->loc, fmt, ap);
     current_file = saved;
   } else {
     vfprintf(stderr, fmt, ap);
@@ -84,10 +95,11 @@ void warn_tok(Token *tok, const char *fmt, ...) {
   va_list ap;
   va_start(ap, fmt);
 
-  if (tok && tok->file) {
+  Token *src = macro_use_site(tok);
+  if (src && src->file) {
     File *saved = current_file;
-    current_file = tok->file;
-    verror_at(tok->line_no, tok->loc, fmt, ap);
+    current_file = src->file;
+    verror_at(src->line_no, src->loc, fmt, ap);
     current_file = saved;
   } else {
     vfprintf(stderr, fmt, ap);
