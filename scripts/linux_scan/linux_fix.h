@@ -1,0 +1,273 @@
+/* Pre-include for ncc: autoconf, kconfig, and kernel compat overrides */
+#include <generated/autoconf.h>
+#include <linux/kconfig.h>
+#include <linux/const.h>
+#undef __is_constexpr
+#define __is_constexpr(x) __builtin_constant_p(x)
+/* KBUILD_MODNAME/MODFILE are set by the kernel build system per file;
+   use generic placeholders since we only check compilation */
+#ifndef KBUILD_MODNAME
+#define KBUILD_MODNAME "ncc"
+#endif
+#ifndef KBUILD_MODFILE
+#define KBUILD_MODFILE "lib/ncc"
+#endif
+/* Safe CONFIG options: verified not to break previously passing files */
+#define CONFIG_PROC_FS 1
+#define CONFIG_MODULES 1
+#define CONFIG_MODPROBE_PATH "/sbin/modprobe"
+#define CONFIG_TRACEPOINTS 1
+#define CONFIG_SECCOMP 1
+#define CONFIG_HAVE_UID16 1
+#define CONFIG_TASKSTATS 1
+#define CONFIG_SCHED_INFO 1
+#define CONFIG_TASK_DELAY_ACCT 1
+#define CONFIG_DETECT_HUNG_TASK 1
+#define CONFIG_DEFAULT_HUNG_TASK_TIMEOUT 120
+#define CONFIG_RSEQ 1
+/* CONFIG_USER_RETURN_NOTIFIER is x86-only, not ARM64 */
+#define CONFIG_WATCH_QUEUE 1
+#define CONFIG_BSD_PROCESS_ACCT 1
+#define CONFIG_LATENCYTOP 1
+#define CONFIG_PROFILING 1
+#define CONFIG_KCOV 1
+#define CONFIG_KCOV_IRQ_AREA_SIZE 0x40000
+#define CONFIG_CRASH_CORE 1
+#define CONFIG_FUNCTION_ERROR_INJECTION 1
+#define CONFIG_KEXEC 1
+#define CONFIG_KEXEC_CORE 1
+#define CONFIG_KEXEC_ELF 1
+#define CONFIG_KEXEC_FILE 1
+#define CONFIG_MMU_NOTIFIER 1
+#define CONFIG_MEMORY_HOTPLUG 1
+#define CONFIG_MEMORY_FAILURE 1
+#define CONFIG_KSM 1
+#define CONFIG_HUGETLB_PAGE 1
+#define CONFIG_PAGE_EXTENSION 1
+#define CONFIG_PAGE_OWNER 1
+#define CONFIG_DEVICE_PRIVATE 1
+#define CONFIG_MIGRATION 1
+#define CONFIG_NET 1
+#define CONFIG_AUDIT 1
+#define CONFIG_AUDITSYSCALL 1
+#define CONFIG_FSNOTIFY 1
+#define CONFIG_RELAY 1
+#define CONFIG_KPROBES 1
+#define CONFIG_FAULT_INJECTION 1
+#define CONFIG_JUMP_LABEL 1
+#define CONFIG_HAVE_ARCH_JUMP_LABEL 1
+#define CONFIG_HAVE_ARCH_JUMP_LABEL_RELATIVE 1
+#define CONFIG_SHADOW_CALL_STACK 1
+#define CONFIG_PERF_EVENTS 1
+#define CONFIG_LOCKUP_DETECTOR 1
+#define CONFIG_HARDLOCKUP_DETECTOR 1
+#define CONFIG_GCC_PLUGIN_STACKLEAK 1
+#define CONFIG_HAVE_STATIC_CALL 1
+#define CONFIG_HAVE_STATIC_CALL_INLINE 1
+/* mm subsystem */
+#define CONFIG_TRANSPARENT_HUGEPAGE 1
+#define CONFIG_NUMA 1
+#define CONFIG_MEMORY_TIER 1
+#define CONFIG_FRONTSWAP 1
+#define CONFIG_USERFAULTFD 1
+#define CONFIG_DEBUG_KMEMLEAK 1
+#define CONFIG_DEBUG_KMEMLEAK_MEM_POOL_SIZE 16000
+#define CONFIG_MEMORY_BALLOON 1
+#define CONFIG_BALLOON_COMPACTION 1
+#define CONFIG_ZONE_DEVICE 1
+#define CONFIG_MEMORY_ISOLATION 1
+#define CONFIG_HUGETLB_PAGE_OPTIMIZE_VMEMMAP 1
+#define CONFIG_HUGETLBFS 1
+#define CONFIG_PERCPU_STATS 1
+#define CONFIG_SHRINKER_DEBUG 1
+#define CONFIG_SWAP 1
+#define CONFIG_ZSWAP 1
+#define CONFIG_ZSWAP_COMPRESSOR_DEFAULT "lzo"
+#define CONFIG_ZSWAP_ZPOOL_DEFAULT "zbud"
+#define CONFIG_ZSMALLOC 1
+/* net subsystem */
+#define CONFIG_INET 1
+#define CONFIG_INET_TABLE_PERTURB_ORDER 16
+#define CONFIG_DYNAMIC_DEBUG_CORE 1
+#define CONFIG_NETFILTER 1
+#define CONFIG_IPV6 1
+#define CONFIG_XFRM 1
+#define CONFIG_SKB_EXTENSIONS 1
+#define CONFIG_IP_MULTIPLE_TABLES 1
+#define CONFIG_IPV6_MULTIPLE_TABLES 1
+#define CONFIG_IPV6_MROUTE 1
+#define CONFIG_IP_MROUTE 1
+#define CONFIG_IPV6_MIP6 1
+#define CONFIG_IPV6_NDISC_NODETYPE 1
+#define CONFIG_IPV6_SEG6_HMAC 1
+#define CONFIG_LWTUNNEL 1
+#define CONFIG_SYN_COOKIES 1
+#define CONFIG_NET_SOCK_MSG 1
+#define CONFIG_DST_CACHE 1
+#define CONFIG_NET_DROP_MONITOR 1
+#define CONFIG_BPF 1
+#define CONFIG_BPF_SYSCALL 1
+#define CONFIG_BPF_LSM 1
+#define CONFIG_CGROUP_BPF 1
+#define CONFIG_BPF_JIT 1
+/* ipc subsystem */
+#define CONFIG_SYSVIPC 1
+#define CONFIG_SYSVIPC_SYSCTL 1
+#define CONFIG_COMPAT 1
+#define CONFIG_POSIX_MQUEUE 1
+/* security subsystem */
+#define CONFIG_SECURITY 1
+#define CONFIG_IMA 1
+#define CONFIG_FILE_LOCKING 1
+#define CONFIG_FS_POSIX_ACL 1
+/* lib subsystem */
+#define CONFIG_ASSOCIATIVE_ARRAY 1
+#define CONFIG_BUG 1
+#define CONFIG_GENERIC_BUG 1
+#define CONFIG_GENERIC_BUG_RELATIVE_POINTERS 1
+#define CONFIG_DEBUG_OBJECTS 1
+#define CONFIG_DEBUG_OBJECTS_ENABLE_DEFAULT 0
+#define CONFIG_KEYS 1
+#define CONFIG_DEBUG_MAPLE_TREE 1
+#define CONFIG_UBSAN 1
+/* fs/block subsystem */
+#define CONFIG_BLOCK 1
+#define CONFIG_CGROUPS 1
+#define CONFIG_BLK_CGROUP 1
+#define CONFIG_AIO 1
+#define CONFIG_EVENTFD 1
+#define CONFIG_EPOLL 1
+#define CONFIG_COREDUMP 1
+#define CONFIG_SYSCTL 1
+/* arch/arm64 subsystem */
+#define CONFIG_ACPI 1
+#define CONFIG_ARM_PMU 1
+#define CONFIG_HAVE_HW_BREAKPOINT 1
+#define CONFIG_ARM64_MTE 1
+#define CONFIG_ARCH_USES_HIGH_VMA_FLAGS 1
+#define CONFIG_PARAVIRT 1
+#define CONFIG_ARM64_MODULE_PLTS 1
+#define CONFIG_HIBERNATION 1
+#define CONFIG_ARM64_PTR_AUTH 1
+#define CONFIG_ARM_SDE_INTERFACE 1
+/* block subsystem */
+#define CONFIG_PM 1
+#define CONFIG_BLK_WBT 1
+#define CONFIG_BLOCK_HOLDER_DEPRECATED 1
+#define CONFIG_BLK_DEV_ZONED 1
+#define CONFIG_BLK_DEV_INTEGRITY 1
+#define CONFIG_BLK_INLINE_ENCRYPTION 1
+#define CONFIG_BLK_CGROUP_IOCOST 1
+#define CONFIG_BLK_CGROUP_FC_APPID 1
+#define CONFIG_BLK_DEV_THROTTLING 1
+#define CONFIG_BLK_RQ_ALLOC_TIME 1
+#define CONFIG_BLK_SED_OPAL 1
+/* net/ipv4 */
+#define CONFIG_DEFAULT_TCP_CONG "cubic"
+#define CONFIG_NETPOLL 1
+#define CONFIG_NET_POLL_CONTROLLER 1
+#define CONFIG_CGROUP_NET_CLASSID 1
+#define CONFIG_CGROUP_NET_PRIO 1
+#define CONFIG_NET_CLS_ACT 1
+#define CONFIG_NET_SCHED 1
+#define CONFIG_NF_CONNTRACK 1
+#define CONFIG_NF_CONNTRACK_MARK 1
+#define CONFIG_NF_TABLES 1
+/* mm subsystem extras */
+#define CONFIG_CMA 1
+#define CONFIG_CMA_AREAS 8
+#define CONFIG_CGROUP_HUGETLB 1
+/* ARM64 stub: x86 defines cache-mask bits in pgprot; ARM64 uses MAIR */
+#ifndef _PAGE_CACHE_MASK
+#define _PAGE_CACHE_MASK 0UL
+#endif
+/* mm/net extra configs */
+#define CONFIG_MEMCG 1
+#define CONFIG_NET_EMATCH 1
+#define CONFIG_NET_EMATCH_STACK 4
+#define CONFIG_CMA_DEBUGFS 1
+#define CONFIG_CMA_SYSFS 1
+#define CONFIG_NF_CONNTRACK_EVENTS 1
+#define CONFIG_NF_CONNTRACK_LABELS 1
+#define CONFIG_NF_NAT 1
+#define CONFIG_NF_FLOW_TABLE 1
+#define CONFIG_NF_CT_PROTO_DCCP 1
+#define CONFIG_NF_CT_PROTO_GRE 1
+#define CONFIG_NF_CT_PROTO_SCTP 1
+#define CONFIG_NF_NAT_MASQUERADE 1
+#define CONFIG_NF_CONNTRACK_TIMEOUT 1
+#define CONFIG_NETWORK_SECMARK 1
+#define CONFIG_NF_CONNTRACK_SECMARK 1
+#define CONFIG_IP_VS 1
+#define CONFIG_LEDS_TRIGGERS 1
+/* net/xfrm */
+#define CONFIG_XFRM_STATISTICS 1
+/* net/bridge subsystem */
+#define CONFIG_BRIDGE_CFM 1
+#define CONFIG_BRIDGE_IGMP_SNOOPING 1
+#define CONFIG_BRIDGE_MRP 1
+#define CONFIG_BRIDGE_NETFILTER 1
+#define CONFIG_NET_SWITCHDEV 1
+#define CONFIG_SYSFS 1
+#define CONFIG_BRIDGE_VLAN_FILTERING 1
+#define CONFIG_VLAN_8021Q 1
+#define CONFIG_NETFILTER_FAMILY_BRIDGE 1
+/* arch/arm64 subsystem */
+#define CONFIG_KGDB 1
+#define CONFIG_HAVE_ARCH_KGDB 1
+#define CONFIG_HW_PERF_EVENTS 1
+#define CONFIG_KVM 1
+#define CONFIG_DEBUG_VIRTUAL 1
+/* crypto subsystem */
+#define CONFIG_CRYPTO_USER 1
+#define CONFIG_CRYPTO_STATS 1
+#define CONFIG_SGL_ALLOC 1
+/* net/wireless, net/bluetooth, block */
+#define CONFIG_CFG80211 1
+#define CONFIG_WIRELESS_EXT 1
+#define CONFIG_WEXT_CORE 1
+#define CONFIG_WEXT_PRIV 1
+#define CONFIG_WEXT_SPY 1
+#define CONFIG_CFG80211_WEXT 1
+#define CONFIG_BT_LEDS 1
+#define CONFIG_BT_MSFTEXT 1
+#define CONFIG_BT_AOSPEXT 1
+#define CONFIG_BLK_DEBUG_FS 1
+/* fs subsystem */
+#define CONFIG_FS_ENCRYPTION 1
+#define CONFIG_NFS_V4 1
+#define CONFIG_NFS_V4_1 1
+#define CONFIG_NFS_V4_2 1
+#define CONFIG_NFS_FSCACHE 1
+#define CONFIG_EXT2_FS_POSIX_ACL 1
+#define CONFIG_EXT4_FS_POSIX_ACL 1
+#define CONFIG_BTRFS_FS_POSIX_ACL 1
+#define CONFIG_NFS_V3_ACL 1
+#define CONFIG_F2FS_FS_POSIX_ACL 1
+#define CONFIG_F2FS_FS_XATTR 1
+/* net protocols */
+#define CONFIG_IP_SCTP 1
+#define CONFIG_TIPC 1
+#define CONFIG_TIPC_CRYPTO 1
+#define CONFIG_CAN 1
+#define CONFIG_MPTCP 1
+#define CONFIG_NET_DSA 1
+#define CONFIG_MAC80211_MESH 1
+#define CONFIG_MAC80211_DEBUGFS 1
+#define CONFIG_MAC80211_LEDS 1
+/* Omitted:
+   CONFIG_NET_NS - may need netns infrastructure
+   CONFIG_USER_RETURN_NOTIFIER - x86-only (TIF_USER_RETURN_NOTIFY)
+*/
+
+/* Added 2026-04-29 (lessons from misdiagnosed-bugs investigation):
+
+   CONFIG_SND_SOC_TOPOLOGY: enables `dobj` member in struct snd_soc_dai_link
+     (include/sound/soc.h:104). Without it, sound/soc/soc-topology.c fails
+     "no such member" — which was misdiagnosed as a container_of bug.
+   CONFIG_DEBUG_LOCKING_API_SELFTESTS: makes `locking_selftest()` a prototype
+     instead of a do-while-0 macro that collides with the function definition
+     in lib/locking-selftest.c.
+*/
+#define CONFIG_SND_SOC_TOPOLOGY 1
+#define CONFIG_DEBUG_LOCKING_API_SELFTESTS 1
