@@ -271,3 +271,20 @@
 */
 #define CONFIG_SND_SOC_TOPOLOGY 1
 #define CONFIG_DEBUG_LOCKING_API_SELFTESTS 1
+
+/* Added 2026-04-29 (CONFIG_PCI enables many driver subsystems).
+   Verified non-regressing on fs/befs (7/7), kernel (97/97), crypto (126/127);
+   raised drivers/pci from 19/35 (54%) to 30/35 (86%).
+*/
+#define CONFIG_PCI 1
+#define CONFIG_PCI_MSI 1
+#define CONFIG_PCI_QUIRKS 1
+#define CONFIG_PCI_PRI 1
+#define CONFIG_PCI_PASID 1
+#define CONFIG_PCI_ATS 1
+#define CONFIG_PCI_DOMAINS 1
+
+/* CONFIG_CRYPTO_FIPS makes fips_enabled an `extern int` instead of macro 0,
+   so crypto/fips.c can define it. drbg/ansi_cprng also reference it.
+*/
+#define CONFIG_CRYPTO_FIPS 1

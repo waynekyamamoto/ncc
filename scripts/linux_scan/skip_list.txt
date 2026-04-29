@@ -1,1 +1,34 @@
+# Files the real arm64 kernel build does NOT compile, so ncc shouldn't either.
+# Exact paths are matched via grep -F against $LINUX-relative paths.
+
+# CONFIG_INDIRECT_IOMEM=n on arm64 — Makefile gates this out.
 lib/logic_iomem.c
+
+# !MMU only (arm64 has MMU).
+mm/nommu.c
+fs/proc/nommu.c
+fs/proc/task_nommu.c
+
+# Embedded-systems !SMP variant (arm64 builds percpu-vm.c instead).
+mm/percpu-km.c
+
+# x86-only feature (TIF_USER_RETURN_NOTIFY).
+kernel/user-return-notifier.c
+
+# Old SLAB allocator. arm64 defconfig uses SLUB.
+mm/slab.c
+
+# clang/gcc-only header arm_neon.h — ncc lacks NEON intrinsics support.
+crypto/aegis128-neon-inner.c
+
+# Generated ASN.1 headers — produced by the kernel build system; not source.
+crypto/ecdsa.c
+crypto/ecrdsa.c
+crypto/rsa_helper.c
+crypto/sm2.c
+
+# Computed-include `#include TRACE_INCLUDE(TRACE_INCLUDE_FILE)` — GCC extension
+# we don't support. Tracepoint-only files; skip rather than chase.
+fs/cifs/trace.c
+fs/nfs/nfs4trace.c
+fs/nfs/nfstrace.c

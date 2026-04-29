@@ -46,9 +46,12 @@ for f in "$DIR"/*.c; do
     echo "SKIP: $rel"
     continue
   fi
+  # Some subsystems include local headers from their own dir (e.g. mm/slub.c
+  # does `#include "slab.h"`). Add the scanned dir as an include path.
   err=$(cd "$LINUX" && "$NCC" -S -o /dev/null \
     -include "$FIX_HEADER" \
     -I "$STUBS_DIR" \
+    -I "${DIR#$LINUX/}" \
     -I include -I arch/arm64/include -I arch/arm64/include/generated \
     -I arch/arm64/include/generated/uapi -I arch/arm64/include/uapi \
     -I include/generated -I include/uapi \
