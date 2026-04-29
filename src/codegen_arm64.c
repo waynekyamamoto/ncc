@@ -665,8 +665,14 @@ static void gen_funcall(Node *node) {
   // use sp-relative addressing. The issue is when the CALLER already pushed
   // something before calling gen_funcall — that data is now at sp+padded_stack+depth*16.
   // This is a known limitation.
-  if (padded_stack > 0)
-    println("sub sp, sp, #%d", padded_stack);
+  if (padded_stack > 0) {
+    if (padded_stack <= 4095)
+      println("sub sp, sp, #%d", padded_stack);
+    else {
+      load_imm("x9", (uint64_t)padded_stack);
+      println("sub sp, sp, x9");
+    }
+  }
 
   // Evaluate stack args and store directly to the stack area
   for (int i = 0; i < nargs; i++) {
@@ -804,13 +810,23 @@ static void gen_funcall(Node *node) {
       println("ldr %s, [sp], #16", argreg64[i]);
 
     if (large_ret) {
-      println("sub sp, sp, #%d", ret_buf_size);
+      if (ret_buf_size <= 4095)
+        println("sub sp, sp, #%d", ret_buf_size);
+      else {
+        load_imm("x10", (uint64_t)ret_buf_size);
+        println("sub sp, sp, x10");
+      }
       println("mov x8, sp");
     }
     println("blr x9");
   } else {
     if (large_ret) {
-      println("sub sp, sp, #%d", ret_buf_size);
+      if (ret_buf_size <= 4095)
+        println("sub sp, sp, #%d", ret_buf_size);
+      else {
+        load_imm("x10", (uint64_t)ret_buf_size);
+        println("sub sp, sp, x10");
+      }
       println("mov x8, sp");
     }
     println("bl _%s", node->funcname);
@@ -821,12 +837,23 @@ static void gen_funcall(Node *node) {
   // After the call sp is still at ret_buf start; capture it first, then free both.
   if (large_ret) {
     println("mov x0, sp");
-    println("add sp, sp, #%d", ret_buf_size);
+    if (ret_buf_size <= 4095)
+      println("add sp, sp, #%d", ret_buf_size);
+    else {
+      load_imm("x10", (uint64_t)ret_buf_size);
+      println("add sp, sp, x10");
+    }
   }
 
   // Clean up stack args that were passed on the stack
-  if (padded_stack > 0)
-    println("add sp, sp, #%d", padded_stack);
+  if (padded_stack > 0) {
+    if (padded_stack <= 4095)
+      println("add sp, sp, #%d", padded_stack);
+    else {
+      load_imm("x9", (uint64_t)padded_stack);
+      println("add sp, sp, x9");
+    }
+  }
 
   // Result is in x0 (integer/pointer) or d0 (float)
   if (call_ret_ty->kind == TY_BOOL)
