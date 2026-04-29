@@ -594,12 +594,15 @@ static void count_params(Type *func_ty, int *gp_count, int *fp_count) {
 // - Stack must be 16-byte aligned before the call
 static void gen_funcall(Node *node) {
 
-  Node *args[64];
+  // Cap is generous — real-world ceiling is ~70 (redis FMTARGS expansion).
+  // 256 leaves headroom while keeping these arrays on the stack (~6 KiB).
+  enum { MAX_ARGS = 256 };
+  Node *args[MAX_ARGS];
   int nargs = 0;
   for (Node *arg = node->args; arg; arg = arg->next) {
-    args[nargs++] = arg;
-    if (nargs >= 64)
+    if (nargs >= MAX_ARGS)
       error_tok(node->tok, "too many arguments");
+    args[nargs++] = arg;
   }
 
   // Count named vs variadic parameters
@@ -614,8 +617,8 @@ static void gen_funcall(Node *node) {
   // Variadic args: all on stack
   // Single classification loop: determine where each arg goes
   // (GP register, FP register, or stack) per ARM64 Apple ABI.
-  int arg_dest[64]; // >=0: GP reg#, >=100: FP reg#, -1: stack
-  int arg_stack_off[64];
+  int arg_dest[MAX_ARGS]; // >=0: GP reg#, >=100: FP reg#, -1: stack
+  int arg_stack_off[MAX_ARGS];
   int gp_reg = 0, fp_reg = 0;
   int cur_stack_off = 0;
 
@@ -1159,9 +1162,10 @@ static void gen_expr(Node *node) {
     println("mov x2, #0");
     int zeroed = 0;
     int zoff = 0;
+    // Cap at 4088 (largest multiple of 8 ≤ 4095) so the periodic bump
+    // `add x1, x1, #zoff` fits in ARM64's 12-bit add-immediate.
     while (zeroed + 8 <= sz) {
-      if (zoff + 8 > 32760) {
-        // Advance base pointer to keep offsets in range for str x
+      if (zoff + 8 > 4088) {
         println("add x1, x1, #%d", zoff);
         zoff = 0;
       }
@@ -1171,8 +1175,7 @@ static void gen_expr(Node *node) {
     }
     // Handle remaining bytes (< 8)
     while (zeroed < sz) {
-      if (zoff >= 4096) {
-        // Advance base pointer to keep offsets in range for strb
+      if (zoff >= 4095) {
         println("add x1, x1, #%d", zoff);
         zoff = 0;
       }
@@ -2504,16 +2507,30 @@ static void emit_text(Obj *prog) {
       // Zero-initialize the stack frame when VLAs are present.
       // This ensures VLA saved_sp variables start at zero so the
       // first-time check (cbz) works correctly.
+      //
+      // ARM64 immediate ranges: stp's signed-imm is [-512, 504]
+      // (8-aligned, 7-bit signed × 8); str x's unsigned-imm is [0, 32760]
+      // (8-aligned, 12-bit × 8). Use a base register x9 = sp and bump it
+      // periodically to keep offsets in range.
       if (has_vla) {
         int remaining = fn->stack_size;
         int off = 0;
+        println("mov x9, sp");
         while (remaining >= 16) {
-          println("stp xzr, xzr, [sp, #%d]", off);
+          if (off + 16 > 504) {
+            println("add x9, x9, #%d", off);
+            off = 0;
+          }
+          println("stp xzr, xzr, [x9, #%d]", off);
           off += 16;
           remaining -= 16;
         }
         if (remaining >= 8) {
-          println("str xzr, [sp, #%d]", off);
+          if (off + 8 > 32760) {
+            println("add x9, x9, #%d", off);
+            off = 0;
+          }
+          println("str xzr, [x9, #%d]", off);
           off += 8;
           remaining -= 8;
         }
