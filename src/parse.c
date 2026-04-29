@@ -2258,6 +2258,13 @@ static Node *new_add(Node *lhs, Node *rhs, Token *tok) {
   add_type(lhs);
   add_type(rhs);
 
+  // Function-to-pointer decay (C11 6.3.2.1): a function designator used as
+  // a value (not as the operand of & or sizeof) decays to a pointer.
+  if (lhs->ty->kind == TY_FUNC)
+    lhs->ty = pointer_to(lhs->ty);
+  if (rhs->ty->kind == TY_FUNC)
+    rhs->ty = pointer_to(rhs->ty);
+
   // Vector addition: decompose into element-wise ops
   if (lhs->ty->kind == TY_VECTOR || rhs->ty->kind == TY_VECTOR)
     return vec_binary_op(ND_ADD, lhs, rhs, tok);
@@ -2304,12 +2311,13 @@ static Node *new_add(Node *lhs, Node *rhs, Token *tok) {
   }
 
   // ptr + num
-  // For VLA base types, use the runtime-computed size
+  // For VLA base types, use the runtime-computed size.
+  // For function/incomplete bases (size 0), GCC treats sizeof as 1 (byte arithmetic).
   Node *elem_size;
   if (lhs->ty->base->vla_size)
     elem_size = new_var_node(lhs->ty->base->vla_size, tok);
   else
-    elem_size = new_long(lhs->ty->base->size, tok);
+    elem_size = new_long(lhs->ty->base->size ? lhs->ty->base->size : 1, tok);
   rhs = new_binary(ND_MUL, rhs, elem_size, tok);
   return new_binary(ND_ADD, lhs, rhs, tok);
 }
@@ -2317,6 +2325,13 @@ static Node *new_add(Node *lhs, Node *rhs, Token *tok) {
 static Node *new_sub(Node *lhs, Node *rhs, Token *tok) {
   add_type(lhs);
   add_type(rhs);
+
+  // Function-to-pointer decay (C11 6.3.2.1): a function designator used as
+  // a value (not as the operand of & or sizeof) decays to a pointer.
+  if (lhs->ty->kind == TY_FUNC)
+    lhs->ty = pointer_to(lhs->ty);
+  if (rhs->ty->kind == TY_FUNC)
+    rhs->ty = pointer_to(rhs->ty);
 
   // Vector subtraction: decompose into element-wise ops
   if (lhs->ty->kind == TY_VECTOR || rhs->ty->kind == TY_VECTOR)
@@ -2345,7 +2360,7 @@ static Node *new_sub(Node *lhs, Node *rhs, Token *tok) {
     if (lhs->ty->base->vla_size)
       elem_size = new_var_node(lhs->ty->base->vla_size, tok);
     else
-      elem_size = new_long(lhs->ty->base->size, tok);
+      elem_size = new_long(lhs->ty->base->size ? lhs->ty->base->size : 1, tok);
     rhs = new_binary(ND_MUL, rhs, elem_size, tok);
     add_type(rhs);
     Node *node = new_binary(ND_SUB, lhs, rhs, tok);
@@ -2353,7 +2368,7 @@ static Node *new_sub(Node *lhs, Node *rhs, Token *tok) {
     return node;
   }
 
-  // ptr - ptr = difference in elements
+  // ptr - ptr = difference in elements (byte difference for function/incomplete bases)
   if (lhs->ty->base && rhs->ty->base) {
     Node *node = new_binary(ND_SUB, lhs, rhs, tok);
     node->ty = ty_long;
@@ -2361,7 +2376,7 @@ static Node *new_sub(Node *lhs, Node *rhs, Token *tok) {
     if (lhs->ty->base->vla_size)
       divisor = new_var_node(lhs->ty->base->vla_size, tok);
     else
-      divisor = new_num(lhs->ty->base->size, tok);
+      divisor = new_num(lhs->ty->base->size ? lhs->ty->base->size : 1, tok);
     return new_binary(ND_DIV, node, divisor, tok);
   }
 
