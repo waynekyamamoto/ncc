@@ -288,3 +288,31 @@
    so crypto/fips.c can define it. drbg/ansi_cprng also reference it.
 */
 #define CONFIG_CRYPTO_FIPS 1
+#define CONFIG_CRYPTO_FIPS_NAME "Linux Kernel Cryptographic API"
+
+/* Targeted single-file unblocks (string/integer kconfig defaults). */
+#define CONFIG_NFS_V4_1_IMPLEMENTATION_ID_DOMAIN "kernel.org"
+#define CONFIG_VGA_ARB_MAX_GPUS 16
+#define CONFIG_PROC_VMCORE 1
+
+/* fs/cifs sub-features (each gates one .c file in fs/cifs/Makefile). */
+#define CONFIG_CIFS_XATTR 1
+#define CONFIG_CIFS_DFS_UPCALL 1
+#define CONFIG_CIFS_SWN_UPCALL 1
+#define CONFIG_CIFS_FSCACHE 1
+#define CONFIG_CIFS_SMB_DIRECT 1
+#define CONFIG_CIFS_ALLOW_INSECURE_LEGACY 1
+/* Underlying fscache infrastructure (gates cache member in netfs_inode). */
+#define CONFIG_FSCACHE 1
+
+/* fs/f2fs sub-features. */
+#define CONFIG_F2FS_FS_COMPRESSION 1
+#define CONFIG_F2FS_STAT_FS 1
+#define CONFIG_F2FS_IOSTAT 1
+
+/* fs/btrfs ref-verify (one .c file gated). */
+#define CONFIG_BTRFS_FS_REF_VERIFY 1
+
+/* drivers/pci IOV (or pci_sriov_configure_simple becomes NULL macro). */
+#define CONFIG_PCI_IOV 1
+#define CONFIG_PCI_P2PDMA 1

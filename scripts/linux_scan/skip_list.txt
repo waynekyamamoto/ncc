@@ -18,6 +18,21 @@ kernel/user-return-notifier.c
 # Old SLAB allocator. arm64 defconfig uses SLUB.
 mm/slab.c
 
+# autoconf has CONFIG_SLOB=1; only one of SLAB/SLUB/SLOB compiles at once.
+mm/slub.c
+
+# Sub-files #include'd into mm/percpu.c — not standalone translation units.
+mm/percpu-vm.c
+
+# x86-only Intel MID platform.
+drivers/pci/pci-mid.c
+
+# Xen-specific (asm/xen/pci.h not on arm64 path).
+drivers/pci/xen-pcifront.c
+
+# Header-style file #include'd into raid1.c and raid10.c.
+drivers/md/raid1-10.c
+
 # clang/gcc-only header arm_neon.h — ncc lacks NEON intrinsics support.
 crypto/aegis128-neon-inner.c
 
@@ -26,6 +41,7 @@ crypto/ecdsa.c
 crypto/ecrdsa.c
 crypto/rsa_helper.c
 crypto/sm2.c
+fs/cifs/asn1.c
 
 # Computed-include `#include TRACE_INCLUDE(TRACE_INCLUDE_FILE)` — GCC extension
 # we don't support. Tracepoint-only files; skip rather than chase.
