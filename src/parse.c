@@ -1547,14 +1547,16 @@ static Token *attribute_list(Token *tok, Type *ty, VarAttr *attr) {
                  equal(tok, "sentinel") || equal(tok, "alloc_size") ||
                  equal(tok, "cleanup") || equal(tok, "nonnull")) {
         tok = tok->next;
-        tok = skip(tok, "(");
-        int level = 1;
-        while (level > 0) {
-          if (equal(tok, "(")) level++;
-          if (equal(tok, ")")) level--;
-          if (level > 0) tok = tok->next;
+        // Args are optional: e.g. `__attribute__((sentinel))` is valid.
+        if (consume(&tok, tok, "(")) {
+          int level = 1;
+          while (level > 0) {
+            if (equal(tok, "(")) level++;
+            if (equal(tok, ")")) level--;
+            if (level > 0) tok = tok->next;
+          }
+          tok = tok->next;
         }
-        tok = tok->next;
       } else {
         // Unknown attribute — skip it and any arguments
         tok = tok->next;
@@ -1730,6 +1732,10 @@ static Type *enum_specifier(Token **rest, Token *tok) {
 
     char *name = strndup_checked(tok->loc, tok->len);
     tok = tok->next;
+
+    // Allow GCC-style __attribute__((...)) on the enumerator (e.g. clang's
+    // CURL_DEPRECATED on libcurl enums). Consume but ignore.
+    tok = attribute_list(tok, NULL, NULL);
 
     if (equal(tok, "=")) {
       val = const_expr_val(&tok, tok->next);
@@ -2902,6 +2908,8 @@ static Node *struct_ref(Node *node, Token *tok) {
 // postfix = "(" type-name ")" "{" initializer-list "}" (compound literal)
 //         | primary ("[" expr "]" | "." ident | "->" ident | "++" | "--")*
 static Node *postfix(Token **rest, Token *tok) {
+  Node *node;
+
   // Compound literal
   if (equal(tok, "(") && is_typename(tok->next)) {
     Token *start = tok;
@@ -2909,19 +2917,19 @@ static Node *postfix(Token **rest, Token *tok) {
     tok = skip(tok, ")");
 
     if (equal(tok, "{")) {
-      // Compound literal
+      // Compound literal — fall through to the postfix-suffix loop so
+      // `(T){...}[i]`, `(T){...}.field`, `(T){...}->field` etc. parse.
       if (scope->next) {
-        // Local scope: create a temp, init it, return its address
         Obj *var = new_lvar("", ty);
-        Node *init = lvar_initializer(rest, tok, var);
-        // The compound literal evaluates to the variable itself
+        Node *init = lvar_initializer(&tok, tok, var);
         Node *ref = new_var_node(var, start);
-        return new_binary(ND_COMMA, init, ref, start);
+        node = new_binary(ND_COMMA, init, ref, start);
+      } else {
+        Obj *var = new_anon_gvar(ty);
+        gvar_initializer(&tok, tok, var);
+        node = new_var_node(var, start);
       }
-
-      Obj *var = new_anon_gvar(ty);
-      gvar_initializer(rest, tok, var);
-      return new_var_node(var, start);
+      goto postfix_suffix;
     }
 
     // It was a cast, not compound literal
@@ -2930,7 +2938,8 @@ static Node *postfix(Token **rest, Token *tok) {
     return cast(rest, start);
   }
 
-  Node *node = primary(&tok, tok);
+  node = primary(&tok, tok);
+postfix_suffix:;
 
   for (;;) {
     // Array/vector subscript
