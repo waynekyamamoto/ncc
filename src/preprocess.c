@@ -426,19 +426,42 @@ static Token *read_const_expr(Token **rest, Token *tok) {
       Token *start = t;
       Token *u = t->next;
       if (u && equal(u, "(")) {
-        // Skip to matching )
+        // Probe the include search path with the argument file name.
+        // Argument is either `"foo.h"` (TK_STR) or `<foo.h>` (a sequence
+        // of tokens between `<` and `>`).
+        char *fname = NULL;
+        Token *arg = u->next;
+        Token *end = arg;
         int level = 1;
-        Token *end = u->next;
         while (end && level > 0) {
           if (equal(end, "(")) level++;
           if (equal(end, ")")) level--;
           if (level > 0) end = end->next;
         }
-        // Replace entire __has_include(...) with 0 (conservative)
+
+        if (arg && arg->kind == TK_STR) {
+          fname = strndup_checked(arg->str, arg->ty->array_len - 1);
+        } else if (arg && equal(arg, "<")) {
+          // Concatenate the loc/len of every token between < and >.
+          int total = 0;
+          for (Token *x = arg->next; x && !equal(x, ">"); x = x->next)
+            total += x->len;
+          char *buf = calloc_checked(total + 1, 1);
+          int pos = 0;
+          for (Token *x = arg->next; x && !equal(x, ">"); x = x->next) {
+            memcpy(buf + pos, x->loc, x->len);
+            pos += x->len;
+          }
+          buf[pos] = 0;
+          fname = buf;
+        }
+
+        int result = (fname && search_include_paths(fname)) ? 1 : 0;
+
         Token *next = end ? end->next : new_eof(start);
         *start = *new_eof(start);
         start->kind = TK_PP_NUM;
-        start->loc = "0";
+        start->loc = result ? "1" : "0";
         start->len = 1;
         start->next = next;
         t = start;
@@ -1305,6 +1328,17 @@ void init_macros(void) {
   define_macro("TARGET_RT_MAC_MACHO", "1");
   define_macro("TARGET_OS_MACCATALYST", "0");
   define_macro("TARGET_OS_DRIVERKIT", "0");
+
+  // Darwin deployment-target predefines that real-world headers gate on.
+  // clang predefines these from the SDK / -mmacosx-version-min; ncc has no
+  // SDK awareness, so pick a modern macOS 14 baseline. Without these,
+  // <Availability.h> / <AvailabilityInternal.h> chains leave platform
+  // predicates undefined and downstream headers pick the wrong code path
+  // (e.g. `stat64` instead of `stat`, PowerPC `__srr0` instead of arm64).
+  define_macro("__MAC_OS_X_VERSION_MIN_REQUIRED", "140000");
+  define_macro("__MAC_OS_X_VERSION_MAX_ALLOWED", "140000");
+  define_macro("__ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__", "140000");
+  define_macro("__ENVIRONMENT_OS_VERSION_MIN_REQUIRED__", "140000");
 
   // GCC compatibility — advertise GCC 12 for modern kernel feature paths
   define_macro("__GNUC__", "12");
