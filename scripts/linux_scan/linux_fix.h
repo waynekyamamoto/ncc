@@ -355,3 +355,8 @@
 /* drivers/scsi top-level — proc + netlink unblock 2 files; rest skip-listed. */
 #define CONFIG_SCSI_PROC_FS 1
 #define CONFIG_SCSI_NETLINK 1
+
+/* fs/fuse + drivers/dma (Phase G additions). */
+#define CONFIG_FUSE_DAX 1
+#define CONFIG_VIRTIO_FS 1
+#define CONFIG_DMA_ACPI 1

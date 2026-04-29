@@ -138,3 +138,28 @@ drivers/ata/pata_rb532_cf.c
 # sound/usb — Makefile-gated and #include'd-only fragments.
 sound/usb/media.c
 sound/usb/mixer_maps.c
+
+# net/netfilter — x86 AVX2; #include'd-only types table.
+net/netfilter/nft_set_pipapo_avx2.c
+net/netfilter/nf_conntrack_h323_types.c
+
+# drivers/watchdog — arch-specific (mips/powerpc/s390/x86/sgi).
+drivers/watchdog/ar7_wdt.c
+drivers/watchdog/booke_wdt.c
+drivers/watchdog/cpwd.c
+drivers/watchdog/diag288_wdt.c
+drivers/watchdog/gef_wdt.c
+drivers/watchdog/geodewdt.c
+drivers/watchdog/indydog.c
+drivers/watchdog/intel-mid_wdt.c
+
+# drivers/rtc — arch-specific.
+drivers/rtc/rtc-au1xxx.c
+drivers/rtc/rtc-cmos.c
+drivers/rtc/rtc-ls1x.c
+drivers/rtc/rtc-mc146818-lib.c
+drivers/rtc/rtc-opal.c
+drivers/rtc/rtc-pic32.c
+
+# drivers/dma — arch-specific.
+drivers/dma/txx9dmac.c
