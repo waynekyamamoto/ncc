@@ -4,13 +4,16 @@
 #include "cc.h"
 #include <libgen.h>
 #include <unistd.h>
+#ifdef __APPLE__
 #include <mach-o/dyld.h>
+#endif
 
 // Global options
 bool opt_fpic = true;     // macOS always uses PIC
 bool opt_fcommon = true;
 bool opt_elf = false;
 char *base_file;
+StringArray global_asm;
 
 static StringArray input_files_list;
 static StringArray tmpfiles;
@@ -186,6 +189,12 @@ static void assemble(char *input, char *output) {
   char *filtered = filter_asm(input);
   StringArray cmd = {};
   strarray_push(&cmd, opt_elf ? "aarch64-elf-as" : "as");
+  if (opt_elf) {
+    // NetBSD source uses ARMv8.1+ system registers (pan, pointer-auth, etc.)
+    // and ARMv8.4-a is the highest level any AARCH64REG_*_INLINE in armreg.h
+    // requires. Tell the assembler to accept the full instruction set.
+    strarray_push(&cmd, "-march=armv8.6-a+sve");
+  }
   strarray_push(&cmd, "-o");
   strarray_push(&cmd, output);
   strarray_push(&cmd, filtered);
@@ -291,8 +300,19 @@ int main(int argc, char **argv) {
   // These must come before user -I paths and system paths.
   {
     char exe_path[1024];
+    bool got_path = false;
+#ifdef __APPLE__
     uint32_t size = sizeof(exe_path);
-    if (_NSGetExecutablePath(exe_path, &size) == 0) {
+    if (_NSGetExecutablePath(exe_path, &size) == 0)
+      got_path = true;
+#else
+    ssize_t n = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+    if (n > 0) {
+      exe_path[n] = '\0';
+      got_path = true;
+    }
+#endif
+    if (got_path) {
       char *dir = dirname(strdup(exe_path));
       add_include_path(format("%s/include", dir));
     }
@@ -372,8 +392,18 @@ int main(int argc, char **argv) {
 
     if (!strcmp(argv[i], "-target")) {
       if (++i >= argc) usage(1);
-      if (!strcmp(argv[i], "elf"))
+      if (!strcmp(argv[i], "elf")) {
         opt_elf = true;
+        define_macro("__ELF__", "1");
+        // Drop macOS-specific predefines — NetBSD/Linux source may take
+        // wrong code paths if it sees __APPLE__ etc.
+        undef_macro("__APPLE__");
+        undef_macro("__MACH__");
+        undef_macro("__DARWIN_C_LEVEL");
+        undef_macro("TARGET_OS_MAC");
+        undef_macro("TARGET_OS_OSX");
+        undef_macro("TARGET_RT_MAC_MACHO");
+      }
       continue;
     }
 
@@ -411,6 +441,8 @@ int main(int argc, char **argv) {
         !strncmp(argv[i], "-std=", 5) ||
         !strncmp(argv[i], "-f", 2) ||
         !strncmp(argv[i], "-m", 2) ||
+        !strcmp(argv[i], "-nostdinc") ||
+        !strncmp(argv[i], "--sysroot=", 10) ||
         !strcmp(argv[i], "-pipe") ||
         !strcmp(argv[i], "-MD") ||
         !strcmp(argv[i], "-MF") ||
