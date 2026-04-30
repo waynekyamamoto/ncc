@@ -18,6 +18,7 @@ static char *opt_o;
 static bool opt_S;  // Output assembly only
 static bool opt_c;  // Compile only, don't link
 static bool opt_E;  // Preprocess only
+static bool opt_dump_tokens;  // -fdump-tokens: print token stream and exit
 
 static void usage(int status) {
   fprintf(stderr, "Usage: ncc [options] <file...>\n");
@@ -26,6 +27,7 @@ static void usage(int status) {
   fprintf(stderr, "  -S           Output assembly\n");
   fprintf(stderr, "  -c           Compile only\n");
   fprintf(stderr, "  -E           Preprocess only\n");
+  fprintf(stderr, "  -fdump-tokens  Dump tokenizer output and exit (validation aid)\n");
   fprintf(stderr, "  -I <dir>     Add include path\n");
   fprintf(stderr, "  -D <macro>   Define macro\n");
   fprintf(stderr, "  -U <macro>   Undefine macro\n");
@@ -233,6 +235,49 @@ static void compile(char *input_path, char *output_path) {
   if (!tok)
     error("%s: %s", input_path, strerror(errno));
 
+  if (opt_dump_tokens) {
+    // Validation aid for Phase 1 (tokenizer swap-out): dump the raw
+    // tokenize() output as a deterministic line-per-token format
+    // that two tokenizer implementations can be diff'd against.
+    // No preprocessing, no -include prepend — just tokenize_file's
+    // output for the named source file.
+    FILE *fp = output_path ? fopen(output_path, "w") : stdout;
+    for (Token *t = tok; ; t = t->next) {
+      static const char *kind_name[] = {
+        "IDENT", "PUNCT", "KEYWORD", "STR", "NUM", "PP_NUM", "EOF",
+      };
+      // offset:len identifies the token's exact source span; line is
+      // included for human readability but is redundant w.r.t. offset.
+      long offset = (t->file && t->loc) ? (long)(t->loc - t->file->contents) : -1;
+      fprintf(fp, "%ld:%d L%d %s",
+              offset, t->len, t->line_no, kind_name[t->kind]);
+      if (t->at_bol) fprintf(fp, " bol");
+      if (t->has_space) fprintf(fp, " sp");
+      // Source spelling (always safe for non-EOF; EOF has len 0)
+      if (t->len > 0)
+        fprintf(fp, " \"%.*s\"", t->len, t->loc);
+      // Numeric value (TK_NUM only; TK_PP_NUM hasn't been resolved
+      // yet at the tokenize layer).
+      if (t->kind == TK_NUM) {
+        if (t->ty && (t->ty->kind == TY_FLOAT || t->ty->kind == TY_DOUBLE
+                      || t->ty->kind == TY_LDOUBLE))
+          fprintf(fp, " fval=%La", t->fval);
+        else
+          fprintf(fp, " val=%lld", (long long)t->val);
+        if (t->ty)
+          fprintf(fp, " ty=%d/sz=%ld/u=%d",
+                  t->ty->kind, (long)t->ty->size, t->ty->is_unsigned);
+      }
+      if (t->kind == TK_STR && t->ty) {
+        fprintf(fp, " strlen=%ld", (long)t->ty->array_len);
+      }
+      fprintf(fp, "\n");
+      if (t->kind == TK_EOF) break;
+    }
+    if (fp != stdout) fclose(fp);
+    return;
+  }
+
   // Prepend -include files (processed first, as if #include'd at top of file)
   for (int j = extra_includes.len - 1; j >= 0; j--) {
     Token *inc = tokenize_file(extra_includes.data[j]);
@@ -316,6 +361,11 @@ int main(int argc, char **argv) {
 
     if (!strcmp(argv[i], "-c")) {
       opt_c = true;
+      continue;
+    }
+
+    if (!strcmp(argv[i], "-fdump-tokens")) {
+      opt_dump_tokens = true;
       continue;
     }
 
@@ -437,8 +487,10 @@ int main(int argc, char **argv) {
 
   base_file = input_files_list.data[0];
 
-  if (opt_E) {
-    // Preprocess only
+  if (opt_E || opt_dump_tokens) {
+    // Preprocess-only / token-dump: compile() short-circuits before
+    // codegen and writes its result (preprocessed text or token stream)
+    // to opt_o or stdout.
     for (int i = 0; i < input_files_list.len; i++)
       compile(input_files_list.data[i], opt_o);
     return 0;
