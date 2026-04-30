@@ -48,6 +48,12 @@ static char *cont_label;
 static Node *current_switch;
 int label_cnt;
 
+// Set while parsing a global initializer.  When a bare identifier inside an
+// initializer fails to resolve, we synthesize a forward-reference placeholder
+// rather than erroring out — the real definition may follow later in the TU
+// (NetBSD's kern_cctr.c uses this pattern with cc_get_timecount).
+static int in_gvar_initializer;
+
 // Nested function support: track captured outer variables
 typedef struct CapturedVar CapturedVar;
 struct CapturedVar {
@@ -3783,6 +3789,23 @@ static Node *primary(Token **rest, Token *tok) {
 
     // Variable or enum constant
     if (!vs || (!vs->var && !vs->enum_ty)) {
+      // Forward reference inside a global initializer: the identifier may
+      // refer to a function (or, less commonly, an object) defined later in
+      // the same TU.  Synthesize a function-typed placeholder Obj so the
+      // initializer parses; the existing relocation machinery (char** label
+      // indirection in write_gvar_data + emit_data) resolves the symbol at
+      // codegen time using the placeholder's `name`, which by then matches
+      // the real definition's exported symbol.
+      if (in_gvar_initializer > 0) {
+        char *name = strndup_checked(tok->loc, tok->len);
+        Type *fty = func_type(ty_int);
+        Obj *ph = new_gvar(name, fty);
+        ph->is_function = true;
+        ph->is_definition = false;
+        ph->is_static = false;
+        *rest = tok->next;
+        return new_var_node(ph, tok);
+      }
       error_tok(tok, "undefined variable '%.*s'", tok->len, tok->loc);
     }
 
@@ -5260,7 +5283,9 @@ static void write_gvar_data(Initializer *init, Type *ty, char *buf, int offset, 
 
 static void gvar_initializer(Token **rest, Token *tok, Obj *var) {
   Initializer *init = new_initializer(var->ty, true);
+  in_gvar_initializer++;
   initializer2(rest, tok, init);
+  in_gvar_initializer--;
 
   // Handle flexible arrays — update the variable's type from the initializer
   if (var->ty->kind == TY_ARRAY && var->ty->array_len < 0) {
