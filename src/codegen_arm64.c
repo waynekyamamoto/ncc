@@ -390,7 +390,12 @@ static void gen_addr(Node *node) {
       println("adrp x0, _%s@GOTPAGE", node->var->name);
       println("ldr x0, [x0, _%s@GOTPAGEOFF]", node->var->name);
     } else {
-      // PC-relative addressing: used for defined vars on Mach-O, and all vars on ELF
+      // PC-relative symbol load via ADRP+ADD. This works during both early
+      // boot (MMU off, code at physical addresses) and normal kernel
+      // operation (MMU on, code at virtual addresses), because the
+      // relocation is computed relative to the current PC. Section flags
+      // ("a", %progbits via emit_data) keep custom sections within ADRP's
+      // ±4 GB page-relative reach.
       if (opt_elf) {
         println("adrp x0, %s", node->var->name);
         println("add x0, x0, :lo12:%s", node->var->name);
@@ -602,6 +607,34 @@ static void count_params(Type *func_ty, int *gp_count, int *fp_count) {
 // - Variadic args are ALL passed on the stack (not in registers)
 // - Stack must be 16-byte aligned before the call
 static void gen_funcall(Node *node) {
+
+  // Mini-inliner: if the callee is a static inline whose body is a single
+  // __asm__ statement, splice the asm in at the call site with input
+  // expressions rebound to the call arguments. This lets literal constants
+  // flow into "n" constraints (NetBSD relies on this for PSTATE writes).
+  if (node->var && node->var->is_asm_inline) {
+    Node *tmpl = node->var->asm_inline_template;
+    Node *args[64];
+    int nargs = 0;
+    for (Node *a = node->args; a; a = a->next) {
+      if (nargs >= 64)
+        error_tok(node->tok, "too many arguments to inlined asm");
+      args[nargs++] = a;
+    }
+    if (nargs != tmpl->asm_num_inputs)
+      error_tok(node->tok,
+                "asm-inline arg count (%d) does not match template inputs (%d)",
+                nargs, tmpl->asm_num_inputs);
+    Node *spliced = calloc_checked(1, sizeof(Node));
+    *spliced = *tmpl;
+    if (nargs > 0) {
+      spliced->asm_input_exprs = calloc_checked(nargs, sizeof(Node *));
+      for (int i = 0; i < nargs; i++)
+        spliced->asm_input_exprs[i] = args[i];
+    }
+    gen_stmt(spliced);
+    return;
+  }
 
   // Emit __sync_* GCC builtins inline (needed for bare-metal ELF where
   // there is no libgcc, but correct on all ARM64 targets).
@@ -1889,8 +1922,12 @@ static void gen_stmt(Node *node) {
     // Constant condition optimization: avoid emitting dead code that
     // references undefined symbols. Case labels inside dead branches
     // are still emitted (they're reachable via switch dispatch).
-    if (node->cond->kind == ND_NUM && is_integer(node->cond->ty)) {
-      if (node->cond->val == 0) {
+    // Use try_eval_node so we also fold !x, ~x, arithmetic — needed for
+    // patterns like `if (!__builtin_constant_p(p))` where the inner
+    // builtin returns ND_NUM but the outer ! isn't folded at parse time.
+    int64_t cond_val;
+    if (try_eval_node(node->cond, &cond_val)) {
+      if (cond_val == 0) {
         int c = label_cnt++;
         println("b Ltmp_end.%d", c);
         gen_stmt_dead(node->then);
@@ -1900,6 +1937,12 @@ static void gen_stmt(Node *node) {
         return;
       } else {
         gen_stmt(node->then);
+        if (node->els) {
+          int c = label_cnt++;
+          println("b Ltmp_end.%d", c);
+          gen_stmt_dead(node->els);
+          printlabel("Ltmp_end.%d:", c);
+        }
         return;
       }
     }
@@ -2446,7 +2489,15 @@ static void emit_data(Obj *prog) {
     }
 
     // Section
-    if (var->init_data) {
+    if (var->section && opt_elf) {
+      // Emit explicit attributes so the linker places the section adjacent
+      // to .data — without "aw",%progbits the assembler treats unknown
+      // section names as their own type and the linker may put them so far
+      // from .text that ADRP relocations overflow (see NetBSD link sets).
+      // Use "a" (alloc, read-only) so link-set sections land near .rodata
+      // and stay within ADRP's ±4 GB page-relative reach from .text.
+      printlabel(".section %s, \"a\", %%progbits", var->section);
+    } else if (var->init_data) {
       printlabel("%s", opt_elf ? ".section .data" : ".section __DATA,__data");
     } else {
       printlabel("%s", opt_elf ? ".section .bss" : ".section __DATA,__bss");
@@ -2509,6 +2560,8 @@ static void emit_text(Obj *prog) {
     // tolower) are inline-only definitions. Emit them as local symbols
     // so they don't override system library implementations, but are
     // still available if called from this compilation unit.
+    if (fn->is_asm_inline)
+      continue;  // body is substituted at every call site
     bool extern_inline = fn->is_inline && fn->is_extern;
     if (hashmap_get(&emitted_fns, fn->name))
       continue;
@@ -2852,13 +2905,6 @@ static void emit_text(Obj *prog) {
 //   (3) `\tldr R, [sp, #N]` immediately followed by `\tstr R, [sp, #N]`
 //       with identical register and offset — drop the str.
 //
-// Plus a pre-pass that collapses ncc's stack-machine push/pop pairs
-// (`str x0, [sp, #-16]!` ... `ldr xN, [sp], #16`) when the destination
-// register isn't read or written between the push and the matching pop:
-// the pair is replaced with `mov xN, x0` hoisted to the push site, or
-// dropped entirely when xN == x0. This is the dominant ncc bloat pattern;
-// a pure-text pass like this catches ~60% of the pairs cleanly.
-//
 // Fences (block pairing for (2)/(3)): any directive line (starts with `.`),
 // any label line (`foo:`), and any branch/return instruction. (1) is text-
 // local and safe across fences.
@@ -3118,9 +3164,14 @@ static bool writes_sp_unknown(const char *line) {
   size_t len;
   const char *tok = first_token(p, &len);
   if (len == 0) return false;
+  // ldr/str to [sp,...] is a memory op, not a write to sp itself
+  // unless it's pre/post-indexed (writeback). Pushes/pops are handled
+  // separately by the caller; treat unrecognized writeback forms as unknown.
   p = tok + len;
   p = skip_ws(p);
   if (!(p[0] == 's' && p[1] == 'p')) return false;
+  // First operand is sp. If this is add/sub sp,sp,#imm we already
+  // handled it; the caller checks parse_sp_arith first.
   return true;
 }
 
@@ -3133,8 +3184,11 @@ static bool instr_uses_reg(const char *line, const char *reg, size_t reglen) {
   size_t len;
   const char *tok = first_token(p, &len);
   if (len == 0) return false;
+  // Skip mnemonic
   p = tok + len;
+  // Scan operand portion for `reg` as a token.
   while (*p && *p != '\n') {
+    // Skip non-token chars
     while (*p && *p != '\n'
            && !((*p >= 'a' && *p <= 'z')
                 || (*p >= 'A' && *p <= 'Z')
@@ -3172,16 +3226,18 @@ static bool is_caller_saved_x(const char *reg, size_t reglen) {
 static bool is_protected_push_reg(const char *reg, size_t reglen) {
   if (reglen == 3 && (reg[0] == 'x' || reg[0] == 'X')
       && reg[1] == '2' && (reg[2] == '9' || reg[2] == '8')) {
+    // x29 (fp) protected. x28 (saved indirect result ptr) also protected
+    // because epilogue restores it via post-indexed pop.
     return true;
   }
   if (reglen == 3 && (reg[0] == 'x' || reg[0] == 'X')
-      && reg[1] == '3' && reg[2] == '0') return true;
+      && reg[1] == '3' && reg[2] == '0') return true;       // x30
   if (reglen == 2 && (reg[0] == 'l' || reg[0] == 'L')
-      && (reg[1] == 'r' || reg[1] == 'R')) return true;
+      && (reg[1] == 'r' || reg[1] == 'R')) return true;     // lr
   if (reglen == 2 && (reg[0] == 'f' || reg[0] == 'F')
-      && (reg[1] == 'p' || reg[1] == 'P')) return true;
+      && (reg[1] == 'p' || reg[1] == 'P')) return true;     // fp
   if (reglen == 2 && (reg[0] == 's' || reg[0] == 'S')
-      && (reg[1] == 'p' || reg[1] == 'P')) return true;
+      && (reg[1] == 'p' || reg[1] == 'P')) return true;     // sp
   return false;
 }
 
@@ -3236,13 +3292,19 @@ static char *peephole(const char *in, size_t *out_removed) {
     size_t srclen;
     if (!is_push_line(scratch, &src, &srclen)) continue;
     if (is_protected_push_reg(src, srclen)) continue;
+    // Only optimize 64-bit pushes (xN). Skip wN/dN/sN/qN forms.
     if (srclen < 2 || (src[0] != 'x' && src[0] != 'X')) continue;
 
+    // Snapshot src token into a local buffer (pointer would be invalidated
+    // if buf got reallocated, but here it's into scratch which is reused).
     char src_buf[16];
     if (srclen >= sizeof(src_buf)) continue;
     memcpy(src_buf, src, srclen);
     src_buf[srclen] = '\0';
 
+    // Walk forward, tracking sp delta from BEFORE the push: starts at -16
+    // (the push lowered sp by 16). Matching pop is the one that brings
+    // delta back to 0.
     long delta = -16;
     size_t j = i + 1;
     size_t scanned = 0;
@@ -3262,16 +3324,19 @@ static char *peephole(const char *in, size_t *out_removed) {
         break;
       }
 
+      // Pop?
       const char *pr;
       size_t prl;
       long poff;
       if (is_pop_line(tmp, &pr, &prl, &poff)) {
         delta += poff;
         if (delta == 0) {
+          // Matching pop — record dst.
           if (prl >= sizeof(dst_buf)) { aborted = true; break; }
           memcpy(dst_buf, pr, prl);
           dst_buf[prl] = '\0';
           dstlen = prl;
+          // Also require 64-bit (xN) destination for the same reason as src.
           if (dstlen < 2 || (dst_buf[0] != 'x' && dst_buf[0] != 'X')) {
             aborted = true; break;
           }
@@ -3281,6 +3346,7 @@ static char *peephole(const char *in, size_t *out_removed) {
         continue;
       }
 
+      // Nested push?
       const char *npr;
       size_t nprl;
       if (is_push_line(tmp, &npr, &nprl)) {
@@ -3288,20 +3354,30 @@ static char *peephole(const char *in, size_t *out_removed) {
         continue;
       }
 
+      // sp arithmetic with small imm?
       long imm;
       int sign;
       if (parse_sp_arith(tmp, &imm, &sign)) {
         delta += sign * imm;
-        if (delta > 0) { aborted = true; break; }
+        if (delta > 0) { aborted = true; break; } // sp went above push level
         continue;
       }
 
+      // Any other write to sp -> give up.
       if (writes_sp_unknown(tmp)) { aborted = true; break; }
     }
 
     if (!found || aborted) continue;
     if (j <= i) continue;
 
+    // Safety scan: between i+1 and j-1, ensure dst is neither read nor
+    // written. The conservative `instr_uses_reg` flags any mention. If
+    // dst == src, we drop both push and pop without inserting a mov, so the
+    // safety condition is just that src is not written in the range — but
+    // since `instr_uses_reg` catches reads too, we'd be too strict. Use the
+    // same predicate anyway: it's a safe over-approximation, and most
+    // dst==src cases ncc emits really do not touch the register between
+    // push and pop in any way our predicate detects.
     bool dst_eq_src = (dstlen == srclen
                        && strncasecmp(dst_buf, src_buf, dstlen) == 0);
 
@@ -3313,6 +3389,8 @@ static char *peephole(const char *in, size_t *out_removed) {
       if (instr_uses_reg(tmp, dst_buf, dstlen)) {
         dst_touched = true; break;
       }
+      // bl/blr clobbers x0..x18, x30 — treat as a touch on dst if dst is
+      // caller-saved.
       if (is_call_line(tmp)) {
         if (is_caller_saved_x(dst_buf, dstlen)
             || (dstlen == 3 && (dst_buf[0] == 'x' || dst_buf[0] == 'X')
@@ -3323,12 +3401,15 @@ static char *peephole(const char *in, size_t *out_removed) {
     }
     if (dst_touched) continue;
 
+    // Commit: drop push (line i) and pop (line j). If dst != src, replace
+    // the push with `\tmov dst, src\n`.
     if (dst_eq_src) {
       keep[i] = false;
       keep[j] = false;
       removed += 2;
     } else {
       char *rep = malloc(srclen + dstlen + 16);
+      // Format: "\tmov <dst>, <src>\n"
       memcpy(rep, "\tmov ", 5);
       size_t off2 = 5;
       memcpy(rep + off2, dst_buf, dstlen); off2 += dstlen;
@@ -3339,10 +3420,11 @@ static char *peephole(const char *in, size_t *out_removed) {
       rep[off2] = '\0';
       replacement[i] = rep;
       keep[j] = false;
-      removed += 1;
+      removed += 1; // net: we replace push with mov, drop pop
     }
   }
 
+  // Helper: load line[i], honoring replacement[i] if set.
   #define LOAD_EFFECTIVE(i, buf) do {                             \
       if (replacement[i]) {                                       \
         size_t L = strlen(replacement[i]);                        \
@@ -3435,10 +3517,28 @@ static char *peephole(const char *in, size_t *out_removed) {
   return out;
 }
 
+// Detect static inline functions whose body is a single __asm__ statement
+// and whose return type is void. Such functions can be substituted at the
+// call site, which lets compile-time-constant call arguments flow into "n"
+// (immediate) constraints — exactly the pattern NetBSD uses for PSTATE
+// writes (msr daifset, %0 :: "n"(val)).
+static void mark_asm_inline_funcs(Obj *prog) {
+  for (Obj *fn = prog; fn; fn = fn->next) {
+    if (!fn->is_function || !fn->is_definition) continue;
+    if (!fn->is_inline || !fn->is_static) continue;
+    if (!fn->ty || fn->ty->return_ty->kind != TY_VOID) continue;
+    if (!fn->body || fn->body->kind != ND_BLOCK) continue;
+    Node *stmt = fn->body->body;
+    if (!stmt || stmt->next) continue;          // exactly one statement
+    if (stmt->kind != ND_ASM) continue;
+    fn->is_asm_inline = true;
+    fn->asm_inline_template = stmt;
+  }
+}
+
 void codegen(Obj *prog, FILE *out) {
   // Emit into a memory stream so a peephole pass can scrub redundant
-  // patterns (no-op moves, str/ldr round-trips on the same stack slot,
-  // stack-machine push/pop pairs that bracket subexpression evaluation)
+  // patterns (no-op moves, str/ldr round-trips on the same stack slot)
   // before the cleaned text is written to the real output file.
   char *buf = NULL;
   size_t buflen = 0;
@@ -3446,6 +3546,9 @@ void codegen(Obj *prog, FILE *out) {
   if (!mem) {
     // Fallback: emit straight to `out` if memstream isn't available.
     output_file = out;
+    mark_asm_inline_funcs(prog);
+    for (int i = 0; i < global_asm.len; i++)
+      println("%s", global_asm.data[i]);
     emit_data(prog);
     emit_text(prog);
     if (!opt_elf) {
@@ -3456,6 +3559,16 @@ void codegen(Obj *prog, FILE *out) {
   }
   output_file = mem;
 
+  mark_asm_inline_funcs(prog);
+
+  // Emit file-scope __asm("...") directives first so any aliases /
+  // .weak / .global declarations they set up land before any defs that
+  // reference them.
+  for (int i = 0; i < global_asm.len; i++) {
+    println("%s", global_asm.data[i]);
+  }
+
+  // Emit assembly
   emit_data(prog);
   emit_text(prog);
 

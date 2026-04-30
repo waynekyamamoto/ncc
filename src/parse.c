@@ -477,6 +477,7 @@ typedef struct {
   int align;
   int vector_size;  // __attribute__((vector_size(N)))
   char *alias_target; // __attribute__((alias("name")))
+  char *section_name; // __attribute__((section("name")))
   int mode_kind;    // __attribute__((mode(X))): 1=QI, 2=HI, 4=SI, 8=DI
 } VarAttr;
 
@@ -1467,9 +1468,19 @@ static Token *attribute_list(Token *tok, Type *ty, VarAttr *attr) {
       } else if (equal(tok, "section") || equal(tok, "__section__")) {
         tok = tok->next;
         tok = skip(tok, "(");
-        // Skip all tokens until closing ')' (handles string concat like SEG_DATA ",PyRuntime")
-        while (!equal(tok, ")"))
+        // Capture the section name (concatenated string literals).
+        int total = 0;
+        for (Token *t = tok; t->kind == TK_STR; t = t->next)
+          total += t->ty->array_len - 1;  // drop trailing NUL
+        char *name = calloc_checked(total + 1, 1);
+        int off = 0;
+        while (tok->kind == TK_STR) {
+          int slen = tok->ty->array_len - 1;
+          memcpy(name + off, tok->str, slen);
+          off += slen;
           tok = tok->next;
+        }
+        if (attr) attr->section_name = name;
         tok = skip(tok, ")");
       } else if (equal(tok, "visibility")) {
         tok = tok->next;
@@ -1489,7 +1500,23 @@ static Token *attribute_list(Token *tok, Type *ty, VarAttr *attr) {
                  equal(tok, "flatten") || equal(tok, "constructor") ||
                  equal(tok, "destructor") ||
                  equal(tok, "transparent_union") ||
-                 equal(tok, "returns_nonnull")) {
+                 equal(tok, "returns_nonnull") ||
+                 // GCC/clang attributes that ncc treats as no-ops.
+                 // target: per-function arch override (armreg.h pattern).
+                 // pcs: ARM AAPCS calling convention selector.
+                 // neon_vector_type: NEON vector type marker.
+                 // no_sanitize: KASAN/KUBSAN/etc. sanitizer-skip.
+                 equal(tok, "target") || equal(tok, "__target__") ||
+                 equal(tok, "pcs") || equal(tok, "__pcs__") ||
+                 equal(tok, "neon_vector_type") ||
+                 equal(tok, "__neon_vector_type__") ||
+                 equal(tok, "no_sanitize") ||
+                 equal(tok, "__no_sanitize__") ||
+                 equal(tok, "no_sanitize_address") ||
+                 equal(tok, "no_sanitize_thread") ||
+                 equal(tok, "no_sanitize_undefined") ||
+                 equal(tok, "no_instrument_function") ||
+                 equal(tok, "__no_instrument_function__")) {
         tok = tok->next;
         // Some attrs take arguments
         if (consume(&tok, tok, "(")) {
@@ -2882,35 +2909,38 @@ static Node *struct_ref(Node *node, Token *tok) {
 // postfix = "(" type-name ")" "{" initializer-list "}" (compound literal)
 //         | primary ("[" expr "]" | "." ident | "->" ident | "++" | "--")*
 static Node *postfix(Token **rest, Token *tok) {
-  // Compound literal
+  Node *node;
+  // Compound literal: (type){...}. Followed-by suffixes (e.g. `._t`,
+  // `[i]`, `->m`) must run through the postfix-suffix loop below, so we
+  // produce the literal as `node` and fall through rather than returning.
   if (equal(tok, "(") && is_typename(tok->next)) {
     Token *start = tok;
     Type *ty = typename_(&tok, tok->next);
     tok = skip(tok, ")");
 
     if (equal(tok, "{")) {
-      // Compound literal
       if (scope->next) {
-        // Local scope: create a temp, init it, return its address
+        // Local scope: create a temp, init it, value is the variable.
         Obj *var = new_lvar("", ty);
-        Node *init = lvar_initializer(rest, tok, var);
-        // The compound literal evaluates to the variable itself
+        Node *init = lvar_initializer(&tok, tok, var);
         Node *ref = new_var_node(var, start);
-        return new_binary(ND_COMMA, init, ref, start);
+        node = new_binary(ND_COMMA, init, ref, start);
+      } else {
+        Obj *var = new_anon_gvar(ty);
+        gvar_initializer(&tok, tok, var);
+        node = new_var_node(var, start);
       }
-
-      Obj *var = new_anon_gvar(ty);
-      gvar_initializer(rest, tok, var);
-      return new_var_node(var, start);
+      goto postfix_suffix_loop;
     }
 
-    // It was a cast, not compound literal
-    // Reparse
+    // It was a cast, not a compound literal — reparse.
     *rest = start;
     return cast(rest, start);
   }
 
-  Node *node = primary(&tok, tok);
+  node = primary(&tok, tok);
+
+postfix_suffix_loop:;
 
   for (;;) {
     // Array/vector subscript
@@ -4189,7 +4219,7 @@ static Node *stmt(Token **rest, Token *tok) {
   }
 
   // ASM
-  if (equal(tok, "asm") || equal(tok, "__asm__")) {
+  if (equal(tok, "asm") || equal(tok, "__asm__") || equal(tok, "__asm")) {
     Node *node = new_node(ND_ASM, tok);
     tok = tok->next;
     // Skip any combination of qualifiers: volatile, __volatile__, inline, goto
@@ -4511,6 +4541,8 @@ static Node *declaration(Token **rest, Token *tok, Type *basety, VarAttr *attr) 
       // Static local variable → global with mangled name
       Obj *var = new_anon_gvar(ty);
       push_scope(strndup_checked(ty->name->loc, ty->name->len))->var = var;
+      if (attr->section_name)
+        var->section = attr->section_name;
       if (equal(tok, "="))
         gvar_initializer(&tok, tok->next, var);
       continue;
@@ -5489,6 +5521,30 @@ Obj *parse(Token *tok) {
       continue;
     }
 
+    // File-scope __asm("...") — emit assembler directives verbatim.
+    // NetBSD uses this for __strong_alias / __weak_alias, e.g.
+    //   __asm(".global mutex_spin_enter\nmutex_spin_enter = mutex_vector_enter");
+    if (equal(tok, "asm") || equal(tok, "__asm__") || equal(tok, "__asm")) {
+      tok = tok->next;
+      tok = skip(tok, "(");
+      // Concatenate string literal arguments.
+      int total = 0;
+      for (Token *t = tok; t->kind == TK_STR; t = t->next)
+        total += t->ty->array_len - 1;
+      char *buf = calloc_checked(total + 1, 1);
+      int off = 0;
+      while (tok->kind == TK_STR) {
+        int slen = tok->ty->array_len - 1;
+        memcpy(buf + off, tok->str, slen);
+        off += slen;
+        tok = tok->next;
+      }
+      tok = skip(tok, ")");
+      consume(&tok, tok, ";");
+      strarray_push(&global_asm, buf);
+      continue;
+    }
+
     // _Static_assert at file scope
     if (equal(tok, "_Static_assert") || equal(tok, "static_assert")) {
       tok = skip(tok->next, "(");
@@ -6045,6 +6101,8 @@ static Token *global_variable(Token *tok, Type *ty, Type *basety, VarAttr *attr)
       var->alias_target = attr->alias_target;
       var->is_definition = true;
     }
+    if (attr->section_name)
+      var->section = attr->section_name;
 
     if (equal(tok, "=")) {
       var->is_definition = true; // has initializer → is definition even if extern
