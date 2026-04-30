@@ -2782,9 +2782,21 @@ static void emit_text(Obj *prog) {
 
     // Save variadic argument area pointer
     if (fn->is_variadic && fn->va_area) {
-      // On Apple ARM64, variadic args are on the caller's stack.
-      // After our prologue (stp x29,x30,[sp,#-16]!; mov x29,sp; sub sp,sp,#N),
-      // the caller's variadic args are at x29+16.
+      // On Apple ARM64 / AAPCS64-stack-only-vararg, variadic args are on
+      // the caller's stack AFTER any named args that overflowed the
+      // register slots.  After our prologue, the caller's stack starts
+      // at x29+16 (just past the saved fp/lr).  When a function has more
+      // than 8 GP-passable named params (or more than 8 FP-passable),
+      // the overflow named args occupy stack slots BEFORE the variadic
+      // args.  Each overflow slot is 8 bytes.  Account for that here, or
+      // va_arg will read named args back as if they were variadic — which
+      // is exactly what NetBSD's sysctl_createv (12 named ints + vararg)
+      // exposed: variadic-name accumulation read named args 9..12 and
+      // mistook them for the CTL_KERN/CTL_EOL path, blowing up boot.
+      int gp_overflow = (gp > 8) ? (gp - 8) : 0;
+      int fp_overflow = (fp > 8) ? (fp - 8) : 0;
+      int va_caller_off = 16 + (gp_overflow + fp_overflow) * 8;
+
       int off = fn->va_area->offset;
       if (off < 0 && -off <= 4095) {
         println("sub x9, x29, #%d", -off);
@@ -2797,7 +2809,12 @@ static void emit_text(Obj *prog) {
         load_imm("x9", (uint64_t)off);
         println("add x9, x29, x9");
       }
-      println("add x10, x29, #16");
+      if (va_caller_off <= 4095) {
+        println("add x10, x29, #%d", va_caller_off);
+      } else {
+        load_imm("x10", (uint64_t)va_caller_off);
+        println("add x10, x29, x10");
+      }
       println("str x10, [x9]");
     }
 
