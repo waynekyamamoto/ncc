@@ -2842,10 +2842,620 @@ static void emit_text(Obj *prog) {
 // Main codegen entry point
 //
 
-void codegen(Obj *prog, FILE *out) {
-  output_file = out;
+// ---------------------------------------------------------------------------
+// Peephole optimizer
+//
+// Operates on the emitted assembly text line-by-line. Three patterns:
+//   (1) `\tmov <reg>, <reg>` (same register) — drop unconditionally.
+//   (2) `\tstr R, [sp, #N]` immediately followed by `\tldr R, [sp, #N]`
+//       with identical register and offset — drop the ldr.
+//   (3) `\tldr R, [sp, #N]` immediately followed by `\tstr R, [sp, #N]`
+//       with identical register and offset — drop the str.
+//
+// Plus a pre-pass that collapses ncc's stack-machine push/pop pairs
+// (`str x0, [sp, #-16]!` ... `ldr xN, [sp], #16`) when the destination
+// register isn't read or written between the push and the matching pop:
+// the pair is replaced with `mov xN, x0` hoisted to the push site, or
+// dropped entirely when xN == x0. This is the dominant ncc bloat pattern;
+// a pure-text pass like this catches ~60% of the pairs cleanly.
+//
+// Fences (block pairing for (2)/(3)): any directive line (starts with `.`),
+// any label line (`foo:`), and any branch/return instruction. (1) is text-
+// local and safe across fences.
+// ---------------------------------------------------------------------------
 
-  // Emit assembly
+static const char *skip_ws(const char *s) {
+  while (*s == ' ' || *s == '\t') s++;
+  return s;
+}
+
+// Return pointer to start of first non-whitespace token; *len gets its length.
+static const char *first_token(const char *line, size_t *len) {
+  const char *p = skip_ws(line);
+  const char *q = p;
+  while (*q && *q != ' ' && *q != '\t' && *q != ',' && *q != '\n') q++;
+  *len = (size_t)(q - p);
+  return p;
+}
+
+static bool tok_eq(const char *p, size_t len, const char *s) {
+  return strlen(s) == len && strncasecmp(p, s, len) == 0;
+}
+
+// Is this a label line? Heuristic: contains a ':' such that everything before
+// ':' is an identifier-ish blob and everything after the ':' on the line is
+// only whitespace or a comment. We're conservative.
+static bool is_label_line(const char *line) {
+  const char *p = skip_ws(line);
+  const char *q = p;
+  while (*q && *q != ':' && *q != ' ' && *q != '\t' && *q != '\n') q++;
+  if (*q != ':') return false;
+  q++;
+  while (*q == ' ' || *q == '\t') q++;
+  return *q == '\0' || *q == '\n' || *q == '/' || *q == '#';
+}
+
+static bool is_directive_line(const char *line) {
+  const char *p = skip_ws(line);
+  return *p == '.';
+}
+
+// Is this a branch/return — fences pattern (2)/(3).
+static bool is_branch_line(const char *line) {
+  size_t len;
+  const char *tok = first_token(line, &len);
+  if (len == 0) return false;
+  if (tok_eq(tok, len, "ret")) return true;
+  if (tok_eq(tok, len, "br"))  return true;
+  if (tok_eq(tok, len, "blr")) return true;
+  if (tok_eq(tok, len, "b"))   return true;
+  if (tok_eq(tok, len, "bl"))  return true;
+  if (tok_eq(tok, len, "cbz")) return true;
+  if (tok_eq(tok, len, "cbnz"))return true;
+  if (tok_eq(tok, len, "tbz")) return true;
+  if (tok_eq(tok, len, "tbnz"))return true;
+  if (len >= 3 && (tok[0] == 'b' || tok[0] == 'B') && tok[1] == '.')
+    return true;
+  return false;
+}
+
+// Match `\tmov <reg>, <reg>` where both registers are textually identical.
+static bool is_redundant_mov(const char *line) {
+  if (line[0] != '\t') return false;
+  const char *p = line + 1;
+  size_t len;
+  const char *tok = first_token(p, &len);
+  if (!tok_eq(tok, len, "mov")) return false;
+  p = tok + len;
+  p = skip_ws(p);
+  const char *r1 = p;
+  while (*p && *p != ',' && *p != ' ' && *p != '\t' && *p != '\n') p++;
+  size_t r1len = (size_t)(p - r1);
+  if (r1len == 0) return false;
+  while (*p == ' ' || *p == '\t' || *p == ',') p++;
+  const char *r2 = p;
+  while (*p && *p != ',' && *p != ' ' && *p != '\t' && *p != '\n') p++;
+  size_t r2len = (size_t)(p - r2);
+  if (r2len == 0) return false;
+  while (*p == ' ' || *p == '\t') p++;
+  if (*p != '\0' && *p != '\n' && *p != '/' && *p != '#') return false;
+  if (r1len != r2len) return false;
+  return strncasecmp(r1, r2, r1len) == 0;
+}
+
+// Parse a `\t<op> <reg>, [sp, #<N>]` line. Refuses pre/post-indexed forms
+// (`!` writeback or `[sp], #N` post-index) — those mutate sp.
+static bool parse_mem_op(const char *line, const char *expected_op,
+                         const char **reg, size_t *reglen, long *off) {
+  if (line[0] != '\t') return false;
+  const char *p = line + 1;
+  size_t len;
+  const char *tok = first_token(p, &len);
+  if (!tok_eq(tok, len, expected_op)) return false;
+  p = tok + len;
+  p = skip_ws(p);
+  *reg = p;
+  while (*p && *p != ',' && *p != ' ' && *p != '\t' && *p != '\n') p++;
+  *reglen = (size_t)(p - *reg);
+  if (*reglen == 0) return false;
+  while (*p == ' ' || *p == '\t' || *p == ',') p++;
+  if (*p != '[') return false;
+  p++;
+  p = skip_ws(p);
+  if (!(p[0] == 's' && p[1] == 'p')) return false;
+  p += 2;
+  p = skip_ws(p);
+  if (*p != ',') return false;
+  p++;
+  p = skip_ws(p);
+  if (*p != '#') return false;
+  p++;
+  char *endp;
+  long v = strtol(p, &endp, 0);
+  if (endp == p) return false;
+  p = endp;
+  p = skip_ws(p);
+  if (*p != ']') return false;
+  p++;
+  if (*p == '!') return false;
+  while (*p == ' ' || *p == '\t') p++;
+  if (*p != '\0' && *p != '\n' && *p != '/' && *p != '#') return false;
+  *off = v;
+  return true;
+}
+
+// Parse `\tstr <reg>, [sp, #-16]!` push form. Returns true on match and
+// fills *reg/*reglen with the register token.
+static bool is_push_line(const char *line, const char **reg, size_t *reglen) {
+  if (line[0] != '\t') return false;
+  const char *p = line + 1;
+  size_t len;
+  const char *tok = first_token(p, &len);
+  if (!tok_eq(tok, len, "str")) return false;
+  p = tok + len;
+  p = skip_ws(p);
+  *reg = p;
+  while (*p && *p != ',' && *p != ' ' && *p != '\t' && *p != '\n') p++;
+  *reglen = (size_t)(p - *reg);
+  if (*reglen == 0) return false;
+  while (*p == ' ' || *p == '\t' || *p == ',') p++;
+  if (*p != '[') return false;
+  p++;
+  p = skip_ws(p);
+  if (!(p[0] == 's' && p[1] == 'p')) return false;
+  p += 2;
+  p = skip_ws(p);
+  if (*p != ',') return false;
+  p++;
+  p = skip_ws(p);
+  if (*p != '#') return false;
+  p++;
+  if (*p != '-') return false;
+  p++;
+  char *endp;
+  long v = strtol(p, &endp, 0);
+  if (endp == p) return false;
+  if (v != 16) return false;
+  p = endp;
+  p = skip_ws(p);
+  if (*p != ']') return false;
+  p++;
+  if (*p != '!') return false;
+  return true;
+}
+
+// Parse `\tldr <reg>, [sp], #N` post-indexed pop. Returns true on match,
+// fills *reg/*reglen and *off (the post-increment, e.g. 16).
+static bool is_pop_line(const char *line, const char **reg, size_t *reglen,
+                        long *off) {
+  if (line[0] != '\t') return false;
+  const char *p = line + 1;
+  size_t len;
+  const char *tok = first_token(p, &len);
+  if (!tok_eq(tok, len, "ldr")) return false;
+  p = tok + len;
+  p = skip_ws(p);
+  *reg = p;
+  while (*p && *p != ',' && *p != ' ' && *p != '\t' && *p != '\n') p++;
+  *reglen = (size_t)(p - *reg);
+  if (*reglen == 0) return false;
+  while (*p == ' ' || *p == '\t' || *p == ',') p++;
+  if (*p != '[') return false;
+  p++;
+  p = skip_ws(p);
+  if (!(p[0] == 's' && p[1] == 'p')) return false;
+  p += 2;
+  p = skip_ws(p);
+  if (*p != ']') return false;
+  p++;
+  p = skip_ws(p);
+  if (*p != ',') return false;
+  p++;
+  p = skip_ws(p);
+  if (*p != '#') return false;
+  p++;
+  char *endp;
+  long v = strtol(p, &endp, 0);
+  if (endp == p) return false;
+  *off = v;
+  return true;
+}
+
+// Match `\tbl ...` or `\tblr ...`.
+static bool is_call_line(const char *line) {
+  if (line[0] != '\t') return false;
+  const char *p = line + 1;
+  size_t len;
+  const char *tok = first_token(p, &len);
+  if (tok_eq(tok, len, "bl")) return true;
+  if (tok_eq(tok, len, "blr")) return true;
+  return false;
+}
+
+// Match `\tadd sp, sp, #N` (out_sign=+1) or `\tsub sp, sp, #N` (out_sign=-1)
+// with a small immediate. Returns true and stores N>0 in *imm. *out_sign is
+// set to +1 for add, -1 for sub.
+static bool parse_sp_arith(const char *line, long *imm, int *out_sign) {
+  if (line[0] != '\t') return false;
+  const char *p = line + 1;
+  size_t len;
+  const char *tok = first_token(p, &len);
+  int sign;
+  if (tok_eq(tok, len, "add")) sign = +1;
+  else if (tok_eq(tok, len, "sub")) sign = -1;
+  else return false;
+  p = tok + len;
+  p = skip_ws(p);
+  if (!(p[0] == 's' && p[1] == 'p')) return false;
+  p += 2;
+  p = skip_ws(p);
+  if (*p != ',') return false;
+  p++;
+  p = skip_ws(p);
+  if (!(p[0] == 's' && p[1] == 'p')) return false;
+  p += 2;
+  p = skip_ws(p);
+  if (*p != ',') return false;
+  p++;
+  p = skip_ws(p);
+  if (*p != '#') return false;
+  p++;
+  char *endp;
+  long v = strtol(p, &endp, 0);
+  if (endp == p) return false;
+  if (v < 0) return false;
+  *imm = v;
+  *out_sign = sign;
+  return true;
+}
+
+// Detect any other write to sp not covered above (e.g. `mov sp, ...`,
+// `add sp, sp, x9`). Conservative: any instruction whose first operand is
+// `sp` and that isn't a recognized small-imm sp arithmetic.
+static bool writes_sp_unknown(const char *line) {
+  if (line[0] != '\t') return false;
+  const char *p = line + 1;
+  size_t len;
+  const char *tok = first_token(p, &len);
+  if (len == 0) return false;
+  p = tok + len;
+  p = skip_ws(p);
+  if (!(p[0] == 's' && p[1] == 'p')) return false;
+  return true;
+}
+
+// Conservative check: does instruction `line` mention register token `reg`
+// (length `reglen`) anywhere in its operand portion? Used as both read and
+// write detection — over-approximates by treating any mention as a use.
+static bool instr_uses_reg(const char *line, const char *reg, size_t reglen) {
+  if (line[0] != '\t') return false;
+  const char *p = line + 1;
+  size_t len;
+  const char *tok = first_token(p, &len);
+  if (len == 0) return false;
+  p = tok + len;
+  while (*p && *p != '\n') {
+    while (*p && *p != '\n'
+           && !((*p >= 'a' && *p <= 'z')
+                || (*p >= 'A' && *p <= 'Z')
+                || (*p >= '0' && *p <= '9')
+                || *p == '_' || *p == '.')) {
+      p++;
+    }
+    if (!*p || *p == '\n') break;
+    const char *t = p;
+    while (*p && ((*p >= 'a' && *p <= 'z')
+                  || (*p >= 'A' && *p <= 'Z')
+                  || (*p >= '0' && *p <= '9')
+                  || *p == '_' || *p == '.')) {
+      p++;
+    }
+    size_t tl = (size_t)(p - t);
+    if (tl == reglen && strncasecmp(t, reg, reglen) == 0) return true;
+  }
+  return false;
+}
+
+// Is `reg`/`reglen` one of x0..x18 (caller-saved on AAPCS64)?
+static bool is_caller_saved_x(const char *reg, size_t reglen) {
+  if (reglen < 2 || reglen > 3) return false;
+  if (reg[0] != 'x' && reg[0] != 'X') return false;
+  long n = 0;
+  for (size_t k = 1; k < reglen; k++) {
+    if (reg[k] < '0' || reg[k] > '9') return false;
+    n = n * 10 + (reg[k] - '0');
+  }
+  return n >= 0 && n <= 18;
+}
+
+// Refuse to optimize pushes of these — they belong to prologue/epilogue.
+static bool is_protected_push_reg(const char *reg, size_t reglen) {
+  if (reglen == 3 && (reg[0] == 'x' || reg[0] == 'X')
+      && reg[1] == '2' && (reg[2] == '9' || reg[2] == '8')) {
+    return true;
+  }
+  if (reglen == 3 && (reg[0] == 'x' || reg[0] == 'X')
+      && reg[1] == '3' && reg[2] == '0') return true;
+  if (reglen == 2 && (reg[0] == 'l' || reg[0] == 'L')
+      && (reg[1] == 'r' || reg[1] == 'R')) return true;
+  if (reglen == 2 && (reg[0] == 'f' || reg[0] == 'F')
+      && (reg[1] == 'p' || reg[1] == 'P')) return true;
+  if (reglen == 2 && (reg[0] == 's' || reg[0] == 'S')
+      && (reg[1] == 'p' || reg[1] == 'P')) return true;
+  return false;
+}
+
+// Run peephole over `in`, return malloc'd cleaned text. Caller frees.
+static char *peephole(const char *in, size_t *out_removed) {
+  size_t cap = 1024, n = 0;
+  const char **lines = malloc(cap * sizeof(*lines));
+  size_t *lens = malloc(cap * sizeof(*lens));
+  if (!lines || !lens) { free(lines); free(lens); return strdup(in); }
+  const char *p = in;
+  while (*p) {
+    const char *q = strchr(p, '\n');
+    size_t L = q ? (size_t)(q - p) + 1 : strlen(p);
+    if (n == cap) {
+      cap *= 2;
+      lines = realloc(lines, cap * sizeof(*lines));
+      lens  = realloc(lens,  cap * sizeof(*lens));
+    }
+    lines[n] = p;
+    lens[n]  = L;
+    n++;
+    if (!q) break;
+    p = q + 1;
+  }
+
+  bool *keep = malloc(n * sizeof(*keep));
+  char **replacement = malloc(n * sizeof(*replacement));
+  for (size_t i = 0; i < n; i++) { keep[i] = true; replacement[i] = NULL; }
+
+  size_t removed = 0;
+
+  char scratch[512];
+  #define LOAD_LINE(i, buf) do {                                  \
+      size_t L = lens[i];                                         \
+      if (L >= sizeof(buf)) L = sizeof(buf) - 1;                  \
+      memcpy(buf, lines[i], L);                                   \
+      buf[L] = '\0';                                              \
+    } while (0)
+
+  // Pass 1: collapse stack-machine push/pop pairs.
+  //
+  // ncc's expression codegen pushes x0 to the stack, evaluates a sibling
+  // subexpression that clobbers x0, then pops the saved value into a
+  // different register. The push/pop is unnecessary if no code between the
+  // push and the matching pop reads or writes the pop's destination
+  // register: we can hoist a `mov dst, src` to right after the push and
+  // delete the pair.
+  for (size_t i = 0; i < n; i++) {
+    if (!keep[i]) continue;
+    LOAD_LINE(i, scratch);
+    const char *src;
+    size_t srclen;
+    if (!is_push_line(scratch, &src, &srclen)) continue;
+    if (is_protected_push_reg(src, srclen)) continue;
+    if (srclen < 2 || (src[0] != 'x' && src[0] != 'X')) continue;
+
+    char src_buf[16];
+    if (srclen >= sizeof(src_buf)) continue;
+    memcpy(src_buf, src, srclen);
+    src_buf[srclen] = '\0';
+
+    long delta = -16;
+    size_t j = i + 1;
+    size_t scanned = 0;
+    bool aborted = false;
+    bool found = false;
+    char dst_buf[16];
+    size_t dstlen = 0;
+    for (; j < n && scanned < 200; j++) {
+      if (!keep[j]) continue;
+      scanned++;
+      char tmp[512];
+      LOAD_LINE(j, tmp);
+
+      if (is_label_line(tmp) || is_directive_line(tmp)
+          || is_branch_line(tmp)) {
+        aborted = true;
+        break;
+      }
+
+      const char *pr;
+      size_t prl;
+      long poff;
+      if (is_pop_line(tmp, &pr, &prl, &poff)) {
+        delta += poff;
+        if (delta == 0) {
+          if (prl >= sizeof(dst_buf)) { aborted = true; break; }
+          memcpy(dst_buf, pr, prl);
+          dst_buf[prl] = '\0';
+          dstlen = prl;
+          if (dstlen < 2 || (dst_buf[0] != 'x' && dst_buf[0] != 'X')) {
+            aborted = true; break;
+          }
+          found = true;
+          break;
+        }
+        continue;
+      }
+
+      const char *npr;
+      size_t nprl;
+      if (is_push_line(tmp, &npr, &nprl)) {
+        delta -= 16;
+        continue;
+      }
+
+      long imm;
+      int sign;
+      if (parse_sp_arith(tmp, &imm, &sign)) {
+        delta += sign * imm;
+        if (delta > 0) { aborted = true; break; }
+        continue;
+      }
+
+      if (writes_sp_unknown(tmp)) { aborted = true; break; }
+    }
+
+    if (!found || aborted) continue;
+    if (j <= i) continue;
+
+    bool dst_eq_src = (dstlen == srclen
+                       && strncasecmp(dst_buf, src_buf, dstlen) == 0);
+
+    bool dst_touched = false;
+    for (size_t k = i + 1; k < j; k++) {
+      if (!keep[k]) continue;
+      char tmp[512];
+      LOAD_LINE(k, tmp);
+      if (instr_uses_reg(tmp, dst_buf, dstlen)) {
+        dst_touched = true; break;
+      }
+      if (is_call_line(tmp)) {
+        if (is_caller_saved_x(dst_buf, dstlen)
+            || (dstlen == 3 && (dst_buf[0] == 'x' || dst_buf[0] == 'X')
+                && dst_buf[1] == '3' && dst_buf[2] == '0')) {
+          dst_touched = true; break;
+        }
+      }
+    }
+    if (dst_touched) continue;
+
+    if (dst_eq_src) {
+      keep[i] = false;
+      keep[j] = false;
+      removed += 2;
+    } else {
+      char *rep = malloc(srclen + dstlen + 16);
+      memcpy(rep, "\tmov ", 5);
+      size_t off2 = 5;
+      memcpy(rep + off2, dst_buf, dstlen); off2 += dstlen;
+      rep[off2++] = ',';
+      rep[off2++] = ' ';
+      memcpy(rep + off2, src_buf, srclen); off2 += srclen;
+      rep[off2++] = '\n';
+      rep[off2] = '\0';
+      replacement[i] = rep;
+      keep[j] = false;
+      removed += 1;
+    }
+  }
+
+  #define LOAD_EFFECTIVE(i, buf) do {                             \
+      if (replacement[i]) {                                       \
+        size_t L = strlen(replacement[i]);                        \
+        if (L >= sizeof(buf)) L = sizeof(buf) - 1;                \
+        memcpy(buf, replacement[i], L);                           \
+        buf[L] = '\0';                                            \
+      } else {                                                    \
+        LOAD_LINE(i, buf);                                        \
+      }                                                           \
+    } while (0)
+
+  for (size_t i = 0; i < n; i++) {
+    if (!keep[i]) continue;
+    LOAD_EFFECTIVE(i, scratch);
+
+    if (is_redundant_mov(scratch)) {
+      keep[i] = false;
+      if (replacement[i]) { free(replacement[i]); replacement[i] = NULL; }
+      removed++;
+      continue;
+    }
+
+    if (is_directive_line(scratch) || is_label_line(scratch)
+        || is_branch_line(scratch))
+      continue;
+
+    size_t j = i + 1;
+    while (j < n && !keep[j]) j++;
+    if (j >= n) continue;
+
+    char next[512];
+    LOAD_EFFECTIVE(j, next);
+
+    if (is_directive_line(next) || is_label_line(next)
+        || is_branch_line(next))
+      continue;
+
+    const char *r1, *r2;
+    size_t r1l, r2l;
+    long o1, o2;
+
+    if (parse_mem_op(scratch, "str", &r1, &r1l, &o1)
+        && parse_mem_op(next, "ldr", &r2, &r2l, &o2)
+        && r1l == r2l && strncasecmp(r1, r2, r1l) == 0 && o1 == o2) {
+      keep[j] = false;
+      if (replacement[j]) { free(replacement[j]); replacement[j] = NULL; }
+      removed++;
+      continue;
+    }
+
+    if (parse_mem_op(scratch, "ldr", &r1, &r1l, &o1)
+        && parse_mem_op(next, "str", &r2, &r2l, &o2)
+        && r1l == r2l && strncasecmp(r1, r2, r1l) == 0 && o1 == o2) {
+      keep[j] = false;
+      if (replacement[j]) { free(replacement[j]); replacement[j] = NULL; }
+      removed++;
+      continue;
+    }
+  }
+  #undef LOAD_LINE
+  #undef LOAD_EFFECTIVE
+
+  size_t total = 0;
+  for (size_t i = 0; i < n; i++) {
+    if (!keep[i]) continue;
+    total += replacement[i] ? strlen(replacement[i]) : lens[i];
+  }
+  char *out = malloc(total + 1);
+  size_t off = 0;
+  for (size_t i = 0; i < n; i++) {
+    if (!keep[i]) continue;
+    if (replacement[i]) {
+      size_t L = strlen(replacement[i]);
+      memcpy(out + off, replacement[i], L);
+      off += L;
+    } else {
+      memcpy(out + off, lines[i], lens[i]);
+      off += lens[i];
+    }
+  }
+  out[off] = '\0';
+
+  for (size_t i = 0; i < n; i++) if (replacement[i]) free(replacement[i]);
+  free(replacement);
+  free(lines);
+  free(lens);
+  free(keep);
+
+  if (out_removed) *out_removed = removed;
+  return out;
+}
+
+void codegen(Obj *prog, FILE *out) {
+  // Emit into a memory stream so a peephole pass can scrub redundant
+  // patterns (no-op moves, str/ldr round-trips on the same stack slot,
+  // stack-machine push/pop pairs that bracket subexpression evaluation)
+  // before the cleaned text is written to the real output file.
+  char *buf = NULL;
+  size_t buflen = 0;
+  FILE *mem = open_memstream(&buf, &buflen);
+  if (!mem) {
+    // Fallback: emit straight to `out` if memstream isn't available.
+    output_file = out;
+    emit_data(prog);
+    emit_text(prog);
+    if (!opt_elf) {
+      printlabel(".section __DATA,__data");
+      println(".subsections_via_symbols");
+    }
+    return;
+  }
+  output_file = mem;
+
   emit_data(prog);
   emit_text(prog);
 
@@ -2855,4 +3465,13 @@ void codegen(Obj *prog, FILE *out) {
     // Enable weak definition deduplication and dead-stripping.
     println(".subsections_via_symbols");
   }
+
+  fclose(mem);
+
+  char *cleaned = peephole(buf, NULL);
+  fputs(cleaned, out);
+
+  free(cleaned);
+  free(buf);
+  output_file = NULL;
 }
