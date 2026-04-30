@@ -390,7 +390,12 @@ static void gen_addr(Node *node) {
       println("adrp x0, _%s@GOTPAGE", node->var->name);
       println("ldr x0, [x0, _%s@GOTPAGEOFF]", node->var->name);
     } else {
-      // PC-relative addressing: used for defined vars on Mach-O, and all vars on ELF
+      // PC-relative symbol load via ADRP+ADD. This works during both early
+      // boot (MMU off, code at physical addresses) and normal kernel
+      // operation (MMU on, code at virtual addresses), because the
+      // relocation is computed relative to the current PC. Section flags
+      // ("a", %progbits via emit_data) keep custom sections within ADRP's
+      // ±4 GB page-relative reach.
       if (opt_elf) {
         println("adrp x0, %s", node->var->name);
         println("add x0, x0, :lo12:%s", node->var->name);
@@ -602,6 +607,34 @@ static void count_params(Type *func_ty, int *gp_count, int *fp_count) {
 // - Variadic args are ALL passed on the stack (not in registers)
 // - Stack must be 16-byte aligned before the call
 static void gen_funcall(Node *node) {
+
+  // Mini-inliner: if the callee is a static inline whose body is a single
+  // __asm__ statement, splice the asm in at the call site with input
+  // expressions rebound to the call arguments. This lets literal constants
+  // flow into "n" constraints (NetBSD relies on this for PSTATE writes).
+  if (node->var && node->var->is_asm_inline) {
+    Node *tmpl = node->var->asm_inline_template;
+    Node *args[64];
+    int nargs = 0;
+    for (Node *a = node->args; a; a = a->next) {
+      if (nargs >= 64)
+        error_tok(node->tok, "too many arguments to inlined asm");
+      args[nargs++] = a;
+    }
+    if (nargs != tmpl->asm_num_inputs)
+      error_tok(node->tok,
+                "asm-inline arg count (%d) does not match template inputs (%d)",
+                nargs, tmpl->asm_num_inputs);
+    Node *spliced = calloc_checked(1, sizeof(Node));
+    *spliced = *tmpl;
+    if (nargs > 0) {
+      spliced->asm_input_exprs = calloc_checked(nargs, sizeof(Node *));
+      for (int i = 0; i < nargs; i++)
+        spliced->asm_input_exprs[i] = args[i];
+    }
+    gen_stmt(spliced);
+    return;
+  }
 
   // Emit __sync_* GCC builtins inline (needed for bare-metal ELF where
   // there is no libgcc, but correct on all ARM64 targets).
@@ -1919,8 +1952,12 @@ static void gen_stmt(Node *node) {
     // Constant condition optimization: avoid emitting dead code that
     // references undefined symbols. Case labels inside dead branches
     // are still emitted (they're reachable via switch dispatch).
-    if (node->cond->kind == ND_NUM && is_integer(node->cond->ty)) {
-      if (node->cond->val == 0) {
+    // Use try_eval_node so we also fold !x, ~x, arithmetic — needed for
+    // patterns like `if (!__builtin_constant_p(p))` where the inner
+    // builtin returns ND_NUM but the outer ! isn't folded at parse time.
+    int64_t cond_val;
+    if (try_eval_node(node->cond, &cond_val)) {
+      if (cond_val == 0) {
         int c = label_cnt++;
         println("b Ltmp_end.%d", c);
         gen_stmt_dead(node->then);
@@ -1930,6 +1967,12 @@ static void gen_stmt(Node *node) {
         return;
       } else {
         gen_stmt(node->then);
+        if (node->els) {
+          int c = label_cnt++;
+          println("b Ltmp_end.%d", c);
+          gen_stmt_dead(node->els);
+          printlabel("Ltmp_end.%d:", c);
+        }
         return;
       }
     }
@@ -2476,7 +2519,15 @@ static void emit_data(Obj *prog) {
     }
 
     // Section
-    if (var->init_data) {
+    if (var->section && opt_elf) {
+      // Emit explicit attributes so the linker places the section adjacent
+      // to .data — without "aw",%progbits the assembler treats unknown
+      // section names as their own type and the linker may put them so far
+      // from .text that ADRP relocations overflow (see NetBSD link sets).
+      // Use "a" (alloc, read-only) so link-set sections land near .rodata
+      // and stay within ADRP's ±4 GB page-relative reach from .text.
+      printlabel(".section %s, \"a\", %%progbits", var->section);
+    } else if (var->init_data) {
       printlabel("%s", opt_elf ? ".section .data" : ".section __DATA,__data");
     } else {
       printlabel("%s", opt_elf ? ".section .bss" : ".section __DATA,__bss");
@@ -2539,6 +2590,8 @@ static void emit_text(Obj *prog) {
     // tolower) are inline-only definitions. Emit them as local symbols
     // so they don't override system library implementations, but are
     // still available if called from this compilation unit.
+    if (fn->is_asm_inline)
+      continue;  // body is substituted at every call site
     bool extern_inline = fn->is_inline && fn->is_extern;
     if (hashmap_get(&emitted_fns, fn->name))
       continue;
@@ -2903,8 +2956,37 @@ static void emit_text(Obj *prog) {
 // Main codegen entry point
 //
 
+
+// Detect static inline functions whose body is a single __asm__ statement
+// and whose return type is void. Such functions can be substituted at the
+// call site, which lets compile-time-constant call arguments flow into "n"
+// (immediate) constraints — exactly the pattern NetBSD uses for PSTATE
+// writes (msr daifset, %0 :: "n"(val)).
+static void mark_asm_inline_funcs(Obj *prog) {
+  for (Obj *fn = prog; fn; fn = fn->next) {
+    if (!fn->is_function || !fn->is_definition) continue;
+    if (!fn->is_inline || !fn->is_static) continue;
+    if (!fn->ty || fn->ty->return_ty->kind != TY_VOID) continue;
+    if (!fn->body || fn->body->kind != ND_BLOCK) continue;
+    Node *stmt = fn->body->body;
+    if (!stmt || stmt->next) continue;          // exactly one statement
+    if (stmt->kind != ND_ASM) continue;
+    fn->is_asm_inline = true;
+    fn->asm_inline_template = stmt;
+  }
+}
+
 void codegen(Obj *prog, FILE *out) {
   output_file = out;
+
+  mark_asm_inline_funcs(prog);
+
+  // Emit file-scope __asm("...") directives first so any aliases /
+  // .weak / .global declarations they set up land before any defs that
+  // reference them.
+  for (int i = 0; i < global_asm.len; i++) {
+    println("%s", global_asm.data[i]);
+  }
 
   // Emit assembly
   emit_data(prog);
