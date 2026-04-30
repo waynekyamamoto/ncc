@@ -74,4 +74,14 @@ cd tests/torture && bash run.sh --summary
 
 ## License
 
+ncc is MIT-licensed; see [`LICENSE`](LICENSE).
+
+ncc's frontend (`src/tokenize.c`, `src/preprocess.c`, `src/parse.c`,
+`src/type.c`, `src/cc.h`, `src/hashmap.c`, `src/unicode.c`) is derived from
+[chibicc](https://github.com/rui314/chibicc) by Rui Ueyama, also MIT-licensed.
+See [`LICENSE-chibicc`](LICENSE-chibicc) for the original copyright notice.
+The ARM64 code generator (`src/codegen_arm64.c`), the arena allocator
+(`src/alloc.c`), and various extensions (additional GCC builtins, more
+attributes, ELF output mode, NLGoto) are original work.
+
 The DOOM test program (`tests/doom/`) is from [doomgeneric](https://github.com/ozkl/doomgeneric) and is licensed under GPLv2.
