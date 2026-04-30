@@ -1282,6 +1282,12 @@ void init_macros(void) {
   define_macro("__arm64__", "1");
   define_macro("__arm64", "1");
   define_macro("__AARCH64EL__", "1");
+  // gcc-equivalent ARM architecture predefines.
+  // NetBSD's <arm/cdefs.h> uses these to set _ARM_ARCH_8/_ARM_ARCH_7,
+  // which in turn select AArch64 dsb/dmb/isb instead of AArch32 mcr p15.
+  define_macro("__ARM_ARCH", "8");
+  define_macro("__ARM_ARCH_8A__", "1");
+  define_macro("__ARM_PCS_AAPCS64", "1");
   define_macro("__APPLE__", "1");
   define_macro("__MACH__", "1");
   define_macro("__DARWIN_C_LEVEL", "900000L");
