@@ -328,6 +328,8 @@ struct Obj {
   bool is_tentative;
   bool is_tls;        // thread-local storage
   bool is_inline;
+  bool is_asm_inline;            // single-asm-stmt void-return inline → substitute at call site
+  Node *asm_inline_template;     // the ND_ASM node from the body (when is_asm_inline)
   char *init_data;     // Initial data for globals
   int init_data_size;  // Size of init_data (may exceed ty->size for flexible array members)
   Relocation *rel;     // Relocations for initial data
@@ -548,6 +550,7 @@ void hashmap_test(void);
 
 // Compilation options
 extern StringArray include_paths;
+extern StringArray global_asm;  // file-scope __asm("...") directives
 extern bool opt_fpic;
 extern bool opt_fcommon;
 extern bool opt_elf;
