@@ -236,11 +236,15 @@ static void compile(char *input_path, char *output_path) {
     error("%s: %s", input_path, strerror(errno));
 
   if (opt_dump_tokens) {
-    // Validation aid for Phase 1 (tokenizer swap-out): dump the raw
+    // Validation aid for Phase 1 (tokenizer swap-out): dump the
     // tokenize() output as a deterministic line-per-token format
     // that two tokenizer implementations can be diff'd against.
-    // No preprocessing, no -include prepend — just tokenize_file's
-    // output for the named source file.
+    // No macro preprocessing, no -include prepend — just
+    // tokenize_file's output for the named source file, then the
+    // convert_pp_tokens lowering (which the spec considers part of
+    // tokenize.c). This covers BOTH the lex-boundary level (token
+    // span agreement) AND the numeric-literal value/type level.
+    convert_pp_tokens(tok);
     FILE *fp = output_path ? fopen(output_path, "w") : stdout;
     for (Token *t = tok; ; t = t->next) {
       static const char *kind_name[] = {
@@ -259,8 +263,11 @@ static void compile(char *input_path, char *output_path) {
       // Numeric value (TK_NUM only; TK_PP_NUM hasn't been resolved
       // yet at the tokenize layer).
       if (t->kind == TK_NUM) {
-        if (t->ty && (t->ty->kind == TY_FLOAT || t->ty->kind == TY_DOUBLE
-                      || t->ty->kind == TY_LDOUBLE))
+        bool is_fp_kind = t->ty && (t->ty->kind == TY_FLOAT
+                                    || t->ty->kind == TY_DOUBLE
+                                    || t->ty->kind == TY_LDOUBLE
+                                    || t->ty->kind == TY_COMPLEX);
+        if (is_fp_kind)
           fprintf(fp, " fval=%La", t->fval);
         else
           fprintf(fp, " val=%lld", (long long)t->val);
