@@ -855,10 +855,6 @@ static void gen_funcall(Node *node) {
     }
   }
 
-  // Clean up stack args that were passed on the stack
-  if (padded_stack > 0)
-    println("add sp, sp, #%d", padded_stack);
-
   // Result is in x0 (integer/pointer) or d0 (float)
   if (call_ret_ty->kind == TY_BOOL)
     println("and x0, x0, #1");
