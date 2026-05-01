@@ -2,7 +2,7 @@
 # Compliance test runner: compile with both clang and ncc, compare output
 # Usage: ./run.sh [test.c] or ./run.sh (runs all)
 
-NCC="../../ncc"
+NCC="${NCC:-../../ncc2}"
 PASS=0
 FAIL=0
 ERRORS=""

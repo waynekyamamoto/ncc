@@ -7,7 +7,7 @@
 #        ./run.sh            — all tests
 
 set -u
-NCC="../../ncc"
+NCC="${NCC:-../../ncc2}"
 PASS=0
 FAIL=0
 FAIL_NAMES=""

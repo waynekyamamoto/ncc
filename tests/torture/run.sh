@@ -4,7 +4,7 @@
 #        ./run.sh           — run all tests
 #        ./run.sh --summary — run all and show only summary
 
-NCC="../../ncc"
+NCC="${NCC:-../../ncc2}"
 PASS=0
 FAIL_COMPILE=0
 FAIL_RUNTIME=0

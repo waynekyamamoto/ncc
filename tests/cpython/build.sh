@@ -2,8 +2,8 @@
 # Build CPython 3.12.3 with ALL files compiled by ncc
 set -e
 
-NCC=/Users/yamamoto/new_compiler/ncc
-PYDIR=/tmp/Python-3.12.3
+NCC="${NCC:-/Users/yamamoto/ncc/ncc2}"
+PYDIR="${PYDIR:-/tmp/Python-3.12.3}"
 CFLAGS="-DPy_BUILD_CORE -DNDEBUG -I$PYDIR/Include -I$PYDIR/Include/internal -I$PYDIR"
 
 # Ensure CPython is built with make first (provides reference library + Programs/python.o)
