@@ -9,6 +9,7 @@
 // Global options
 bool opt_fpic = true;     // macOS always uses PIC
 bool opt_fcommon = true;
+bool opt_elf = false;
 char *base_file;
 
 static StringArray input_files_list;
@@ -184,7 +185,7 @@ static char *filter_asm(char *input) {
 static void assemble(char *input, char *output) {
   char *filtered = filter_asm(input);
   StringArray cmd = {};
-  strarray_push(&cmd, "as");
+  strarray_push(&cmd, opt_elf ? "aarch64-elf-as" : "as");
   strarray_push(&cmd, "-o");
   strarray_push(&cmd, output);
   strarray_push(&cmd, filtered);
@@ -366,6 +367,13 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[i], "-include") || !strcmp(argv[i], "-include-pch")) {
       if (++i >= argc) usage(1);
       strarray_push(&extra_includes, argv[i]);
+      continue;
+    }
+
+    if (!strcmp(argv[i], "-target")) {
+      if (++i >= argc) usage(1);
+      if (!strcmp(argv[i], "elf"))
+        opt_elf = true;
       continue;
     }
 

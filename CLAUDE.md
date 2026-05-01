@@ -25,13 +25,16 @@ before ncc enters the picture.
 ```bash
 cd ~/xv6/xv6-aarch64
 brew install aarch64-elf-gcc        # if needed for reference build
-make
+make TOOLPREFIX=aarch64-elf-        # Homebrew uses aarch64-elf- prefix
 qemu-system-aarch64 -cpu cortex-a72 -machine virt,gic-version=3 \
   -kernel kernel/kernel -m 128M -smp 4 -nographic \
   -drive file=fs.img,if=none,format=raw,id=x0 \
   -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
 # Should see: xv6 kernel is booting ... $ prompt
 ```
+Notes for GCC 15 compat (already patched in xv6-aarch64/Makefile):
+- `user/sh.c`: add `-Wno-infinite-recursion` (runcmd tail-calls exec, not truly infinite)
+- `user/usertests.c`: add `-Wno-incompatible-pointer-types` (old-style `()` decl vs fn ptr)
 
 ### Phase 2 — Add ELF output mode to ncc
 ncc currently emits Mach-O assembly. xv6 needs ELF. Changes needed in
@@ -80,8 +83,8 @@ make clean && make -j$(sysctl -n hw.ncpu)
 
 # 2. Stage 1: build ncc with itself
 mkdir -p stage1 stage2
-ln -sf /Users/yamamoto/new_compiler/include stage1/include
-ln -sf /Users/yamamoto/new_compiler/include stage2/include
+ln -sf /Users/yamamoto/xv6/include stage1/include
+ln -sf /Users/yamamoto/xv6/include stage2/include
 for f in src/*.c; do
   ./ncc -c -o "stage1/$(basename ${f%.c}.o)" "$f"
 done
