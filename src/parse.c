@@ -1870,11 +1870,11 @@ int64_t eval_node(Node *node) {
 bool try_eval_node(Node *node, int64_t *out) {
   add_type(node);
   switch (node->kind) {
-  case ND_NUM:      *out = node->val; return true;
+  case ND_NUM:      if (is_flonum(node->ty)) return false; *out = node->val; return true;
   case ND_NEG:      { int64_t v; if (!try_eval_node(node->lhs, &v)) return false; *out = -v; return true; }
   case ND_NOT:      { int64_t v; if (!try_eval_node(node->lhs, &v)) return false; *out = !v; return true; }
   case ND_BITNOT:   { int64_t v; if (!try_eval_node(node->lhs, &v)) return false; *out = ~v; return true; }
-  case ND_CAST:     { int64_t v; if (!try_eval_node(node->lhs, &v)) return false; *out = v; return true; }
+  case ND_CAST:     if (is_flonum(node->ty)) return false; { int64_t v; if (!try_eval_node(node->lhs, &v)) return false; *out = v; return true; }
   case ND_ADD:      { int64_t a, b; if (!try_eval_node(node->lhs, &a) || !try_eval_node(node->rhs, &b)) return false; *out = a + b; return true; }
   case ND_SUB:      { int64_t a, b; if (!try_eval_node(node->lhs, &a) || !try_eval_node(node->rhs, &b)) return false; *out = a - b; return true; }
   case ND_MUL:      { int64_t a, b; if (!try_eval_node(node->lhs, &a) || !try_eval_node(node->rhs, &b)) return false; *out = a * b; return true; }
