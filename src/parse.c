@@ -1987,8 +1987,29 @@ static int64_t eval2(Node *node, char ***label) {
   case ND_VAR:
     if (!label)
       error_tok(node->tok, "not a compile-time constant");
-    if (node->var->ty->kind != TY_ARRAY && node->var->ty->kind != TY_FUNC)
+    if (node->var->ty->kind != TY_ARRAY && node->var->ty->kind != TY_FUNC) {
+      // Anonymous compound literal of pointer/scalar type at file scope:
+      // its value is whatever the initializer wrote into init_data + rel,
+      // not a separate object reference. Fold to that value directly so
+      // outer initializers can use compound literals as rvalue constants.
+      // Pattern from Linux kernel STM32_GATE in clk-stm32mp1.c:
+      //   (struct stm32_gate_cfg *){ &(struct stm32_gate_cfg){...} }
+      Obj *v = node->var;
+      if (!v->is_local && v->name && strncmp(v->name, ".L.data.", 8) == 0 &&
+          v->ty->kind == TY_PTR && v->init_data) {
+        if (v->rel && !v->rel->next && v->rel->offset == 0) {
+          *label = v->rel->label;
+          return v->rel->addend;
+        }
+        if (!v->rel && v->init_data_size >= 8) {
+          // Pure integer pointer constant (e.g. (T*){NULL} or (T*){(T*)0x1000}).
+          int64_t val;
+          memcpy(&val, v->init_data, 8);
+          return val;
+        }
+      }
       error_tok(node->tok, "not a compile-time constant");
+    }
     *label = &node->var->name;
     return 0;
   case ND_MEMBER:
