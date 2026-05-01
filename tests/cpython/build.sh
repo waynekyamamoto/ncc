@@ -105,16 +105,16 @@ echo "  ncc: $PASS, clang fallback: $FAIL"
 $NCC $CFLAGS -c $PYDIR/Programs/python.c -o /tmp/ncc_cpython_python.o 2>/dev/null
 
 # Link
-echo "=== Linking python_ncc.exe ==="
+echo "=== Linking python_ncc ==="
 PYTHON_OBJ=$PYDIR/Programs/python.o  # use Makefile's python.o (avoids extern inline link issues)
-clang -o $PYDIR/python_ncc.exe $PYTHON_OBJ $PYDIR/libpython_ncc.a \
+clang -o $PYDIR/python_ncc $PYTHON_OBJ $PYDIR/libpython_ncc.a \
   -ldl -framework CoreFoundation -Wl,-stack_size,1000000 -lz -lreadline
 
 echo ""
 echo "=== Testing ==="
-$PYDIR/python_ncc.exe -c 'print("Hello from ncc-compiled CPython!")'
-$PYDIR/python_ncc.exe -c 'import sys; print(f"Python {sys.version}")'
-$PYDIR/python_ncc.exe -c 'print(2**100)'
+$PYDIR/python_ncc -c 'print("Hello from ncc-compiled CPython!")'
+$PYDIR/python_ncc -c 'import sys; print(f"Python {sys.version}")'
+$PYDIR/python_ncc -c 'print(2**100)'
 echo ""
 echo "=== SUCCESS: $PASS/$(($PASS+$FAIL)) core files compiled with ncc ==="
-echo "Run with: $PYDIR/python_ncc.exe"
+echo "Run with: $PYDIR/python_ncc"
