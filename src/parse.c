@@ -1905,9 +1905,27 @@ static int64_t eval2(Node *node, char ***label) {
       return (uint64_t)eval(node->lhs) >> eval(node->rhs);
     return eval(node->lhs) >> eval(node->rhs);
   case ND_EQ:
-    return eval(node->lhs) == eval(node->rhs);
-  case ND_NE:
-    return eval(node->lhs) != eval(node->rhs);
+  case ND_NE: {
+    // Allow comparing a static address against a null pointer constant
+    // (a static object's address is non-zero, so addr == 0 folds to false).
+    // GCC's _OF_DECLARE family in the Linux kernel relies on this:
+    // (fn == (fn_t)NULL) ? fn : fn — used to typecheck fn against fn_type.
+    char **lbl_l = NULL, **lbl_r = NULL;
+    int64_t a = eval2(node->lhs, &lbl_l);
+    int64_t b = eval2(node->rhs, &lbl_r);
+    bool eq;
+    if (!lbl_l && !lbl_r)
+      eq = (a == b);
+    else if (lbl_l && !lbl_r && b == 0)
+      eq = false;
+    else if (!lbl_l && lbl_r && a == 0)
+      eq = false;
+    else if (lbl_l == lbl_r)
+      eq = (a == b);
+    else
+      error_tok(node->tok, "not a compile-time constant");
+    return (node->kind == ND_EQ) ? eq : !eq;
+  }
   case ND_LT:
     if (node->lhs->ty->is_unsigned)
       return (uint64_t)eval(node->lhs) < (uint64_t)eval(node->rhs);
