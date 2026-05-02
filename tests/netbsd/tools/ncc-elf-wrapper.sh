@@ -50,6 +50,19 @@ case "$SRC" in
     # early-MMU mapping window.
     exec /netbsd/tooldir/bin/aarch64--netbsd-gcc "$@"
     ;;
+  */kern/tty.c)
+    # KNOWN ncc MISCOMPILE (2026-05-02): when ncc compiles tty.c, every
+    # tty ioctl (TIOCSFLAGS), fcntl(O_NONBLOCK), and open() on /dev/constty
+    # returns ENOSYS — getty fails to spawn, login is unreachable.  Bisected
+    # by routing single files to gcc (v5..v8 in build logs from 2026-05-02);
+    # tty.c alone reproduces, none of {tty_conf.c, subr_devsw.c, spec_vnops.c,
+    # vfs_vnops.c, plcom.c} reproduces.  Routing tty.c to gcc lets the
+    # ncc-built kernel reach login.  Remove this entry once the codegen bug
+    # in ncc/src/ is identified and fixed (likely a function-pointer table
+    # initializer in tty.c — the symptom shape matches NULL d_ioctl/d_fcntl
+    # slots in a cdevsw or fileops table).
+    exec /netbsd/tooldir/bin/aarch64--netbsd-gcc "$@"
+    ;;
 esac
 
 case "$SRC" in
