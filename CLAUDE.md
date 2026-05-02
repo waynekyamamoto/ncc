@@ -1,12 +1,14 @@
 # ncc — ARM64/macOS C Compiler
 
 ## Branches
-- `main` — stable; Linux kernel scan work happens here
-- `xv6-aarch64` — xv6 port; ELF output mode for ncc, xv6 kernel compilation, QEMU boot
+- `main` — all active compiler work and OS-port test corpora live here
+- `xv6-aarch64` — historical: original xv6 port branch. Compiler features merged to `main`; xv6 build glue moved to `tests/xv6/`.
+- `swap-out` — chibicc swap-out effort, owned by a separate agent (see memory). Do not touch from `~/ncc`.
 
 ## Active work
-- **main**: Linux kernel subsystem scan (mm/, kernel/, fs/, net/*). Pre-include fix file at `/tmp/ncc_linux_fix.h`. Scan script at `/tmp/ncc_scan.sh`.
-- **xv6-aarch64**: Port ncc to emit ELF assembly, compile xv6-aarch64 kernel + user programs with ncc, boot under QEMU. xv6 source at `~/xv6/xv6-aarch64` (to be cloned). Cross-toolchain: `aarch64-elf-binutils` (brew).
+- **NetBSD/aarch64 boot**: get past the `root device:` prompt to userland. Build glue + kernel config + status doc in `tests/netbsd/` (entry: `tests/netbsd/build.sh MINIMAL_VIRT64 boot`). NetBSD source lives at `~/netbsd/src/` (not in this repo).
+- **xv6-aarch64**: suspended. Kernel + user programs compile and boot. Build glue in `tests/xv6/`.
+- **Linux kernel scan**: suspended. Per-subsystem compile-coverage scan in `tests/linux/` (entry: `tests/linux/scan.sh`). Linux source at `~/ncc-linux/linux/` (not in this repo).
 
 ## xv6-aarch64 build plan
 
@@ -75,35 +77,17 @@ The ARM64 instructions themselves are identical — only directives change.
 
 ## bootstrap_validate
 
-Clean build with clang, then confirm the compiler reaches a fixed point when compiling itself:
+Clean build with clang, then confirm the compiler reaches a fixed point
+when compiling itself:
 
 ```bash
-# 1. Clean build with clang
-make clean && make -j$(sysctl -n hw.ncpu)
-
-# 2. Stage 1: build ncc with itself
-mkdir -p stage1 stage2
-ln -sf /Users/yamamoto/xv6/include stage1/include
-ln -sf /Users/yamamoto/xv6/include stage2/include
-for f in src/*.c; do
-  ./ncc -c -o "stage1/$(basename ${f%.c}.o)" "$f"
-done
-./ncc -o stage1/ncc stage1/*.o
-
-# 3. Stage 2: build ncc with stage1
-for f in src/*.c; do
-  stage1/ncc -c -o "stage2/$(basename ${f%.c}.o)" "$f"
-done
-stage1/ncc -o stage2/ncc stage2/*.o
-ln -sf stage2/ncc ncc2
-
-# 4. Check fixed point: stage1 == ncc2
-if [ "$(md5 -q stage1/ncc)" = "$(md5 -q ncc2)" ]; then
-  echo "FIXED POINT: stage1 == ncc2"
-else
-  echo "MISMATCH: stage1 != ncc2"
-fi
+scripts/bootstrap_validate.sh
 ```
 
-Note: ncc finds its headers via `_NSGetExecutablePath`, so each stage binary needs
-an `include/` symlink next to it pointing at the real include directory.
+The script builds ncc with clang, builds ncc with itself (stage1),
+builds ncc with stage1 (stage2), and checks `md5(stage1) == md5(stage2)`.
+Output ends with `FIXED POINT: stage1 == ncc2` on success.
+
+Note: ncc finds its headers via `_NSGetExecutablePath`, so each stage
+binary needs an `include/` symlink next to it pointing at the real
+include directory (the script handles this).
