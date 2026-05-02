@@ -35,6 +35,18 @@ fi
 
 mkdir -p "$BUILD/kernel" "$BUILD/user"
 
+# Sync our user-program additions into the xv6 source tree's user/ dir
+# so the per-file compile loop picks them up. Idempotent; only files
+# we wrote (hanoi.c) live in this repo.
+for src in "$SCRIPT_DIR"/*.c; do
+  [ -e "$src" ] || continue
+  dst="$XV6/user/$(basename "$src")"
+  if ! cmp -s "$src" "$dst" 2>/dev/null; then
+    echo "Syncing user program: $src -> $dst"
+    cp "$src" "$dst"
+  fi
+done
+
 if [ ! -x "$NCC" ]; then
   echo "=== Building ncc ($NCC missing) ==="
   (cd "$REPO_DIR" && make -j$(sysctl -n hw.ncpu))
@@ -127,7 +139,7 @@ echo "  OK: usys.S, initcode.S"
 echo ""
 echo "=== Phase 4: Link user programs ==="
 ULIB=("$BUILD/user/ulib.o" "$BUILD/user/usys.o" "$BUILD/user/printf.o" "$BUILD/user/umalloc.o")
-for prog in cat echo grep init kill ln ls mkdir rm sh stressfs wc zombie grind; do
+for prog in cat echo grep init kill ln ls mkdir rm sh stressfs wc zombie grind hanoi; do
   aarch64-elf-ld -z max-page-size=4096 -N -e main -Ttext 0 \
     -o "$BUILD/user/_${prog}" "$BUILD/user/${prog}.o" "${ULIB[@]}" 2>/dev/null
   echo "  OK: _$prog"
@@ -162,7 +174,7 @@ cp "$BUILD/user"/_* "$XV6/user/"
 (cd "$XV6" && mkfs/mkfs "$BUILD/fs.img" README \
   user/_cat user/_echo user/_forktest user/_grep user/_init \
   user/_kill user/_ln user/_ls user/_mkdir user/_rm user/_sh \
-  user/_stressfs user/_grind user/_wc user/_zombie)
+  user/_stressfs user/_grind user/_wc user/_zombie user/_hanoi)
 echo "  OK: fs.img"
 
 echo ""
