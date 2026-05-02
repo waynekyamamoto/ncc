@@ -129,3 +129,91 @@ Cut point: `7ff0860`. New commits on `main` after this point are appended below 
 **Action taken.** Re-implemented the codegen revert on swap-out (delete the duplicate cleanup in `src/codegen_arm64.c`'s `gen_funcall`). Bootstrap fixed-point reached under both tokenizers post-fix.
 
 **Action deferred.** The preprocess.c side of the original revert (paste/expand_macro position-flag inheritance, 18 lines) is *not* applied here. Per `b710056`'s message, those changes "on their own may still be valid" but weren't worth bisecting. Swap-out's preprocessor will be replaced wholesale in Phase 2 from spec, so re-applying main's revert on a soon-to-be-discarded file is wasted work. If Phase 2's spec-derived preprocessor exhibits any of the symptoms `a23f2d1` was originally trying to fix, we'll address them then.
+
+### `150f17d` — parse: try_eval_node must not evaluate FP-typed nodes as int64
+
+**On main.** Bug in `try_eval_node`: ND_NUM and ND_CAST cases unconditionally read `node->val` (int64), but for FP-typed nodes the value is in `node->fval` and `val` is garbage. Surfaces only when constant folding traverses an FP subexpression. Fix is 4 lines in `src/parse.c`.
+
+**Applies to swap-out.** Latent. The bug requires a code path that calls `try_eval_node` on FP-typed nodes. swap-out's `try_eval_node` has the same buggy code, but the trigger introduced on main was `93c6ecc`'s addition of `if (try_eval_node(node->cond, &cond_val))` in gen_stmt's ND_IF case — and swap-out doesn't have `93c6ecc`. Without the if-fold caller, the bug is unreachable from any in-scope program; torture and bootstrap agree (current swap-out: torture 964/995 100% on non-skip).
+
+**Action taken.** None. Logged as gated on `93c6ecc`.
+
+**Action deferred.** When `93c6ecc`'s if-fold lands (Phase 4/5 NetBSD work), `150f17d` must land alongside it. Both are in `src/parse.c`; Phase 4 (parser rewrite) is the natural seam.
+
+### `e7e7393` — codegen: variadic va_start when fn has >8 GP/FP named params
+
+**On main.** `gen_funcall`'s va_start used `add x10, x29, #16` for the va_list base; correct only when ≤8 named GP and ≤8 named FP params. With more, overflow named args occupy stack slots starting at x29+16 and the variadic region begins after them. Fix: walk named params, add `(gp_overflow + fp_overflow) * 8` to the base. 25 lines in `src/codegen_arm64.c`.
+
+**Applies to swap-out.** Yes — same `gen_funcall` codegen path on aarch64 — but no in-scope program (sqlite, doom, cpython, ncc itself) declares a variadic with >8 named params. Trigger surface is NetBSD's `sysctl_createv` (12 named + variadic), not in scope.
+
+**Action taken.** None. No reachable trigger from current swap-out workload.
+
+**Action deferred.** Phase 5 (codegen audit) ports the fix. Should land with `tests/compliance/22_variadic_after_stack_named.c` (the regression test from main).
+
+### `ff529fb` — parse: forward-static-fn refs in file-scope initializers
+
+**On main.** `find_var()` walks scope and returns NULL for not-yet-declared static functions; `primary()` errored "undefined variable" when this was triggered by a file-scope initializer for a struct of fnptrs whose targets are defined later in the same TU. Fix: `in_gvar_initializer` counter; `primary()` synthesizes a function-typed placeholder Obj when find_var returns NULL inside an initializer; relocation machinery resolves at codegen time. Trade-off: misspelled identifier in such an initializer no longer reported at the offending line. 25 lines in `src/parse.c`.
+
+**Applies to swap-out.** Yes — same `primary()` and `find_var()` code path. No in-scope program triggers this; the motivating use case is NetBSD's `kern_cctr.c` style (ops-table struct of static fnptrs).
+
+**Action taken.** None.
+
+**Action deferred.** Phase 4 (parser rewrite) is the natural seam — port the fix and `tests/compliance/21_forward_static_init.c` then.
+
+### `8fe8dda` — codegen: `-target elf` flag and `__sync_*` builtins
+
+**On main.** Two independent capabilities:
+1. `-target elf` switches Mach-O directives → ELF (.text/.data/.bss/.rodata, drop leading `_`, `:lo12:` instead of @PAGE/@PAGEOFF, `.weak` instead of `.weak_definition`); routes assembly through `aarch64-elf-as`.
+2. `__sync_*` GCC builtins emitted inline in `gen_funcall`: `__sync_synchronize` → `dmb ish`, `__sync_lock_release` → `stlr wzr`, `__sync_lock_test_and_set` → ldaxr/stlxr loop, `__sync_bool_compare_and_swap` → ldaxr/cmp/stlxr CAS.
+
+135 lines in `src/codegen_arm64.c` + main.c + cc.h.
+
+**Applies to swap-out.** Codegen-only; not load-bearing for any current swap-out workflow on macOS/Mach-O. The `__sync_*` half *would* let `tests/sqlite/build.sh` drop the `-DSQLITE_MEMORY_BARRIER=` workaround that swap-out inherited at `6cd2b54`.
+
+**Action taken.** None.
+
+**Action deferred.** Phase 5 (codegen audit) ports both. When `__sync_*` lands, also remove the SQLITE_MEMORY_BARRIER override from `tests/sqlite/build.sh`.
+
+### `4ed0320` — main + preprocess: Linux build, `-target elf` enhancements, ARM arch predefines
+
+**On main.** Cross-platform additions:
+- `main.c`: Linux include-path discovery via `/proc/self/exe`; under `-target elf` undef Apple predefines and define `__ELF__`; silently accept `-nostdinc` / `--sysroot=`; pass `-march=armv8.6-a+sve` to assembler in ELF mode; forward `-l`/`-L`/`-Wl,...` to system linker.
+- `preprocess.c`: predefine `__ARM_ARCH=8`, `__ARM_ARCH_8A__`, `__ARM_PCS_AAPCS64` under `-target elf`.
+
+40 lines total.
+
+**Applies to swap-out.** Touches `src/preprocess.c`, but only for the `-target elf` predefines path. Default Mach-O target unaffected.
+
+**Action taken.** None at code level. **Flagged for Phase 2 spec authoring.** Phase 2's preprocessor spec must decide: include the `-target elf` predefined-macro set in scope, or defer ELF support until later. Recommend deferring — the simpler initial spec covers macOS only; `-target elf` becomes a separate spec extension when xv6/NetBSD/Linux work resumes.
+
+**Action deferred.** When `-target elf` capability returns to swap-out (Phase 5 codegen audit, alongside `8fe8dda`), the preprocess-side predefines need to come with it.
+
+### `93c6ecc` — codegen + parse: NetBSD source-compat bundle
+
+**On main.** Six features for NetBSD/aarch64 kernel + ACPICA source compatibility:
+1. Mini-inliner for `static inline` functions whose body is a single `__asm__` (NetBSD PSTATE write pattern).
+2. `__attribute__((section("foo")))` capture and emission with explicit ELF flags (`link_set_*` markers).
+3. File-scope `__asm("...")` directives (NetBSD's `__strong_alias` / `__weak_alias`).
+4. Compound literal followed by postfix suffix (ACPICA pattern).
+5. `if (try_eval_node)` constant folding (precondition for `150f17d`'s bug).
+6. `__asm` recognized as inline-asm keyword; no-op compiler attributes (`target`, `pcs`, `neon_vector_type`, `no_sanitize*`, etc.).
+
+271 lines across `src/codegen_arm64.c` + `src/parse.c` + `src/cc.h`.
+
+**Applies to swap-out.** None of the six features is needed by sqlite/doom/cpython/ncc-itself. All NetBSD/ACPICA-specific.
+
+**Action taken.** None.
+
+**Action deferred.** Phase 4 (parser rewrite) and Phase 5 (codegen audit) jointly; when `93c6ecc` is ported, `150f17d` must come along (`93c6ecc`'s if-fold introduces the trigger that `150f17d` fixes). Tests `tests/compliance/16..20` come along.
+
+### Tests / infrastructure / docs commits — bulk no-action
+
+Fourteen commits between cut-point and `cc92e6f` are tests, infrastructure, or docs that don't modify the compiler:
+
+`cc92e6f` `34afce2` `6d67fd8` `820562c` `9354c70` `02826fd` `6a93efd` `9bcaafd` `8664268` `2d44324` `0e88d74` `a690c94` `414a13c` `6eee1c2`
+
+Coverage: xv6/NetBSD/Linux test harness additions (`tests/xv6`, `tests/netbsd`, `tests/linux`), `validate.sh` validation pyramid, compliance test additions, CLAUDE.md updates, cpython filename tweak.
+
+**Applies to swap-out.** None at code level. The compliance tests added on main (`tests/compliance/16..22`) are referenced by individual entries above (`93c6ecc`, `e7e7393`, etc.); they'll be ported alongside the features they test in Phases 4–5.
+
+**Action taken.** None. Logged in bulk per `docs/main-commit-contract.md`.
