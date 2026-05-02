@@ -96,10 +96,36 @@ Format per entry:
 
 ---
 
+## 2026-05-02: Phase 1 swap-in — RESOLVED
+
+**Diagnosis correction.** The 2026-05-02 BLOCKED entry above was wrong on its central claim. It asserted "swap-out's codegen is byte-identical to current main's (post-revert of `b710056`)" and concluded the bug therefore had to be in the spec tokenizer. The premise was false. Swap-out's cut-point `7ff0860` (2026-04-30 20:04:21) lands **between** the bad cherry-pick `a23f2d1` (19:50:38) and main's revert `b710056` (20:28:16). Swap-out inherited the buggy code and never received the revert. The chibicc tokenizer also hangs the bootstrap — same symptom — confirming the bug has nothing to do with the spec tokenizer. Re-validation today: tokenizer harness `ncc` vs `ncc-v2` PASS=28/28 over `src/*.c` + sqlite + 17 regression files; torture parity 950/995 with identical 14 runtime failures on both binaries.
+
+**Root cause.** `gen_funcall` in `src/codegen_arm64.c` had a duplicated `add sp, sp, #padded_stack` cleanup at end-of-function, identical to the one already done above the duplicate. Stack pointer over-cleaned by `padded_stack` bytes on every call site that passed args on the stack — corrupted sp, infinite loop on bootstrap. Verbatim the symptom main's `b710056` revert message describes.
+
+**Fix.** Removed the 4-line duplicate (the comment + `if (padded_stack > 0)` + `println` + blank line) — same delete as `b710056`'s revert. Per `docs/main-commit-contract.md`, this is a re-implementation of main's fix, not a cherry-pick; the action is purely a deletion of inherited buggy code.
+
+**Bootstrap (chibicc tokenize, `./ncc`)**: PASS — md5 fixed point `1b3d2af5e09242eef2969ea60f0a9f3c` (stage1 == stage2).
+
+**Bootstrap (spec tokenize, `./ncc-v2`, Phase 1 swap-in equivalent)**: PASS — md5 fixed point `f0409e97b1a02d96ea04feced345d2eb` (stage1 == stage2).
+
+**Phase 1 candidate validated end-to-end.** Tokenizer harness PASS=28/28; torture parity 950/995 (chibicc and spec identical); bootstrap fixed-point under both tokenizers. The actual swap-in commit (`git rm src/tokenize.c; git mv src/tokenize_v2.c src/tokenize.c`; simplify Makefile) is the next mechanical step.
+
+**Open**: divergence-log backlog of the remaining 20 main commits between `7ff0860` and `cc92e6f` (this entry covers `b710056` + `a23f2d1`).
+
+---
+
 ## Divergence log: changes on `main` since swap-out cut
 
 Tracking commits that land on `main` (`docs/main-commit-contract.md` defines what each entry needs to provide). The swap-out branch will not merge or cherry-pick these; instead, at each phase boundary, this list gets walked and each entry is checked against the reimplemented code. See `docs/main-commit-contract.md` for the contract.
 
-Cut point: `7ff0860`. New commits on `main` after this point will be appended below as they happen.
+Cut point: `7ff0860`. New commits on `main` after this point are appended below as they happen.
 
-(no entries yet)
+### `a23f2d1` (pre-cut-point, inherited as a bug) + `b710056` (revert, ported) — codegen, gen_funcall stack-arg cleanup
+
+**On main.** `a23f2d1` (2026-04-30 19:50:38) cherry-picked SP-cleanup + token-spacing fixes from a stale orphan branch. The auto-merge added a `add sp, sp, #padded_stack` cleanup at the tail of `gen_funcall` that was already performed earlier in the same function — net effect, sp over-cleaned by `padded_stack` on every call site that passed stack args. `b710056` (2026-04-30 20:28:16) reverted both files (codegen 4 lines, preprocess 18 lines) after `bootstrap_validate.sh` was observed hanging on stage1 → src/alloc.c.
+
+**Applies to swap-out.** Yes, load-bearing. Swap-out's cut-point sits between the bad commit and the revert. Bootstrap on swap-out hangs identically (chibicc and spec tokenizers both — confirms the bug is in codegen, not tokenize).
+
+**Action taken.** Re-implemented the codegen revert on swap-out (delete the duplicate cleanup in `src/codegen_arm64.c`'s `gen_funcall`). Bootstrap fixed-point reached under both tokenizers post-fix.
+
+**Action deferred.** The preprocess.c side of the original revert (paste/expand_macro position-flag inheritance, 18 lines) is *not* applied here. Per `b710056`'s message, those changes "on their own may still be valid" but weren't worth bisecting. Swap-out's preprocessor will be replaced wholesale in Phase 2 from spec, so re-applying main's revert on a soon-to-be-discarded file is wasted work. If Phase 2's spec-derived preprocessor exhibits any of the symptoms `a23f2d1` was originally trying to fix, we'll address them then.
