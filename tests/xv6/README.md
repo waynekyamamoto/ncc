@@ -22,15 +22,31 @@ tests/xv6/
 # One-time: clone the upstream xv6 source somewhere
 git clone https://github.com/k-mrm/xv6-aarch64 ~/xv6/xv6-aarch64
 
-# Build
+# Build (default: ncc2 if it exists, otherwise ncc)
 ./build.sh
 
-# Boot (via QEMU directly, or via the Dockerfile)
+# Boot directly via QEMU
 qemu-system-aarch64 -cpu cortex-a72 -machine virt,gic-version=3 \
   -kernel ~/xv6/build/xv6_ncc/kernel/kernel -m 128M -smp 4 -nographic \
   -drive file=~/xv6/build/xv6_ncc/fs.img,if=none,format=raw,id=x0 \
   -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
 ```
+
+At the `$` prompt, try `hanoi 4` (or any of the standard xv6 commands:
+ls, cat README, etc.).
+
+## Boot inside Docker
+
+The `Dockerfile` bundles the built kernel + `fs.img` with QEMU into a
+container so you can boot xv6 with a single `docker run`:
+
+```bash
+docker build -f tests/xv6/Dockerfile -t xv6-ncc ~/xv6/
+docker run --rm -i xv6-ncc
+```
+
+(The build context is `~/xv6/` because that's where the build artifacts
+live — `build/xv6_ncc/{kernel,fs.img}`.)
 
 ## Env overrides
 
