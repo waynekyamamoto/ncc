@@ -13,7 +13,16 @@ set -e
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 REPO_DIR=$(cd "$SCRIPT_DIR/../.." && pwd)
-NCC="$REPO_DIR/ncc"
+# Prefer the bootstrapped ncc2 (proves the build survives the self-hosted
+# compiler) when one exists; fall back to the host-built ncc.  Override
+# with NCC=path.
+if [ -n "${NCC:-}" ]; then
+  :
+elif [ -x "$REPO_DIR/ncc2" ]; then
+  NCC="$REPO_DIR/ncc2"
+else
+  NCC="$REPO_DIR/ncc"
+fi
 XV6="${XV6_SRC:-$HOME/xv6/xv6-aarch64}"
 BUILD="${XV6_BUILD:-$HOME/xv6/build/xv6_ncc}"
 
@@ -26,8 +35,12 @@ fi
 
 mkdir -p "$BUILD/kernel" "$BUILD/user"
 
-echo "=== Building ncc ==="
-(cd "$REPO_DIR" && make -j$(sysctl -n hw.ncpu))
+if [ ! -x "$NCC" ]; then
+  echo "=== Building ncc ($NCC missing) ==="
+  (cd "$REPO_DIR" && make -j$(sysctl -n hw.ncpu))
+else
+  echo "=== Using existing ncc: $NCC ==="
+fi
 
 echo ""
 echo "=== Phase 3: Kernel C files (ncc -target elf) ==="
@@ -128,6 +141,17 @@ echo "  OK: _forktest"
 aarch64-elf-ld -z max-page-size=4096 -N -e start -Ttext 0 \
   -o "$BUILD/user/initcode.out" "$BUILD/user/initcode.o" 2>/dev/null
 aarch64-elf-objcopy -S -O binary "$BUILD/user/initcode.out" "$BUILD/user/initcode"
+
+echo ""
+echo "=== Phase 4: Build mkfs (host tool) ==="
+# mkfs is a host-side tool that constructs the xv6 filesystem image; built
+# with the host's cc, not ncc.
+if [ ! -x "$XV6/mkfs/mkfs" ]; then
+  # -I. forces clang to look for "kernel/types.h" relative to the cwd
+  # before consulting the macOS SDK's `kernel` framework.
+  (cd "$XV6" && cc -Werror -Wall -I. -o mkfs/mkfs mkfs/mkfs.c)
+fi
+echo "  OK: mkfs"
 
 echo ""
 echo "=== Phase 4: Build fs.img ==="
