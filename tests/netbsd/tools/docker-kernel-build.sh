@@ -61,6 +61,16 @@ ls -l /xv6/ncc
 echo "=== Cross-as symlink ==="
 ln -sf /netbsd/tooldir/bin/aarch64--netbsd-as /usr/local/bin/aarch64-elf-as
 
+echo "=== Regenerating build dir from current $KERNEL config ==="
+# Without this, nbmake just rebuilds .o's against the build dir's
+# baked-in config.  Edits to /xv6/tests/netbsd/$KERNEL (synced into
+# /netbsd/src/sys/arch/evbarm/conf/$KERNEL by the host build.sh)
+# are silently ignored.  config(8) regenerates ioconf.c, the
+# generated headers, and the Makefile from the .conf file.
+cd /netbsd/src/sys/arch/evbarm/conf
+/netbsd/tooldir/bin/nbconfig -b /netbsd/obj/sys/arch/evbarm/compile/"$KERNEL" \
+                             -s /netbsd/src/sys "$KERNEL"
+
 echo "=== Re-pointing build-dir symlinks to Docker paths ==="
 cd /netbsd/obj/sys/arch/evbarm/compile/"$KERNEL"
 ln -sfn /netbsd/src/sys/arch/evbarm/include machine

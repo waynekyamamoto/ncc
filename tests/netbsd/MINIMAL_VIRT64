@@ -28,10 +28,18 @@ options 	INCLUDE_CONFIG_FILE
 # accommodate full-kernel ksyms without the "increase KSYMS_MAX_ID" warning.
 options 	KSYMS_MAX_ID=2000000
 
-# File systems — keep ffs registered so the mountroot path has at least
-# one fs type to enumerate.  We never actually mount; reaching the
-# "root device:" prompt is the success milestone.
+# File systems.
+# FFS is the root.  The rest are needed by /etc/rc when running a real
+# userland: mount_ptyfs, mount_procfs, mount_tmpfs, mount_msdos all
+# fail with "Operation not supported by device" if their fs isn't
+# registered in the kernel.  KERNFS is cheap insurance for scripts
+# that peek at /kern.
 file-system	FFS
+file-system	PTYFS
+file-system	PROCFS
+file-system	TMPFS
+file-system	MSDOSFS
+file-system	KERNFS
 
 # Networking — INET is referenced by lots of kernel infrastructure
 # (sockets, ifnet) even with no network drivers.  INET6 is here only
@@ -103,3 +111,13 @@ pseudo-device	loop
 pseudo-device	pty
 pseudo-device	ksyms
 pseudo-device	clockctl
+
+# Needed by userland once a real /etc/rc runs:
+#   putter  — generic upper layer used by tmpfs / ptyfs / etc.
+#   drvctl  — devpubd uses this to discover/publish devices
+#   fss     — file system snapshots (used by some periodic scripts)
+# PTYFS is a file-system (declared above) — there is no separate
+# `pseudo-device ptyfs`; it uses the existing `pseudo-device pty`.
+pseudo-device	putter
+pseudo-device	drvctl
+pseudo-device	fss
