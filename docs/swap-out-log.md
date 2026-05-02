@@ -68,6 +68,34 @@ Format per entry:
 
 ---
 
+## 2026-05-02: Phase 1 swap-in attempt — BLOCKED (candidate is broken)
+
+**Attempted**: Close Phase 1 by swapping in the spec-derived tokenizer — `git rm src/tokenize.c; git mv src/tokenize_v2.c src/tokenize.c`; simplify `Makefile` (drop the v2 dual-build); delete `scripts/validate_tokenizer.sh`; remove `ncc-v2`/`stage*_v2` `.gitignore` entries.
+
+**Outcome**: BLOCKED. The swap-in was performed in the working tree only — no commit landed. After `make clean && make ncc`, the `scripts/bootstrap_validate.sh` chain hangs.
+
+**Failure mode (reproducible)**: `./ncc` (built by clang with the spec-derived tokenize) compiles `src/*.c` → `stage1/*.o` → `stage1/ncc` to completion. Then `stage1/ncc -c -o stage2/alloc.o src/alloc.c` infinite-loops at ~100% CPU on a 37-line file. Killed after ~8 minutes of accumulated CPU with no output produced.
+
+**Bootstrap**: FAIL (hang in stage2 → src/alloc.c).
+
+**Diagnosis — bug is in the spec-derived tokenizer, not in inherited codegen**:
+- `git diff origin/main..swap-out -- src/codegen_arm64.c` is empty. Swap-out's codegen is byte-identical to current main's (post-revert of `b710056`), and main self-hosts cleanly there.
+- The only delta vs main that affects build output is `tokenize.c` (chibicc on main; spec-derived after the swap-in on swap-out).
+- ∴ the spec tokenizer must be producing wrong tokens for some construct in `src/*.c`. Wrong tokens → wrong parse → wrong codegen → `stage1/ncc` is internally miscompiled → infinite loop on whatever `alloc.c` happens to invoke first in stage2's build order.
+- Note: `alloc.c` hanging does not mean the bug is *triggered by* `alloc.c` content. `alloc.c` is the first source file stage2 builds; the broken code path may have been laid down when `./ncc` mistokenized something else (e.g. `parse.c`, `codegen_arm64.c`) and emitted wrong assembly for that.
+
+**Why the 2026-04-30 entry's "PASS" claims were misleading**:
+- `Bootstrap (ncc-v2): PASS — md5 = 2eef62e6...` was annotated "from the pre-rebase measurement; re-confirmed in sanity check" — but the sanity check on this rebased branch was never actually run. The self-host claim is unverified at this branch tip.
+- `Tokenizer-corpus diff PASS=26 FAIL=0, bit-for-bit on sqlite3.c (1.1M tokens)` was true for `sqlite3.c`. But the corpus tested did *not* include ncc's own source (~13k lines of `src/*.c`). The bug-triggering construct evidently exists in `src/*.c` but not in `sqlite3.c`. Phase 1 closure-readiness was overconfident on the strength of a corpus that did not exercise the compiler's own source.
+
+**Status**: Phase 1 candidate is **not closeable**. `tokenize_v2.c` and `tokenize.c` (chibicc) both remain at their `2efcde9` content; the alt-binary `ncc-v2` Makefile target also remains intentionally — both binaries are needed for the next debug step.
+
+**Next step (debug plan)**: bisect with `-fdump-tokens`. From `~/ncc-swapout/`: `make ncc` (chibicc) + `make ncc-v2` (spec-derived; alt binary already builds at `2efcde9`). For each `src/*.c` file: `./ncc -fdump-tokens FILE > /tmp/a.tok; ./ncc-v2 -fdump-tokens FILE > /tmp/b.tok; diff`. The first file with diffs identifies the construct the spec tokenizer mishandles. Once isolated, fix `tokenize_v2.c` (or amend `docs/specs/01_tokenizer.md` if the spec is wrong), re-run the corpus diff against `src/*.c`, then re-attempt the swap-in.
+
+**Phase 1 closure also blocked on**: divergence-log catch-up — 21 commits landed on `main` between cut-point `7ff0860` and `origin/main` tip `cc92e6f` and need entries below per `docs/main-commit-contract.md`. Compiler-relevant subset: `8fe8dda` (`__sync_*` ARM64 builtins — closes the Day-0 sqlite workaround), `4ed0320` (ELF target + ARM arch predefines), `93c6ecc` (NetBSD source-compat features), `e7e7393` (variadic va_start fix when fn has >8 named params), `ff529fb` (forward-static-fn refs in file-scope initializers), `150f17d` (parse: FP-typed nodes not evaluated as int64), `b710056` (revert of the cherry-picked SP-cleanup — already-reverted on main; swap-out's codegen has the post-revert state, no action needed beyond logging). The remaining 14 commits are test infrastructure or docs (low signal but record per contract).
+
+---
+
 ## Divergence log: changes on `main` since swap-out cut
 
 Tracking commits that land on `main` (`docs/main-commit-contract.md` defines what each entry needs to provide). The swap-out branch will not merge or cherry-pick these; instead, at each phase boundary, this list gets walked and each entry is checked against the reimplemented code. See `docs/main-commit-contract.md` for the contract.
