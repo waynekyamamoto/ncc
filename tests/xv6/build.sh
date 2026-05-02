@@ -143,13 +143,15 @@ aarch64-elf-ld -z max-page-size=4096 -N -e start -Ttext 0 \
 aarch64-elf-objcopy -S -O binary "$BUILD/user/initcode.out" "$BUILD/user/initcode"
 
 echo ""
-echo "=== Phase 4: Build mkfs (host tool) ==="
-# mkfs is a host-side tool that constructs the xv6 filesystem image; built
-# with the host's cc, not ncc.
+echo "=== Phase 4: Build mkfs (host tool, also via ncc) ==="
+# mkfs is a host-side tool that constructs the xv6 filesystem image. ncc
+# without -target elf produces a Mach-O binary that runs on macOS — same
+# compiler, different output format. Building it with ncc keeps the goal
+# of "every C file in the xv6 build goes through ncc" intact.
 if [ ! -x "$XV6/mkfs/mkfs" ]; then
-  # -I. forces clang to look for "kernel/types.h" relative to the cwd
-  # before consulting the macOS SDK's `kernel` framework.
-  (cd "$XV6" && cc -Werror -Wall -I. -o mkfs/mkfs mkfs/mkfs.c)
+  # -I. forces the include resolver to look for "kernel/types.h" relative
+  # to the cwd before consulting the macOS SDK's `kernel` framework.
+  (cd "$XV6" && "$NCC" -I. -o mkfs/mkfs mkfs/mkfs.c)
 fi
 echo "  OK: mkfs"
 
