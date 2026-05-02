@@ -51,6 +51,12 @@ cd /xv6
 make clean >/dev/null
 make CC=gcc CFLAGS="-Wall -std=c11 -g -O2 -Wno-unused-parameter -Wno-switch -D_GNU_SOURCE" >/dev/null 2>&1
 ls -l /xv6/ncc
+# NOTE: ncc cannot yet self-bootstrap on Linux. /usr/include/limits.h uses
+# #include_next (an ncc-unsupported GCC extension) and /usr/include/stdio.h
+# uses __gnuc_va_list (also unrecognized). The kernel build itself is
+# unaffected because nbmake invokes ncc with -nostdinc + --sysroot=, so
+# system headers aren't read. Re-enable the bootstrap step here once ncc
+# grows #include_next and the gcc-extension typedefs.
 
 echo "=== Cross-as symlink ==="
 ln -sf /netbsd/tooldir/bin/aarch64--netbsd-as /usr/local/bin/aarch64-elf-as

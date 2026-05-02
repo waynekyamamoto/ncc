@@ -468,7 +468,14 @@ int main(int argc, char **argv) {
 
   // Add system include paths AFTER user -I paths so that -I overrides system headers.
   // This is standard GCC/Clang behavior: user -I paths shadow system paths.
+#ifdef __APPLE__
   add_include_path("/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include");
+#else
+  // Debian/Ubuntu multiarch: glibc bits/ headers live under the triple-named
+  // subdirectory. Without this, e.g. <stdio.h> -> <bits/wordsize.h> fails to
+  // resolve when ncc is bootstrapping itself on Linux.
+  add_include_path("/usr/include/aarch64-linux-gnu");
+#endif
   add_include_path("/usr/local/include");
   add_include_path("/usr/include");
 
