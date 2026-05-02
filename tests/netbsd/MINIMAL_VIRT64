@@ -1,0 +1,105 @@
+#
+#	MINIMAL_VIRT64 — diagnostic kernel config for ncc port
+#
+#	Goal: reach the "root device:" prompt under QEMU virt with the
+#	smallest plausible kernel.  Used to determine whether ncc-bloat
+#	(rather than something else) is what's keeping the GENERIC64-built
+#	kernel from booting.
+#
+#	NOT FOR PRODUCTION.  Drops ACPI, DRM, COMPAT_*, IPSEC, NPF, NFS,
+#	KDTRACE, sanitizers, every SoC, every PCI/USB/SDMMC driver beyond
+#	what QEMU virt presents (PL011, GICv3, generic timer, virtio).
+#
+#	Lives under arch/evbarm/conf/ but is NOT meant to be pushed
+#	upstream — host-side experimental config.
+#
+
+include	"arch/evbarm/conf/std.generic64"
+include	"arch/evbarm/conf/files.generic64"
+
+maxusers	16
+
+options 	CPU_CORTEX
+options 	ARMV81_PAN
+options 	INCLUDE_CONFIG_FILE
+
+# ncc's debug-symbol count is much higher than gcc's (no symbol coalescing
+# in our codegen); the default cap (98304) is far too small.  Bumped to
+# accommodate full-kernel ksyms without the "increase KSYMS_MAX_ID" warning.
+options 	KSYMS_MAX_ID=2000000
+
+# File systems — keep ffs registered so the mountroot path has at least
+# one fs type to enumerate.  We never actually mount; reaching the
+# "root device:" prompt is the success milestone.
+file-system	FFS
+
+# Networking — INET is referenced by lots of kernel infrastructure
+# (sockets, ifnet) even with no network drivers.  INET6 is here only
+# because tcp_subr.c references ip6_dad_count even when nothing in the
+# build uses IPv6 directly; stripping INET6 fails to link.
+options 	INET
+options 	INET6
+
+# Required compatibility shim — even with no userland binaries, some
+# kernel module tables reference compat fields.  Keep COMPAT_NETBSD32
+# off; we are not running 32-bit binaries.
+options 	EXEC_ELF32
+
+# Standard kernel facilities
+options 	MODULAR
+options 	MODULAR_DEFAULT_AUTOLOAD
+options 	SYSVMSG
+options 	SYSVSEM
+options 	SYSVSHM
+
+# Wedge / GPT auto-discovery so GPT-partitioned disks present partitions
+# as dk0, dk1, ... — required for booting from a NetBSD/aarch64 SD-card-
+# style image attached as virtio-blk.
+options 	DKWEDGE_AUTODISCOVER
+options 	DKWEDGE_METHOD_GPT
+
+# Crank these up; the defaults trip on big builds.
+options 	CHILD_MAX=1024
+options 	OPEN_MAX=1024
+
+makeoptions	DEBUG="-g"
+makeoptions	COPY_SYMTAB=1
+
+config		netbsd		root on ? type ?
+
+# --- Devices: just what QEMU virt presents -----------------------------------
+
+# Device tree
+armfdt0 	at root
+simplebus*	at fdt? pass 0
+
+# CPUs / PSCI / generic timer
+cpus*		at fdt? pass 0
+cpu*		at fdt? pass 0
+psci*		at fdt? pass 0
+gtmr*		at fdt? pass 2
+armgtmr0	at gtmr?
+
+# Interrupt controller — QEMU virt provides GICv3.
+gicvthree*	at fdt? pass 1
+
+# Console — QEMU virt UART is a PL011.
+plcom*		at fdt? pass 4
+
+# Virtio (over MMIO under QEMU virt; over PCI if we add a virtio-pci controller)
+virtio* 	at fdt?
+ld*		at virtio?
+vioif*		at virtio?
+viornd* 	at virtio?
+vioscsi*	at virtio?
+
+# SCSI bus support (vioscsi attaches sd here)
+scsibus*	at scsi?
+sd*		at scsibus? target ? lun ?
+
+# --- Pseudo-devices ---------------------------------------------------------
+
+pseudo-device	loop
+pseudo-device	pty
+pseudo-device	ksyms
+pseudo-device	clockctl
