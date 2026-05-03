@@ -25,8 +25,8 @@ from `main` commits `4ed0320` and `8fe8dda` (`__ELF__`, `__ARM_ARCH`,
 `__ARM_ARCH_8A__`, `__ARM_PCS_AAPCS64`) are explicitly **out of scope**
 and are deferred to Phase 5; see §15.
 
-**Current status (2026-05-03):** §1–§7, §13–§15 drafted.
-§8–§12 remain stubbed; next batch covers §8–§10.
+**Current status (2026-05-03):** §1–§10, §13–§15 drafted.
+§11–§12 remain stubbed; next batch (the last) covers them.
 
 ---
 
@@ -703,32 +703,362 @@ preserved for behavioral compatibility with the corpus.
 
 ## 8. Conditional inclusion
 
-> **STUB — to be drafted in batch §8–§10.** Subsections: 8.1
-> `#if`/`#ifdef`/`#ifndef`; 8.2 `#elif`/`#else`; 8.3 `#endif`; 8.4
-> `skip_cond_incl` (skipping not-taken branches); 8.5
-> `handle_pp_directive_in_arg` (conditional directives inside macro
-> argument lists).
+The preprocessor maintains a stack of `CondIncl` records (§2.5)
+that tracks open `#if` / `#ifdef` / `#ifndef` blocks. Each block
+has three observable phases tracked by `ctx`: `IN_THEN` (currently
+inside the initial branch), `IN_ELIF` (currently inside an `#elif`
+branch), `IN_ELSE` (currently inside the `#else` branch). The
+`included` flag records whether *any* branch of the chain has been
+selected for inclusion; once true, all subsequent branches are
+skipped.
+
+### 8.1 `#if`, `#ifdef`, `#ifndef`
+
+**`#if expr`:** call `eval_const_expr(&tok, tok->next)` (§9) to
+evaluate the rest-of-line expression. Push a new `CondIncl` onto
+`cond_incl` with `ctx = IN_THEN`, `tok = start` (the `#`),
+`included = (val != 0)`. If the value is zero, skip-forward via
+`skip_cond_incl(tok)` to position `tok` at the next `#elif` /
+`#else` / `#endif` at the current depth.
+
+**`#ifdef name`** and **`#ifndef name`:** look up `name` in the
+macro hashmap directly (no macro expansion of the operand —
+`#ifdef NAME` checks whether `NAME` is defined, not whether `NAME`
+expands to something defined). Push a `CondIncl` with `included`
+set to `true` for `#ifdef` (when defined) or `#ifndef` (when not
+defined). If `included` is false, `skip_cond_incl(tok)` to the
+next branch directive.
+
+The operand identifier is required to be `TK_IDENT` or
+`TK_KEYWORD`; otherwise raises `error_tok`. The directive
+consumes the rest of its line via `skip_line`.
+
+### 8.2 `#elif` and `#else`
+
+**`#elif expr`:** legality check first — `cond_incl` must be
+non-NULL (otherwise stray `#elif`) and `cond_incl->ctx` must not
+be `IN_ELSE` (an `#elif` after `#else` is illegal). Set
+`cond_incl->ctx = IN_ELIF`. Then:
+
+- If `cond_incl->included` is already `true`: a previous branch
+  was selected; this `#elif` is a no-op for inclusion. Call
+  `skip_cond_incl(tok)` to advance.
+- Otherwise: evaluate the expression. If non-zero, set
+  `cond_incl->included = true` and *resume processing* (the
+  `#elif`-following tokens become live). If zero,
+  `skip_cond_incl(tok)`.
+
+**`#else`:** same legality (non-NULL stack, not already in
+`IN_ELSE`); set `ctx = IN_ELSE`. If `included` is already `true`,
+`skip_cond_incl(tok)`; otherwise set `included = true` and resume
+processing the body.
+
+### 8.3 `#endif`
+
+Pop `cond_incl`. If the stack is already empty, raise
+`error_tok(start, "stray #endif")`. After pop, `skip_line(tok->next)`
+to advance past the directive.
+
+### 8.4 `skip_cond_incl` and `skip_cond_incl2`
+
+These two functions implement the "skip an unselected branch"
+walk. `skip_cond_incl` returns `tok` positioned at the first
+`#elif` / `#else` / `#endif` *at the current nesting depth*;
+`skip_cond_incl2` skips a fully-nested `#if*` block to its
+matching `#endif`.
+
+**`skip_cond_incl(tok)`:** walk forward token-by-token. At each
+`is_hash(tok)`:
+- If the directive is `if` / `ifdef` / `ifndef`: a nested block
+  begins here. Call `skip_cond_incl2(tok->next->next)` to skip
+  the entire nested block, then continue.
+- If the directive is `elif` / `else` / `endif`: this is the next
+  branch directive at the current depth. Stop and return `tok`.
+- Otherwise: advance one token.
+
+**`skip_cond_incl2(tok)`:** walk forward looking for the matching
+`#endif`. At each `is_hash(tok)`:
+- If `if` / `ifdef` / `ifndef`: recursive call to skip another
+  nested level.
+- If `endif`: return `tok->next->next` (just past the `#endif`).
+- Otherwise: advance.
+
+Both functions never consume tokens into the output stream — they
+purely seek. The caller (`preprocess2` or the `#elif` handler)
+resumes at the returned position.
+
+### 8.5 `handle_pp_directive_in_arg`
+
+When a `#if` family directive appears *inside* a macro argument
+list (e.g., the Linux kernel's `decompress_inflate.c` pattern of
+splitting a ternary expression across `#ifdef`),
+`read_macro_args` (§6.3) calls `handle_pp_directive_in_arg(tok)`
+to resolve it inline.
+
+The handler shares the same `cond_incl` stack as the main loop,
+which means a `#if` opened inside a macro argument can be closed
+by an `#endif` outside it (and vice versa) — the stack does not
+know which level opened it. After `preprocess()` returns, the
+post-loop check verifies the stack is empty; an unclosed
+in-argument directive will be caught there.
+
+Supported directives inside argument lists: `#if`, `#ifdef`,
+`#ifndef`, `#elif`, `#else`, `#endif`. Handling mirrors the main
+loop's per-directive logic (push, evaluate, skip). Other
+directives (`#define`, `#undef`, etc.) inside an argument list
+cause the rest of the line to be silently skipped — the body
+tokens of those directives are not honored.
 
 ---
 
 ## 9. Constant-expression evaluation (`eval_const_expr`)
 
-> **STUB — to be drafted in batch §8–§10.** Six-step pipeline from
-> `read_const_expr` through `convert_pp_tokens` to the recursive-
-> descent evaluator. `__has_attribute` / `__has_builtin` allowlist
-> consultation. `__has_feature` returns 0 (Q5).
+`eval_const_expr` evaluates a `#if` / `#elif` expression. The
+pipeline has six stages, in order:
+
+### 9.1 Stage 1 — `read_const_expr`
+
+Copies the directive's rest-of-line (via `copy_line`) and performs
+two pre-evaluation transformations on the copy:
+
+1. **`__has_attribute(NAME)`, `__has_builtin(NAME)`,
+   `__has_feature(NAME)` lowering.** Each is replaced with a
+   `TK_PP_NUM` token whose `loc` is `"1"` or `"0"` (with `len = 1`).
+   - `__has_attribute`: `1` if `NAME` is in the supported-attributes
+     allowlist (§13 documents this allowlist; the spec recommends
+     moving it to `cc.h` per Q13B). Both single-underscore (e.g.,
+     `packed`) and double-underscore (e.g., `__packed__`) forms are
+     accepted.
+   - `__has_builtin`: `1` if `NAME` is in the supported-builtins
+     allowlist.
+   - `__has_feature`: always `0` (Q5).
+
+2. **`__has_include(...)`, `__has_include_next(...)` lowering.**
+   The argument can be either a `TK_STR` (`"foo.h"`) or a
+   bracketed sequence (`<foo.h>`, concatenating the inter-bracket
+   token spellings). Replaced with `1` if `search_include_paths`
+   finds the file, `0` otherwise.
+
+After these substitutions, a third in-place pass walks the line
+and replaces every `defined(NAME)` or `defined NAME` with a
+`TK_PP_NUM` `"1"` or `"0"` based on macro-table membership.
+(`NAME` must be `TK_IDENT` or `TK_KEYWORD`; the parenthesized form
+consumes the closing `)`.)
+
+The result is a token list (terminated by `TK_EOF`) ready for
+macro expansion.
+
+### 9.2 Stage 2 — recursive `preprocess2`
+
+The transformed list is run through `preprocess2(expr)` to expand
+any remaining macros in the expression. This is the recursive
+re-entry mentioned in §5: macros in `#if` conditions are fully
+expanded.
+
+### 9.3 Stage 3 — post-expansion `defined` pass
+
+After macro expansion, identifiers that *expanded into* `defined`
+need a second pass. `eval_const_expr` walks the expanded list and
+again replaces `defined(NAME)` / `defined NAME` with `1`/`0`.
+This is what allows constructs like:
+
+```c
+#define IS_DEFINED(x) defined(x)
+#if IS_DEFINED(FOO)
+```
+
+to work — the first `read_const_expr` pass doesn't see `defined`
+because it's hidden inside the macro body; only after `preprocess2`
+expands `IS_DEFINED(FOO)` to `defined(FOO)` does it become
+visible. The post-expansion pass catches it.
+
+### 9.4 Stage 4 — identifier-to-zero
+
+After the post-expansion `defined` pass, any remaining `TK_IDENT`
+in the stream is replaced with a `TK_PP_NUM` `"0"`. This implements
+the C standard rule that "any identifier that is not currently
+defined as a macro evaluates to 0" inside a `#if` expression.
+
+**Test case** from the inventory: `#define ZERO 0\n#if ZERO\n` —
+the `ZERO` identifier expands to `0` (a `TK_PP_NUM` after step 2),
+not to `1` (defined-ness). This is what makes the test
+`tests/regression/20_zero_object_macro_in_if.c` meaningful.
+
+### 9.5 Stage 5 — `convert_pp_tokens`
+
+Calls `convert_pp_tokens(expr)` to lower every `TK_PP_NUM` to a
+typed `TK_NUM`. After this stage, the stream contains only `TK_NUM`,
+operators (`TK_PUNCT`), and the terminating `TK_EOF`.
+
+### 9.6 Stage 6 — recursive-descent evaluator (`const_expr`)
+
+Evaluates the converted expression as a `long`. The grammar (in
+descending precedence) is the C operator precedence:
+
+```
+const_expr  := cond
+cond        := logor ('?' const_expr ':' cond)?
+logor       := logand ('||' logand)*
+logand      := bitor ('&&' bitor)*
+bitor       := bitxor ('|' bitxor)*
+bitxor      := bitand ('^' bitand)*
+bitand      := equality ('&' equality)*
+equality    := relational (('==' | '!=') relational)*
+relational  := shift (('<' | '<=' | '>' | '>=') shift)*
+shift       := add (('<<' | '>>') add)*
+add         := mul (('+' | '-') mul)*
+mul         := unary (('*' | '/' | '%') unary)*
+unary       := ('+' | '-' | '!' | '~') unary | primary
+primary     := '(' const_expr ')'
+            |  TK_NUM (returns tok->val)
+            |  TK_PP_NUM (parses with strtol(loc, &end, 0); skips
+                          any [uUlL] suffix; returns parsed value)
+```
+
+After `const_expr` returns, `eval_const_expr` checks that the
+remaining token is `TK_EOF`; if not, it raises `error_tok(rest,
+"extra token in constant expression")`.
+
+**Type semantics:** all arithmetic is performed as signed `long`
+(implementation-specific; on this target, 64-bit). The C standard
+mandates `intmax_t` semantics for `#if` evaluation; `long` is the
+same width as `intmax_t` on aarch64 macOS, so no observable
+divergence today. (Logged here in case a future port to a 32-bit
+target needs to revisit.)
+
+**Errors raised by the evaluator:**
+- Division by zero (`/` or `%`) raises `error_tok(tok, "division
+  by zero in preprocessor expression")`.
+- A `primary` that is neither `(` nor `TK_NUM` nor `TK_PP_NUM`
+  raises `error_tok(tok, "expected a number")`.
 
 ---
 
 ## 10. `#include` resolution
 
-> **STUB — to be drafted in batch §8–§10.** Subsections: 10.1
-> `#include "..."` (current-dirname-first search); 10.2
-> `#include <...>` (`include_paths` only); 10.3 `#include_next`;
-> 10.4 `read_include_filename` (three patterns); 10.5
-> `search_include_paths` (using `access(R_OK)` per Q2, replacing
-> `main`'s leaking `fopen`); 10.6 `include_file` splice semantics
-> (Q11: behavior specified, mechanism not).
+The `#include` and `#include_next` directives are handled inline
+in `preprocess2` (§5). They share `read_include_filename` for
+parsing the operand and `include_file` for splicing the included
+stream.
+
+### 10.1 `#include "foo.h"` and `#include <foo.h>`
+
+`read_include_filename(&tok, tok->next, &is_dquote)` returns the
+filename string and sets `is_dquote` to indicate the form.
+
+For the `"..."` form (`is_dquote = true`):
+1. Try `dirname(start->file->name) + "/" + filename` first
+   (search relative to the directory of the `#include`-ing file).
+   The search uses `fopen` to test existence (Q2: new impl uses
+   `access(R_OK)`).
+2. If not found, fall through to `search_include_paths(filename)`.
+
+For the `<...>` form (`is_dquote = false`):
+- Only `search_include_paths(filename)` is consulted; the
+  current-file directory is not tried first.
+
+If neither search finds the file, raises `error_tok(start, "'%s':
+file not found", filename)`.
+
+When found, calls `include_file(tok, path, start->next)` (§10.5)
+to splice the included stream.
+
+### 10.2 `#include_next "foo.h"` / `#include_next <foo.h>`
+
+A GCC extension for header wrappers that need to delegate to the
+"next" same-named header in the search order. Used in glibc-style
+`#include_next <stdio.h>` after redefining macros.
+
+Algorithm: locate the directory of the `#include`-ing file
+(`dirname(start->file->name)`) in `include_paths` (linear `strcmp`
+scan). If found at index `i`, call `search_include_next(filename,
+i + 1)` to search from the next index onward. If the current file
+is not in `include_paths`, search starts from index `0` (i.e.,
+behaves identically to plain `#include`).
+
+If no path finds the file, raises `error_tok`.
+
+### 10.3 `read_include_filename` — three patterns
+
+Returns a malloc'd string (the filename) and sets `*is_dquote` to
+indicate which pattern matched:
+
+**Pattern 1: `TK_STR`** (`#include "foo.h"`). Set `*is_dquote =
+true`. The filename is `strndup_checked(tok->str, tok->ty->array_len -
+1)` (drops the implicit NUL added by tokenizer's string-literal
+processing). Skip the rest of the line.
+
+**Pattern 2: `<...>`** (`#include <foo.h>`). Set `*is_dquote =
+false`. Walk tokens forward until `>`; concatenate each token's
+`loc[0..len)` into a buffer (with single-space separation between
+tokens that have `has_space = true`, except for the first). Use
+`open_memstream` for the buffer (Q14: replace with C11 grow-buf
+helper in new impl).
+
+If a `\n` (`tok->at_bol`) or `TK_EOF` is hit before `>`, raise
+`error_tok(start, "expected '>'")`.
+
+**Pattern 3: macro-expanded** (`#include FOO`). When the operand
+is a `TK_IDENT`, recursively call `preprocess2(copy_line(rest,
+tok))` to macro-expand the rest-of-line. Then recursively call
+`read_include_filename` on the expanded result (which should now
+match Pattern 1 or 2).
+
+If the operand is none of these, raise `error_tok(tok, "expected a
+filename")`.
+
+### 10.4 `search_include_paths` and `search_include_next`
+
+Linear scans of the `include_paths` list. For each entry, build
+`path = format("%s/%s", entry, filename)` and probe for
+existence.
+
+**Existence check:** the current implementation uses `if (fopen(path,
+"r"))` — and never closes the returned `FILE *`. This is a real
+file-descriptor leak (one FD per probed path per `#include`).
+
+Per Q2, the new implementation **fixes** this: probe with
+`access(path, R_OK) == 0`. This is the one place where the
+swap-out implementation deliberately diverges from `main`'s
+observable behavior (see §13). The diff is not visible to any
+existing test, but it eliminates a real resource leak.
+
+If `filename` starts with `/` (absolute path), it is returned
+directly without any search (no existence probe).
+
+`search_include_next(filename, start)` is identical to
+`search_include_paths` except the loop starts at `start` instead
+of 0; it never returns absolute paths directly (an absolute-path
+operand to `#include_next` would be unusual).
+
+### 10.5 `include_file` — splicing the included stream
+
+Called when a path has been resolved. Tokenizes the file, splices
+the resulting stream into the current token list at the position
+just after the `#include` directive, and returns the new
+"current" position.
+
+**Logical semantics:** the result is equivalent to "tokens of the
+included file, followed by the original `tok` (the position after
+`#include "foo.h"\n`)."
+
+**Current implementation mechanism** (per Q11, the spec
+under-specifies this and leaves it to the implementation):
+
+1. `tok2 = tokenize_file(path)`; if `NULL`, raise
+   `error_tok(filename_tok, "%s: cannot open file: %s", ...)`.
+2. Walk `tok2` to its terminal `TK_EOF` node.
+3. Overwrite that `TK_EOF` node's fields with the contents of
+   `tok` (`*t = *tok`). This in-place mutation re-purposes the
+   sentinel as the first continuing token.
+4. Return `tok2`.
+
+The mutation is an allocation-saving trick. A non-mutating
+implementation that walks to the end and links a copy of `tok` is
+also conformant. Callers must not retain a reference to the
+included file's original `TK_EOF` (its `kind` will change).
+
+---
 
 ---
 
