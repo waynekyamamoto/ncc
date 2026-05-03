@@ -25,9 +25,8 @@ from `main` commits `4ed0320` and `8fe8dda` (`__ELF__`, `__ARM_ARCH`,
 `__ARM_ARCH_8A__`, `__ARM_PCS_AAPCS64`) are explicitly **out of scope**
 and are deferred to Phase 5; see §15.
 
-**Current status (2026-05-03):** §1, §2, §3, §4, §13–§15 drafted.
-§5–§12 (the algorithmic core) remain stubbed pending the §2–§4
-review pass.
+**Current status (2026-05-03):** §1–§7, §13–§15 drafted.
+§8–§12 remain stubbed; next batch covers §8–§10.
 
 ---
 
@@ -312,35 +311,393 @@ return, though there is no current use case that does so.
 
 ## 5. Main directive-dispatch loop: `preprocess2(Token *tok)`
 
-> **STUB — to be drafted in batch §5–§7.** This section describes the
-> central walk-and-dispatch loop that powers the preprocessor: it
-> walks the token stream left-to-right, dispatching `#`-prefixed
-> directive lines (`is_hash(tok)`) to per-directive handlers (§6,
-> §8, §10, §12) and macro-expanding non-directive tokens via
-> `expand_macro` (§6.2). Recursively re-entered by `eval_const_expr`
-> to expand macros inside `#if` expressions, and by
-> `read_include_filename` to expand a macro that produces a header
-> filename.
+`preprocess2` is the central walk-and-dispatch loop that powers the
+preprocessor. It is called once per translation unit by `preprocess`
+(§4) and recursively by `eval_const_expr` (§9, to expand macros
+inside `#if` expressions) and by `read_include_filename` (§10.4, to
+expand a macro that produces a header filename).
+
+### 5.1 Algorithm
+
+Walk the input token stream left-to-right. At each token, in order:
+
+1. **Try macro expansion.** Call `expand_macro(&tok, tok)` (§6.2). If
+   it returns true, an expansion happened and `tok` was advanced;
+   continue the loop.
+2. **Non-directive token.** If `!is_hash(tok)` (i.e., not at a `#`
+   that starts a line per §2.1's `at_bol` rule), append `tok` to the
+   output stream, write `tok->line_delta = tok->file->line_delta`
+   onto it (the per-token snapshot per §2.1), advance, and continue.
+3. **Directive line.** Otherwise, dispatch on the directive name
+   (the token after `#`). Per-directive handlers consume the rest
+   of the directive's logical line and return `tok` positioned at
+   the next directive or non-directive token. Each handler is
+   responsible for not appending the directive's own tokens to the
+   output.
+4. **Null directive.** A `#` immediately followed by a newline (i.e.,
+   the next token is `at_bol`) is a no-op; advance and continue.
+5. **Unknown directive.** Anything else raises `error_tok(tok,
+   "invalid preprocessor directive")`.
+
+When the loop exits (`tok->kind == TK_EOF`), append the EOF token to
+the output stream and return.
+
+### 5.2 Directive table
+
+The directive name (the token after `#`) selects:
+
+| Directive | Handler | Spec section |
+|---|---|---|
+| `include` | inline include resolver | §10.1 |
+| `include_next` | inline include resolver, alternate search | §10.3 |
+| `define` | `read_macro_definition` | §6.1 |
+| `undef` | inline `undef_macro` call | §6.1 |
+| `if` | `eval_const_expr` + `push_cond_incl` + maybe `skip_cond_incl` | §8.1, §9 |
+| `ifdef` / `ifndef` | direct `hashmap_get2` + `push_cond_incl` + maybe `skip_cond_incl` | §8.1 |
+| `elif` | `eval_const_expr` if not yet included; otherwise skip | §8.2 |
+| `else` | toggle context, skip if already included | §8.2 |
+| `endif` | pop `cond_incl` stack | §8.3 |
+| `line` | recursive `preprocess2` + `convert_pp_tokens` to read the line number; update `file->line_delta` and optionally `display_name` | §12.1 |
+| `pragma` | inline `#pragma once` recognition (stub); skip rest of line | §12.2 |
+| `error` | `error_tok` (terminates) | §12.3 |
+| `warning` | `warn_tok` + skip rest of line | §12.3 |
+
+The dispatch is implemented as a sequence of `if (equal(tok,
+"...")) { ... continue; }` checks; the order matters only insofar as
+each handler must position `tok` correctly before the next iteration.
 
 ---
 
 ## 6. Macro expansion
 
-> **STUB — to be drafted in batch §5–§7.** Subsections planned:
-> 6.1 macro definition (`#define`, `#undef`); 6.2 `expand_macro`
-> (single-step expansion with hideset enforcement); 6.3
-> `read_macro_args`; 6.4 `subst` (substitution into body, including
-> `__VA_OPT__` and GNU `, ## __VA_ARGS__`); 6.5 builtin handler
-> macros (`__FILE__`, `__LINE__`, `__COUNTER__`, `__TIMESTAMP__`,
-> `__BASE_FILE__`).
+### 6.1 Macro definition: `#define`, `#undef`
+
+`#define` calls `read_macro_definition(&tok, tok->next)`. That
+function:
+
+1. Reads the macro name (one identifier or keyword).
+2. Determines whether the macro is **function-like** by the rule:
+   `!tok->has_space && equal(tok, "(")` after the name — i.e., a
+   `(` immediately following the name (no whitespace) marks
+   function-like; otherwise object-like. (Per Q7, the spec uses
+   the C11 phrasing: "a left parenthesis with no intervening white
+   space"; the implementation uses `has_space` to detect it.)
+3. For function-like, parses the parameter list:
+   - Comma-separated identifiers become `MacroParam` entries
+     (§2.3).
+   - A trailing `...` makes the macro variadic with
+     `va_args_name = "__VA_ARGS__"` (C99 standard form).
+   - A trailing `name...` (GNU named-variadic extension) sets
+     `va_args_name = "name"`.
+4. Reads the body: tokens up to the next `at_bol`, terminated with
+   `TK_EOF`.
+5. Calls `add_macro(name, is_objlike, body)` to register the macro.
+
+A redefinition is silent: the new entry overwrites the old in the
+hashmap. (No "already-defined" warning.)
+
+`#undef` reads one identifier or keyword and calls
+`undef_macro(name)`, which removes the entry from the hashmap.
+Undefining a macro that does not exist is silently a no-op.
+
+### 6.2 `expand_macro(Token **rest, Token *tok)` — single-step expansion
+
+Returns `true` if `tok` was a macro invocation that expanded;
+`false` otherwise. On `true`, `*rest` points at the start of the
+expansion result (which has the original `tok->next`-and-following
+appended after the expansion body).
+
+Algorithm:
+
+1. **Hideset check.** If `hideset_contains(tok->hideset, tok->loc,
+   tok->len)`, the macro name appears in the token's hideset —
+   expansion is suppressed. Return `false`.
+2. **Lookup.** `find_macro(tok)` returns the `Macro *` (or `NULL`).
+   `find_macro` accepts both `TK_IDENT` and `TK_KEYWORD` (per the
+   §2.1 note). If `NULL`, return `false`.
+3. **Builtin handler dispatch.** If `m->handler != NULL`, call
+   `m->handler(tok)` to produce the replacement token list. Splice
+   it in: `(*rest)->next = tok->next`. Return `true`. (See §6.5
+   for the handler implementations.)
+4. **Object-like macro** (`m->is_objlike == true`):
+   - Construct the body's hideset:
+     `hs = hideset_union(tok->hideset, new_hideset(m->name))`.
+   - `body = add_hideset(m->body, hs)` — copies every body token
+     and stamps the hideset onto each copy.
+   - Walk the body up to its `TK_EOF`; on each token, set
+     `t->origin = tok`. (The appended `tok->next` tail is **not**
+     touched — origin is body-only; see §13.)
+   - `body = append(body, tok->next)` — link the body to the
+     remaining input.
+   - `*rest = body`. Return `true`.
+5. **Function-like macro** (`m->is_objlike == false`):
+   - Require `equal(tok->next, "(")`. If not, return `false` (this
+     is not a function-like invocation; the identifier is left in
+     the stream as-is). This is the rule that lets `FOO` (without
+     `(...)`) appear in source even when `FOO` is a function-like
+     macro.
+   - Save `macro_tok = tok`. Call `read_macro_args(&tok, tok,
+     m->params, m->va_args_name)` (§6.3). This advances `tok` past
+     the closing `)`, and returns the argument list `args`. Save
+     `rparen = tok` (the position of the closing `)`).
+   - **Pre-expand** each argument once: for every `ap` in `args`,
+     `ap->expanded = preprocess2(copy_token_list(ap->tok))`. This
+     is the C standard's "rescan before substitution" pass; the
+     pre-expanded form is consumed by §6.4 for regular argument
+     substitution.
+   - **Painter's rule for hideset** (Q9 / ISO C11 §6.10.3.4):
+     `hs = hideset_intersection(macro_tok->hideset, rparen->hideset)`,
+     then `hs = hideset_union(hs, new_hideset(m->name))`.
+   - `body = subst(m->body, args)` (§6.4).
+   - `body = add_hideset(body, hs)`.
+   - Walk the body up to `TK_EOF`; on each token, set
+     `t->origin = macro_tok`.
+   - `body = append(body, tok)` (where `tok` now points just past
+     the `)`).
+   - `*rest = body`. Return `true`.
+
+The painter's-rule asymmetry — object-like uses
+`union(tok->hideset, {name})` directly; function-like uses the
+intersection of the macro-name and rparen hidesets — is the C
+standard's correctness condition for nested function-like calls.
+
+### 6.3 `read_macro_args` — argument collection
+
+Called with `tok` positioned at the macro name (the `(` is
+`tok->next`). Returns a `MacroArg` list of length
+`len(params) + (va_args_name ? 1 : 0)`.
+
+Algorithm:
+
+1. Skip the macro name and `(`. Save `start` for error reporting.
+2. **Per fixed parameter** (`pp` walks `params`):
+   - For all but the first, skip the leading `,`.
+   - Allocate a new `MacroArg`, set `arg->name = pp->name`.
+   - Read tokens into `arg->tok` until a `,` or `)` is reached at
+     nesting level 0. Track parenthesis nesting (`level++` on `(`,
+     `level--` on `)`) to allow commas inside nested parentheses
+     within an argument.
+   - **Conditional directives inside argument lists** are handled
+     by calling `handle_pp_directive_in_arg(tok)` whenever
+     `is_hash(tok)` matches inside the loop. This shares the
+     module's `cond_incl` stack with the main loop. Other
+     directives (`#define`, `#undef`, etc.) inside an argument
+     list cause the rest of the line to be skipped.
+   - End each argument with a `TK_EOF` sentinel.
+3. **Variadic tail** (when `va_args_name != NULL`):
+   - If at least one fixed parameter was consumed and the current
+     token is `,`, skip it (separator between fixed and variadic).
+     If no fixed parameters were consumed, any leading `,` is
+     part of the variadic tail (e.g., empty first variadic arg).
+   - Allocate `MacroArg` with `is_va_args = true`. Read tokens
+     until the matching `)` at nesting level 0, including any
+     commas as part of the variadic tokens.
+4. Verify the closing `)` and return.
+
+Errors: unclosed argument list raises `error_tok(start, "unclosed
+macro argument list")`.
+
+### 6.4 `subst(body, args)` — substitution into body
+
+Walks the macro body left-to-right and produces the substituted
+token list. Returns a new linked list (every input token is
+copied or replaced).
+
+For each input `tok`:
+
+1. **`#param` (stringize).** If `equal(tok, "#")`:
+   - `find_arg(args, tok->next)` must return a non-NULL `arg`;
+     otherwise `error_tok(tok->next, "'#' is not followed by a
+     macro parameter")`.
+   - Append `stringize(tok, arg->tok)` (§7.1) — note this uses
+     the **raw** `arg->tok`, not the pre-expanded `arg->expanded`,
+     per C11's "no rescan before stringization" rule.
+   - Advance past `#` and the parameter (two tokens).
+2. **`tok ## ...` (paste, possibly chained).** If `equal(tok->next,
+   "##")`:
+   - **Set up the LHS.** If `tok` is a parameter (`find_arg`
+     succeeds): if its raw arg is empty, skip both the empty arg
+     and the `##` (placemarker rule, §7.3); otherwise copy the arg
+     tokens into the output. If `tok` is not a parameter, copy
+     `tok` itself into the output.
+   - **Loop on the RHS** (handles chained `A##B##C##D`):
+     - The next token after `##` is the RHS. If it's a parameter:
+       - If RHS is empty AND the LHS just produced a `,`:
+         **GNU `, ## __VA_ARGS__` extension** — delete the
+         trailing comma from the output.
+       - If RHS is non-empty AND the LHS just produced a `,`:
+         GNU non-empty case — keep the comma, copy the RHS arg
+         tokens directly (no paste).
+       - Otherwise (non-empty RHS, non-comma LHS): paste the
+         current output's tail with the first RHS token via
+         `paste(cur, rhs->tok)` (§7.2), then copy any remaining
+         RHS arg tokens.
+     - If the RHS is not a parameter: paste with `paste(cur, tok)`
+       and advance.
+     - Advance past the RHS. If the next token is another `##`,
+       skip it and continue the loop. Otherwise break.
+3. **`__VA_OPT__(...)`.** If `equal(tok, "__VA_OPT__") &&
+   equal(tok->next, "(")`:
+   - Find the variadic argument among `args` (the one with
+     `is_va_args == true`).
+   - If the variadic arg is non-empty (`va->tok->kind != TK_EOF`),
+     copy the tokens between `(` and the matching `)` into the
+     output (respecting nested parentheses).
+   - If the variadic arg is empty, skip those tokens.
+   - Advance past the closing `)`.
+4. **Regular argument substitution.** If `find_arg(args, tok)`
+   succeeds:
+   - Copy the **pre-expanded** `arg->expanded` tokens into the
+     output (one round of preprocess2 has already been applied
+     per §6.2).
+   - The first copied token's `has_space` is overwritten with
+     `tok->has_space` — i.e., the spacing visible at the
+     parameter-reference site governs how the expansion looks.
+     Subsequent tokens keep their inherited spacing.
+   - Advance past the parameter token.
+5. **Plain token.** Copy `tok` into the output, advance.
+
+When the body's `TK_EOF` is reached, terminate the output with a
+fresh `TK_EOF` (carrying the position from the last consumed
+token) and return.
+
+### 6.5 Builtin handler macros
+
+Five macros have `Macro->handler` set instead of a body:
+`__FILE__`, `__LINE__`, `__COUNTER__`, `__TIMESTAMP__`,
+`__BASE_FILE__`. When `expand_macro` sees `m->handler != NULL`, it
+calls the handler and splices the result into the stream (§6.2).
+
+| Macro | Handler | Output |
+|---|---|---|
+| `__FILE__` | `file_macro` | `"display_name"` of the deepest non-`origin` token (i.e., the source file at the macro use site, walking through any expansion-origin chain) |
+| `__LINE__` | `line_macro` | `(line_no + file->line_delta)` of the same use-site token, formatted as decimal |
+| `__COUNTER__` | `counter_macro` | the value of a static monotonic `int` (starts at 0), then increments |
+| `__TIMESTAMP__` | `timestamp_macro` | the literal string `"Unknown"` (see §13) |
+| `__BASE_FILE__` | `base_file_macro` | `"base_file"` (the original source file passed to the driver, before any `#include`); empty string if `base_file` is `NULL` |
+
+Each handler's output is produced by `format`-building a small
+string and calling `tokenize(new_file(...))` to lex it. The
+handler returns a `Token *` of length 1 (plus a `TK_EOF`); the
+caller in `expand_macro` then splices `tok->next` after it.
+
+The origin-chain walk (`file_macro` and `line_macro`) is what makes
+`__FILE__` and `__LINE__` report the **macro use site**, not the
+deepest expansion. Other handlers don't walk because they don't
+depend on source location.
 
 ---
 
 ## 7. Stringize (`#`) and paste (`##`)
 
-> **STUB — to be drafted in batch §5–§7.** Subsections: 7.1
-> stringize; 7.2 paste; 7.3 placemarker (empty-arg) rule; 7.4
-> chained paste `A##B##C##D`.
+### 7.1 `#` operator (`stringize(hash, arg)`)
+
+Builds a string literal token from an argument's raw token list
+(`arg->tok`, not `arg->expanded` — see §6.4).
+
+Algorithm:
+
+1. **First pass — concatenate.** For each token `t` in the arg
+   list (until `TK_EOF`):
+   - If `t != arg` (not the first token) AND `t->has_space` is
+     true, write a single space.
+   - Write `t->loc[0..len)` (the source-text spelling of the
+     token).
+   - **Note:** the first token's own `has_space` is *not*
+     consulted, so `# x` (space before x) and `#x` produce the
+     same string. Documented in §13.
+2. **Second pass — escape and quote.** Wrap the result in `"..."`,
+   escaping every `\` and `"` with a leading backslash. (No other
+   escapes — newlines, tabs, etc. are not escaped because the
+   input tokens cannot contain them; the tokenizer would have
+   split on them.)
+3. **Re-tokenize.** Call `tokenize(new_file(hash->file->name,
+   hash->file->file_no, escaped_buf))` to produce a new `TK_STR`
+   token. Return it.
+
+The re-tokenization uses the source position of the `#` token, so
+the resulting `TK_STR` reports as having come from the directive
+file (relevant for error messages downstream).
+
+### 7.2 `##` operator (`paste(lhs, rhs)`)
+
+Concatenates the source spellings of two tokens and re-lexes the
+result. Errors if more than one token results.
+
+Algorithm:
+
+1. Build `buf = format("%.*s%.*s", lhs->len, lhs->loc, rhs->len,
+   rhs->loc)`.
+2. `tok = tokenize(new_file(lhs->file->name, lhs->file->file_no,
+   buf))`.
+3. If `tok->next->kind != TK_EOF` (i.e., the result tokenized to
+   more than one token), `error_tok(lhs, "pasting forms \"%s\", an
+   invalid token", buf)`.
+4. Return `tok` (a single token plus its `TK_EOF`).
+
+### 7.3 Placemarker rule (empty argument paste)
+
+Per C11 §6.10.3.3 paragraph 2: "If either operand is a
+placemarker pp-token, the result is the other operand." This is
+**not** implemented in `paste` itself — `paste` would error on an
+empty buffer because the result would tokenize to zero tokens
+(failing the "exactly one token" check).
+
+Instead, the placemarker rule is implemented in `subst` (§6.4)
+during the `##` handling:
+
+- If the LHS is a parameter and its raw arg is empty: skip both
+  the empty arg and the `##` and continue with the next token.
+  (The subsequent token becomes the LHS of the next paste, if
+  any.)
+- If the RHS is a parameter and its raw arg is empty (and the LHS
+  is not a `,`): the paste does nothing (the LHS already in the
+  output stays, the empty RHS contributes nothing). Code path:
+  the inner `for (;;)` loop's first branch falls through without
+  appending or pasting when `rhs->tok->kind == TK_EOF`.
+
+The placemarker rule applies only to **literally empty**
+arguments at the call site (e.g., `CONCAT(foo,)`). It does **not**
+apply to arguments that *expand to nothing*: per the rescan rule
+(§2.3), `##` operates on `arg->tok` (raw), not `arg->expanded`. So
+`CONCAT(foo, EMPTY)` where `EMPTY` is `#define EMPTY` produces
+`fooEMPTY` (paste of literal tokens), not `foo` (placemarker).
+This subtlety is captured in `tests/regression/19_paste_empty_arg.c`.
+
+### 7.4 Chained paste
+
+`A ## B ## C ## D` is supported by the inner `for (;;)` loop in
+`subst`'s `##` case. After the first paste produces `cur`, the
+loop checks whether the next input token is another `##` and
+continues pasting `cur` against the next RHS, until the chain
+ends. Each link can independently invoke the placemarker rule.
+
+### 7.5 GNU `, ## __VA_ARGS__` extension
+
+A widespread GCC extension predating C99's `__VA_OPT__`: a `,`
+immediately before `## __VA_ARGS__` is **deleted** when
+`__VA_ARGS__` is empty, and **preserved** when `__VA_ARGS__` is
+non-empty. Used to write variadic logging macros where a trailing
+comma would be wrong:
+
+```c
+#define LOG(fmt, ...) printf(fmt, ## __VA_ARGS__)
+LOG("hi")        // -> printf("hi")          (comma deleted)
+LOG("%d", 42)    // -> printf("%d", 42)      (comma kept)
+```
+
+Implementation in `subst`'s `##` loop:
+
+- When the RHS is the variadic parameter:
+  - If empty AND the current `cur` is a `,`: delete the comma
+    from the output (walks the output list to find the previous
+    node, sets its `next` to `NULL`, sets `cur = prev`).
+  - If non-empty AND `cur` is a `,`: keep the comma, copy the
+    RHS arg tokens directly without pasting.
+
+C23's `__VA_OPT__` (§6.4) is the standard replacement; both
+mechanisms coexist in this preprocessor and the GNU extension is
+preserved for behavioral compatibility with the corpus.
 
 ---
 
@@ -462,6 +819,32 @@ so a re-implementer does not "fix" them by accident.
   current `src/preprocess.c:41` declares `bool is_locked` but never
   reads it. The new implementation drops it; recursive-expansion
   prevention is the hideset.
+
+- **`pragma_handler` callback is registered but never invoked.** The
+  public `set_pragma_handler` API exists (`cc.h`) and stores the
+  function pointer in a module-level `static`, but `preprocess2`'s
+  `#pragma` branch never calls it. Currently all non-standard
+  pragmas (everything except `#pragma once`) are silently absorbed
+  by the rest-of-line skip. The new implementation matches this
+  behavior — the public API is preserved for binary compatibility
+  but is effectively dead. **Q22 (raised during §5–§7 drafting):**
+  should the new implementation invoke the registered handler, or
+  should `set_pragma_handler` be removed from the public API
+  entirely? Recommended: invoke it (the API is documented; dead
+  infrastructure that promises a callback is worse than working
+  code).
+
+- **`#error` and `#warning` emit empty diagnostic messages.** Both
+  directives call `error_tok` / `warn_tok` with `""` as the format
+  string, so the diagnostic is just the source-line caret with no
+  descriptive text. The directive's rest-of-line tokens (which by
+  C standard convention are the message) are not emitted. Real
+  compilers (gcc, clang) include the message tokens in the
+  diagnostic. **Q23 (raised during §5–§7 drafting):** preserve the
+  empty-message bug for behavioral compat, or fix to emit the
+  message tokens? Recommended: fix. The bug is plainly broken (no
+  one *wants* `#error "this is broken"` to say nothing); fixing it
+  cannot regress any working program.
 
 ---
 
