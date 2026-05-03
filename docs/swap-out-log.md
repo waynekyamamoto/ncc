@@ -231,3 +231,20 @@ Coverage: xv6/NetBSD/Linux test harness additions (`tests/xv6`, `tests/netbsd`, 
 **Codegen bug flagged for Phase 4/5 (from `2fae4e0`'s message).** The reason `tty.c` had to be routed to gcc: every tty/cdev ioctl returned `ENOSYS`, including `TIOCSFLAGS` on `/dev/console`/`/dev/constty` and `fcntl(O_NONBLOCK)` from `ntpd`/`postfix`. Bisect (v5→v8) isolates the miscompile to `tty.c` alone. Symptom shape (every fnptr-table dispatch hitting the no-op stub) matches an ncc miscompile of a `cdevsw` / `fileops` / `linesw` struct of designated initializers, where slots that should hold ioctl/fcntl/open handlers come out NULL. Root cause not yet diagnosed on main; the workaround is in place.
 
 **Reachability on swap-out.** Latent. swap-out's `parse.c` and `codegen_arm64.c` carry the same designated-initializer code paths as main at `7ff0860`. No in-scope program (sqlite, doom, cpython, ncc itself) has been observed to emit a designated-init struct of fnptrs that triggers this — torture/bootstrap remain green. But Phase 4 (parser rewrite) and Phase 5 (codegen audit) should treat designated-initializer fnptr-tables as a known fragile surface and add a dedicated regression case once main's diagnosis lands. Watch for the upstream fix and the test it ships with.
+
+## Validation snapshot — 2026-05-03 (post-`ad8f346`, pre-Phase-2)
+
+Full validation pyramid run on swap-out tip after the two `b710056` catch-up commits (`0bffb33` codegen + `ad8f346` preprocess) and the `phase-1-closed` tag at `65c8297`. All five harnesses match the Phase-1-close baseline exactly — the 18-line preprocess revert is non-regressive on every measurable axis we have today.
+
+| Harness                          | Result                              | Baseline at `phase-1-closed` |
+|----------------------------------|-------------------------------------|------------------------------|
+| `scripts/bootstrap_validate.sh`  | FIXED POINT (md5 `596456d18356edce36f34de96c1b287b`) | FIXED POINT |
+| `scripts/validate_tokenizer.sh`  | PASS=28/28                          | PASS=28/28 |
+| `tests/torture/run.sh`           | 964/995 PASS, 31 SKIP, 100% non-skip | 964/995 |
+| `tests/sqlite/build.sh`          | 20/20 SQL test cases PASS           | (Day-0 PASS, not re-measured at close) |
+| `build_doom_ncc2.sh`             | 83/83 C files OK, links cleanly     | (Day-0 PASS, not re-measured at close) |
+| `tests/cpython/build.sh`         | 153/153 core files OK; runtime tests print expected output | (Day-0 PASS, not re-measured at close) |
+
+Real-program builds were carried implicitly through Phase-1 close via PASS=28 corpus equivalence (token streams bit-identical to chibicc baseline). Today's run measures them directly and confirms the implicit reasoning held.
+
+Conditions: macOS 26.0 host (linker), libpython.a built on macOS 26.1 (ABI-compatible warnings only). cpython override: `NCC=$PWD/ncc2 PYDIR=/tmp/Python-3.12.3` (avoids the script's default `/Users/yamamoto/ncc/ncc2`, which is the chibicc-lineage repo and out of swap-out's lane).
