@@ -63,6 +63,25 @@ case "$SRC" in
     # slots in a cdevsw or fileops table).
     exec /netbsd/tooldir/bin/aarch64--netbsd-gcc "$@"
     ;;
+  */kern/kern_turnstile.c)
+    # KNOWN ncc MISCOMPILE (2026-05-03): forcing root=dk1 panics with NULL
+    # deref at l->l_syncobj inside lwp_lendpri (compiled standalone from
+    # kern_turnstile.c since lwp_lendpri is `static __inline` in lwp.h).
+    # Routing this TU to gcc lets the kernel mount dk1 and reach
+    # /etc/rc / login.
+    #
+    # Bisected 2026-05-03: clean diagnostic route — gcc-routed kern_turnstile
+    # boots past dk1 mount and reaches /etc/rc; ncc-built reproducibly
+    # panics with `Translation Fault L0 ... for 0x18` at PC 0xffffc...f70c
+    # (load chain: l + 0x168 → +0x18, faulting because l->l_syncobj == 0).
+    # Source-side analysis ruled out lwp init bugs: lwp0 static init, every
+    # lwp_create runtime path, and all 4 sleepq writers all assign valid
+    # syncobj pointers.  So the bug is in ncc's codegen of kern_turnstile.c
+    # itself — likely register-save/spill interaction in turnstile_unlendpri
+    # or turnstile_lendpri's call to lwp_lendpri.  Specific instruction
+    # mis-emission TBD; needs codegen-side investigation in src/codegen_arm64.c.
+    exec /netbsd/tooldir/bin/aarch64--netbsd-gcc "$@"
+    ;;
 esac
 
 case "$SRC" in

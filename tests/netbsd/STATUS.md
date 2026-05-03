@@ -660,3 +660,144 @@ Caveats:
   reliably — those need a register save area in the prologue (so
   `va_arg` can read the initial register-passed variadics).  Not
   exercised by the kernel's current call sites.
+
+## Session 5 (2026-05-03) — interactive QEMU run, new mount-path panic
+
+**Headline**: Boot-tested the ncc-built MINIMAL_VIRT64 kernel against
+`/private/tmp/netbsd-arm64.img` (1.5 GB GPT/FFS rootfs).  Kernel boots
+through hardware probe and enumerates the disk + wedges (`dk0` EFI,
+`dk1` netbsd-root FFS).  Default `ld0a` doesn't exist on this disk
+layout (no disklabel, only GPT wedges); forcing `root=dk1` at the prompt
+panics during mount.
+
+```
+root on dk1
+panic: Trap: Data Abort (EL1): Translation Fault L0
+       with read access for 0000000000000018: pc ffffc0000119f70c
+```
+
+**Symbolized**: PC is inside `lwp_lendpri` in `kern/kern_turnstile.c`
+(offset 0x6c into the function).  TU was ncc-compiled (Ltmp_*
+labels visible).  Disassembly:
+
+```
+0x6f700:  add  x0, x0, #0x168       // x0 = &l->l_syncobj
+0x6f704:  ldr  x0, [x0]             // x0 = l->l_syncobj   ← NULL
+0x6f708:  add  x0, x0, #0x18
+0x6f70c:  ldr  x0, [x0]             // FAULT @ 0x18
+0x6f710:  mov  x9, x0
+0x6f71c:  blr  x9                   // l->l_syncobj->sobj_method(l, pri)
+```
+
+So the kernel reaches `lwp_lendpri(l, pri)` with an `l` whose
+`l_syncobj` slot is NULL.  Every lwp must have `l_syncobj` populated
+at create-time (`&sched_syncobj` etc.); a NULL means an lwp init path
+left the field zero.
+
+**Same shape as the tty.c bug**: virtual-table dispatch through a NULL
+function-pointer-table slot.  Likely root cause for both is ncc
+dropping fields in a function-pointer struct/table initializer.
+Recommended next step: bisect via `ncc-elf-wrapper.sh` — route
+`kern_lwp.c` to gcc first, then `kern_synch.c`, `init_main.c`,
+`subr_pool.c` until the panic disappears.  Each iteration is one
+incremental Docker rebuild (~14 min).
+
+Notes:
+- Memory file: `project_ncc_lwp_syncobj_null.md` for next-session
+  pickup.
+- The "login works" path documented in earlier sessions almost
+  certainly used a different rootfs (no GPT wedges, simpler mount
+  path) since the GPT-wedge mount panics here.  Worth verifying
+  what path the previous login-reaching boot actually took.
+- Cosmetic: stubbed `chacha_neon` self-test prints ~30 s of hex
+  diffs every boot.  Worth muting at some point (route the
+  self-test off, or quiet the stub).
+
+Reproducer:
+```
+qemu-system-aarch64 -M virt,gic-version=3 -cpu cortex-a72 -m 512 -smp 4 -nographic \
+  -kernel ~/netbsd/obj/sys/arch/evbarm/compile/MINIMAL_VIRT64/netbsd.img \
+  -drive if=none,file=/private/tmp/netbsd-arm64.img,format=raw,id=hd0 \
+  -device virtio-blk-device,drive=hd0
+# At "root device (default ld0a):" prompt, type: dk1
+```
+
+## Session 6 (2026-05-03) — bisect dk1 panic to kern_turnstile.c, login reached
+
+**Headline**: The `lwp_lendpri` NULL-deref panic from session 5 is bisected
+to `kern/kern_turnstile.c`.  With that TU added to the gcc-route list in
+`tests/netbsd/tools/ncc-elf-wrapper.sh`, the ncc-built kernel boots all
+the way to the login prompt against the GPT-formatted rootfs.
+
+### What landed
+
+- `tests/netbsd/tools/ncc-elf-wrapper.sh` — added `*/kern/kern_turnstile.c)`
+  case routing to `aarch64--netbsd-gcc`, alongside the existing tty.c and
+  kern_ksyms_buf.c routes.  Comment block records the bisect evidence and
+  notes the codegen-side root cause is still TBD.
+
+### How we got there
+
+Source-read first.  Verified that `lwp0` static init (`kern_lwp.c:286`)
+puts `&sched_syncobj` at offset 0x168 in the linked image (data dump
+matched), and the runtime store in `lwp_create:904` is correctly emitted
+by ncc.  All 4 sleepq writers of `l_syncobj` assign valid pointers.  No
+source path produces an lwp with NULL `l_syncobj`.  So either some
+caller hands `lwp_lendpri` a non-lwp pointer, or the codegen of
+`kern_turnstile.c` itself is wrong.
+
+Build experiment.  Routed `kern_turnstile.c` to gcc, rebuilt
+(`build.sh MINIMAL_VIRT64`, ~85 min for the full re-compile).  Boot
+with `dk1` as root: panic gone, kernel mounts ffs, runs `/etc/rc`,
+reaches login prompt.  Definitive — the bug is in ncc's compilation
+of that single TU.
+
+### Boot evidence (excerpt, ncc-built MINIMAL_VIRT64 with both gcc routes)
+
+```
+[   2.7676270] root on dk1
+[   2.8199530] init: trying /sbin/init
+... /etc/rc.d/* running ...
+NetBSD/evbarm (arm64) (constty)
+
+login:
+```
+
+ntpd / postfix still hit `fcntl(O_NONBLOCK) fails` — those are the
+existing tty.c bug, separate from this session's work.
+
+### Where the bug actually is (still TBD)
+
+The disasm of ncc's `lwp_lendpri` body (compiled into kern_turnstile.c
+because lwp_lendpri is `static __inline` in lwp.h) and of the call sites
+in `turnstile_unlendpri` / `turnstile_lendpri` looks superficially
+correct: spill `l` to `[FP-0x10]`, reload, load `[l+0x168]`, load `[+0x18]`,
+indirect call.  Empirically the loaded value at `[l+0x168]` is 0 at
+runtime, but no source path produces such an lwp, and gcc handles
+the same source fine.
+
+Likely candidates for the real codegen bug, listed for next session:
+- A push/pop register dance that corrupts the spill slot for `l` in some
+  callee (possibly inside `aarch64_curlwp` / `lwp_lock` / KASSERT macro
+  expansion).
+- An `atomic_load_relaxed` builtin lowering that drops a memory write
+  somewhere in the prologue dance for `dolock`.
+- An interaction with `__attribute__((const))` on `aarch64_curlwp` that
+  lets ncc cache a stale value across a context-touch.
+
+To pin it down: split kern_turnstile.c by function into `#if`-gated
+pieces, compile each via ncc/gcc independently, find which function is
+the load-bearing miscompile, then disasm-diff that function and look
+for the specific instruction sequence.  Memory file
+`project_ncc_lwp_syncobj_null.md` captures the full analysis.
+
+### Discipline notes
+
+- One Docker rebuild this session (~85 min, full clean rebuild because
+  build.sh deletes all .o's).  Single-file ncc compiles via direct
+  `docker run` were ~5s each and useful for inspecting object disasm
+  without a full rebuild.
+- The existing `boot-test.sh` only checks for `root device:` and isn't
+  set up for stdin input.  Used `expect` with `set send_slow {1 0.1}`
+  to drive the prompts; bare `printf … | qemu` lost characters
+  (qemu/macOS pty interaction quirk).
