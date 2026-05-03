@@ -819,11 +819,6 @@ static Token *paste(Token *lhs, Token *rhs) {
   Token *tok = tokenize(new_file(lhs->file->name, lhs->file->file_no, buf));
   if (tok->next->kind != TK_EOF)
     error_tok(lhs, "pasting forms \"%s\", an invalid token", buf);
-  // Inherit position flags from the lhs token so that the pasted token
-  // does not appear to start a new line (at_bol=true from fresh tokenize
-  // would confuse the -E output and directive detection).
-  tok->at_bol = lhs->at_bol;
-  tok->has_space = lhs->has_space;
   return tok;
 }
 
@@ -1128,13 +1123,6 @@ static bool expand_macro(Token **rest, Token *tok) {
     // Set origin only on body tokens (before appending rest)
     for (Token *t = body; t && t->kind != TK_EOF; t = t->next)
       t->origin = tok;
-    // First token inherits position flags from the macro call site.
-    // Without this, the body token keeps its at_bol/has_space from the
-    // #define line, causing merged lines and missing spaces in -E output.
-    if (body->kind != TK_EOF) {
-      body->at_bol = tok->at_bol;
-      body->has_space = tok->has_space;
-    }
     body = append(body, tok->next);
     *rest = body;
     return true;
@@ -1160,12 +1148,6 @@ static bool expand_macro(Token **rest, Token *tok) {
   // Set origin only on body tokens (before appending rest)
   for (Token *t = body; t && t->kind != TK_EOF; t = t->next)
     t->origin = macro_tok;
-  // First token inherits position flags from the macro call site so that
-  // the expanded result starts on the correct line in -E output.
-  if (body->kind != TK_EOF) {
-    body->at_bol = macro_tok->at_bol;
-    body->has_space = macro_tok->has_space;
-  }
   body = append(body, tok);
 
   *rest = body;
