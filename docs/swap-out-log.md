@@ -217,3 +217,17 @@ Coverage: xv6/NetBSD/Linux test harness additions (`tests/xv6`, `tests/netbsd`, 
 **Applies to swap-out.** None at code level. The compliance tests added on main (`tests/compliance/16..22`) are referenced by individual entries above (`93c6ecc`, `e7e7393`, etc.); they'll be ported alongside the features they test in Phases 4–5.
 
 **Action taken.** None. Logged in bulk per `docs/main-commit-contract.md`.
+
+### `da702d9` + `2fae4e0` — NetBSD test harness, post-`cc92e6f`
+
+**On main.** Two test-only commits past the previous log walk's tip:
+- `da702d9` (2026-05-02 10:52): `tests/netbsd/MINIMAL_VIRT64` adds PTYFS/PROCFS/TMPFS/MSDOSFS/KERNFS + putter/drvctl/fss; `tests/netbsd/tools/docker-kernel-build.sh` adds an `nbconfig` step before `nbmake` so config edits actually propagate. Verified the ncc-built MINIMAL_VIRT64 reaches `/etc/rc` multiuser stage.
+- `2fae4e0` (2026-05-02 14:14): `tests/netbsd/tools/ncc-elf-wrapper.sh` routes `kern/tty.c` (one file, ~5500 lines) through `aarch64--netbsd-gcc` so that login is reachable on the otherwise-ncc-built kernel.
+
+**Applies to swap-out.** No source-level change — both commits touch only `tests/netbsd/`, which swap-out doesn't carry.
+
+**Action taken.** None.
+
+**Codegen bug flagged for Phase 4/5 (from `2fae4e0`'s message).** The reason `tty.c` had to be routed to gcc: every tty/cdev ioctl returned `ENOSYS`, including `TIOCSFLAGS` on `/dev/console`/`/dev/constty` and `fcntl(O_NONBLOCK)` from `ntpd`/`postfix`. Bisect (v5→v8) isolates the miscompile to `tty.c` alone. Symptom shape (every fnptr-table dispatch hitting the no-op stub) matches an ncc miscompile of a `cdevsw` / `fileops` / `linesw` struct of designated initializers, where slots that should hold ioctl/fcntl/open handlers come out NULL. Root cause not yet diagnosed on main; the workaround is in place.
+
+**Reachability on swap-out.** Latent. swap-out's `parse.c` and `codegen_arm64.c` carry the same designated-initializer code paths as main at `7ff0860`. No in-scope program (sqlite, doom, cpython, ncc itself) has been observed to emit a designated-init struct of fnptrs that triggers this — torture/bootstrap remain green. But Phase 4 (parser rewrite) and Phase 5 (codegen audit) should treat designated-initializer fnptr-tables as a known fragile surface and add a dedicated regression case once main's diagnosis lands. Watch for the upstream fix and the test it ships with.
