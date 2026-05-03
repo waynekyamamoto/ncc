@@ -25,8 +25,9 @@ from `main` commits `4ed0320` and `8fe8dda` (`__ELF__`, `__ARM_ARCH`,
 `__ARM_ARCH_8A__`, `__ARM_PCS_AAPCS64`) are explicitly **out of scope**
 and are deferred to Phase 5; see §15.
 
-**Current status (2026-05-03):** §1–§10, §13–§15 drafted.
-§11–§12 remain stubbed; next batch (the last) covers them.
+**Current status (2026-05-03):** §1–§15 drafted in full. Spec is
+ready for end-to-end review and (pending Q22/Q23 calls) Phase 2
+implementation work.
 
 ---
 
@@ -1064,20 +1065,456 @@ included file's original `TK_EOF` (its `kind` will change).
 
 ## 11. Predefined macros (`init_macros`)
 
-> **STUB — to be drafted in batch §11–§12.** Full table of the
-> macOS predefine set with values, organized by category. `__SCHAR_MAX__`
-> listed exactly once (Q1: silent dedup). `-target elf` predefines
-> remain out of scope (§15). Target-dispatch hook per Q18.
+`init_macros(int target)` is called once at compiler startup to
+register the predefined macros and the five handler macros (§6.5).
+Phase 2 supports `target = TARGET_MACOS` only; Phase 5 will add
+`TARGET_ELF` (per Q18).
+
+The full macOS predefine set is the union of the categories below.
+Each macro is registered exactly once (Q1: deduplicate
+`__SCHAR_MAX__`, which is registered twice on `main` due to a
+copy-paste in the limits and float-constants blocks).
+
+The target dispatch is the only non-trivial logic in
+`init_macros`; otherwise it is a long sequence of `define_macro`
+and `add_macro` calls. After all predefines are registered, the
+`__DATE__` and `__TIME__` macros are computed once via `time(NULL)`
+and `localtime` (a known divergence from per-TU semantics; see
+§13).
+
+### 11.1 Standard C predefines
+
+| Name | Body | Note |
+|---|---|---|
+| `__STDC__` | `1` | conforming hosted impl |
+| `__STDC_VERSION__` | `201112L` | C11 |
+| `__STDC_HOSTED__` | `1` | hosted, not freestanding |
+| `__STDC_NO_ATOMICS__` | `1` | no `_Atomic` (see §13 + Q15) |
+| `__STDC_NO_COMPLEX__` | `1` | no `_Complex` |
+| `__STDC_NO_THREADS__` | `1` | no `<threads.h>` |
+| `__STDC_NO_VLA__` | `1` | no variable-length arrays |
+| `__STDC_UTF_16__` | `1` | `char16_t` is UTF-16 |
+| `__STDC_UTF_32__` | `1` | `char32_t` is UTF-32 |
+
+### 11.2 Sizeof and integer-type predefines
+
+For aarch64 macOS (LP64):
+
+| Name | Body |
+|---|---|
+| `__LP64__` | `1` |
+| `__SIZEOF_POINTER__` | `8` |
+| `__SIZEOF_LONG__` | `8` |
+| `__SIZEOF_INT__` | `4` |
+| `__SIZEOF_SHORT__` | `2` |
+| `__SIZEOF_FLOAT__` | `4` |
+| `__SIZEOF_DOUBLE__` | `8` |
+| `__SIZEOF_LONG_DOUBLE__` | `8` |
+| `__SIZEOF_LONG_LONG__` | `8` |
+| `__SIZEOF_SIZE_T__` | `8` |
+| `__SIZEOF_PTRDIFF_T__` | `8` |
+| `__SIZEOF_WCHAR_T__` | `4` |
+| `__SIZE_TYPE__` | `unsigned long` |
+| `__PTRDIFF_TYPE__` | `long` |
+| `__WCHAR_TYPE__` | `int` |
+| `__WINT_TYPE__` | `int` |
+| `__INT8_TYPE__` | `signed char` |
+| `__INT16_TYPE__` | `short` |
+| `__INT32_TYPE__` | `int` |
+| `__INT64_TYPE__` | `long` |
+| `__UINT8_TYPE__` | `unsigned char` |
+| `__UINT16_TYPE__` | `unsigned short` |
+| `__UINT32_TYPE__` | `unsigned int` |
+| `__UINT64_TYPE__` | `unsigned long` |
+| `__INTPTR_TYPE__` | `long` |
+| `__UINTPTR_TYPE__` | `unsigned long` |
+| `__INTMAX_TYPE__` | `long` |
+| `__UINTMAX_TYPE__` | `unsigned long` |
+
+### 11.3 Limit predefines
+
+| Name | Body |
+|---|---|
+| `__CHAR_BIT__` | `8` |
+| `__SCHAR_MAX__` | `127` (Q1: list once, not twice) |
+| `__SHRT_MAX__` | `32767` |
+| `__INT_MAX__` | `2147483647` |
+| `__LONG_MAX__` | `9223372036854775807L` |
+| `__LONG_LONG_MAX__` | `9223372036854775807LL` |
+| `__INT8_MAX__` | `127` |
+| `__INT16_MAX__` | `32767` |
+| `__INT32_MAX__` | `2147483647` |
+| `__INT64_MAX__` | `9223372036854775807LL` |
+| `__UINT8_MAX__` | `255` |
+| `__UINT16_MAX__` | `65535` |
+| `__UINT32_MAX__` | `4294967295U` |
+| `__UINT64_MAX__` | `18446744073709551615ULL` |
+| `__SIZE_MAX__` | `18446744073709551615UL` |
+| `__INTMAX_MAX__` | `9223372036854775807L` |
+| `__UINTMAX_MAX__` | `18446744073709551615UL` |
+| `__PTRDIFF_MAX__` | `9223372036854775807L` |
+| `__INTPTR_MAX__` | `9223372036854775807L` |
+| `__UINTPTR_MAX__` | `18446744073709551615UL` |
+
+### 11.4 Float / double / long double predefines
+
+| Name | Body |
+|---|---|
+| `__FLT_MIN__` | `1.17549435e-38F` |
+| `__FLT_MAX__` | `3.40282347e+38F` |
+| `__FLT_EPSILON__` | `1.19209290e-07F` |
+| `__FLT_DENORM_MIN__` | `1.40129846e-45F` |
+| `__FLT_HAS_INFINITY__` | `1` |
+| `__FLT_HAS_QUIET_NAN__` | `1` |
+| `__DBL_MIN__` | `2.2250738585072014e-308` |
+| `__DBL_MAX__` | `1.7976931348623157e+308` |
+| `__DBL_EPSILON__` | `2.2204460492503131e-16` |
+| `__DBL_DENORM_MIN__` | `4.9406564584124654e-324` |
+| `__LDBL_MIN__` | `2.2250738585072014e-308L` |
+| `__LDBL_MAX__` | `1.7976931348623157e+308L` |
+| `__LDBL_EPSILON__` | `2.2204460492503131e-16L` |
+| `__FLT_MANT_DIG__` | `24` |
+| `__DBL_MANT_DIG__` | `53` |
+| `__LDBL_MANT_DIG__` | `53` |
+| `__FLT_DIG__` | `6` |
+| `__DBL_DIG__` | `15` |
+| `__LDBL_DIG__` | `15` |
+| `__FLT_MIN_EXP__` | `(-125)` |
+| `__FLT_MAX_EXP__` | `128` |
+| `__DBL_MIN_EXP__` | `(-1021)` |
+| `__DBL_MAX_EXP__` | `1024` |
+| `__LDBL_MIN_EXP__` | `(-1021)` |
+| `__LDBL_MAX_EXP__` | `1024` |
+| `__FLT_MIN_10_EXP__` | `(-37)` |
+| `__FLT_MAX_10_EXP__` | `38` |
+| `__DBL_MIN_10_EXP__` | `(-307)` |
+| `__DBL_MAX_10_EXP__` | `308` |
+| `__FINITE_MATH_ONLY__` | `0` |
+
+`long double` is treated as `double` (matching the macOS ABI for
+aarch64).
+
+### 11.5 Byte-order predefines
+
+| Name | Body |
+|---|---|
+| `__ORDER_LITTLE_ENDIAN__` | `1234` |
+| `__ORDER_BIG_ENDIAN__` | `4321` |
+| `__BYTE_ORDER__` | `1234` |
+| `__LITTLE_ENDIAN__` | `1` |
+
+### 11.6 ARM64 / Apple platform predefines
+
+| Name | Body |
+|---|---|
+| `__aarch64__` | `1` |
+| `__arm64__` | `1` |
+| `__arm64` | `1` |
+| `__AARCH64EL__` | `1` |
+| `__APPLE__` | `1` |
+| `__MACH__` | `1` |
+| `__DARWIN_C_LEVEL` | `900000L` |
+
+The ELF-specific arch predefines (`__ARM_ARCH`, `__ARM_ARCH_8A__`,
+`__ARM_PCS_AAPCS64`, `__ELF__`) are **not** in this set; they are
+deferred to Phase 5 per §15.
+
+### 11.7 Apple `TargetConditionals.h` predefines
+
+These satisfy the macros that `<TargetConditionals.h>` would
+otherwise probe via the SDK:
+
+| Name | Body |
+|---|---|
+| `TARGET_OS_MAC` | `1` |
+| `TARGET_OS_OSX` | `1` |
+| `TARGET_OS_IPHONE` | `0` |
+| `TARGET_OS_IOS` | `0` |
+| `TARGET_OS_WATCH` | `0` |
+| `TARGET_OS_TV` | `0` |
+| `TARGET_OS_SIMULATOR` | `0` |
+| `TARGET_OS_EMBEDDED` | `0` |
+| `TARGET_OS_MACCATALYST` | `0` |
+| `TARGET_OS_DRIVERKIT` | `0` |
+| `TARGET_CPU_ARM64` | `1` |
+| `TARGET_CPU_ARM` | `0` |
+| `TARGET_CPU_X86` | `0` |
+| `TARGET_CPU_X86_64` | `0` |
+| `TARGET_RT_LITTLE_ENDIAN` | `1` |
+| `TARGET_RT_BIG_ENDIAN` | `0` |
+| `TARGET_RT_64_BIT` | `1` |
+| `TARGET_RT_MAC_MACHO` | `1` |
+
+### 11.8 Darwin deployment-target predefines
+
+Picks a macOS 14 baseline (the same value used by clang when
+invoked with `-mmacosx-version-min=14`). Without these,
+`<Availability.h>` chains leave platform predicates undefined and
+downstream headers select wrong code paths (e.g., `stat64` instead
+of `stat`, PowerPC `__srr0` instead of arm64).
+
+| Name | Body |
+|---|---|
+| `__MAC_OS_X_VERSION_MIN_REQUIRED` | `140000` |
+| `__MAC_OS_X_VERSION_MAX_ALLOWED` | `140000` |
+| `__ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__` | `140000` |
+| `__ENVIRONMENT_OS_VERSION_MIN_REQUIRED__` | `140000` |
+
+### 11.9 GCC compatibility predefines
+
+Advertise GCC 12 to open modern kernel-header feature paths:
+
+| Name | Body |
+|---|---|
+| `__GNUC__` | `12` |
+| `__GNUC_MINOR__` | `1` |
+| `__GNUC_PATCHLEVEL__` | `0` |
+| `__GNUC_STDC_INLINE__` | `1` |
+| `__VERSION__` | `"ncc 1.0 compatible"` |
+
+### 11.10 GCC atomic predefines
+
+Memory-order constants:
+
+| Name | Body |
+|---|---|
+| `__ATOMIC_RELAXED` | `0` |
+| `__ATOMIC_CONSUME` | `1` |
+| `__ATOMIC_ACQUIRE` | `2` |
+| `__ATOMIC_RELEASE` | `3` |
+| `__ATOMIC_ACQ_REL` | `4` |
+| `__ATOMIC_SEQ_CST` | `5` |
+
+`__atomic_*` builtin stubs (single-threaded, function-like macros):
+
+| Name | Body |
+|---|---|
+| `__atomic_load_n(p,o)` | `(*(p))` |
+| `__atomic_store_n(p,v,o)` | `(*(p)=(v))` |
+| `__atomic_exchange_n(p,v,o)` | `__sync_lock_test_and_set(p,v)` |
+| `__atomic_compare_exchange_n(p,e,d,w,s,f)` | `__sync_bool_compare_and_swap(p,*(e),d)` |
+
+GCC `__sync_*` advertisement (per Q15, kept alongside
+`__STDC_NO_ATOMICS__`):
+
+| Name | Body |
+|---|---|
+| `__GCC_HAVE_SYNC_COMPARE_AND_SWAP_1` | `1` |
+| `__GCC_HAVE_SYNC_COMPARE_AND_SWAP_2` | `1` |
+| `__GCC_HAVE_SYNC_COMPARE_AND_SWAP_4` | `1` |
+| `__GCC_HAVE_SYNC_COMPARE_AND_SWAP_8` | `1` |
+
+The `__sync_*` builtins themselves are **not** implemented in
+codegen on the Phase-2 swap-out; reaching one will fail at link
+time. The advertisements are load-bearing for header gates.
+
+### 11.11 GCC keyword aliases
+
+Object-like macros that map non-standard GCC spellings to the
+standard equivalents. The parser sees only the standard form.
+
+| Name | Body |
+|---|---|
+| `__alignof__` | `_Alignof` |
+| `__const__` | `const` |
+| `__const` | `const` |
+| `__inline__` | `inline` |
+| `__inline` | `inline` |
+| `__volatile__` | `volatile` |
+| `__volatile` | `volatile` |
+| `__attribute` | `__attribute__` |
+| `__signed__` | `signed` |
+| `__signed` | `signed` |
+| `__restrict__` | `restrict` |
+| `__restrict` | `restrict` |
+| `__extension__` | `` (empty) |
+| `__complex` | `_Complex` |
+| `__real` | `__real__` |
+| `__imag` | `__imag__` |
+| `__asm` | `asm` |
+
+### 11.12 Type aliases
+
+Simplified type mappings for compatibility. Not architecturally
+exact (128-bit types collapse to 64-bit), but sufficient for the
+in-scope corpus:
+
+| Name | Body | Note |
+|---|---|---|
+| `__uint128_t` | `unsigned long` | simplified: 64-bit |
+| `__int128_t` | `long` | simplified |
+| `__int128` | `long` | simplified |
+| `_Float16` | `float` | simplified: 32-bit |
+| `__builtin_va_list` | `void *` | aarch64 ABI uses register save area; this works for the codegen stubs |
+
+### 11.13 Builtin function-like macros
+
+Macros that map GCC builtins to libc equivalents or stubbed
+expansions. Not a complete list of GCC builtins — `__builtin_clz*`,
+`__builtin_ctz*`, `__builtin_popcount*`, `__builtin_bswap*`,
+`__builtin_constant_p`, and `__builtin_types_compatible_p` are
+handled directly in `parse.c`'s `primary()` (no macro form).
+
+| Name | Body |
+|---|---|
+| `__builtin_expect(x,y)` | `(x)` |
+| `__builtin_fabsf(x)` | `fabsf(x)` |
+| `__builtin_fabs(x)` | `fabs(x)` |
+| `__builtin_fabsl(x)` | `fabsl(x)` |
+| `__builtin_inff()` | `__FLT_MAX__` |
+| `__builtin_inf()` | `__DBL_MAX__` |
+| `__builtin_infl()` | `__LDBL_MAX__` |
+| `__builtin_nanf(x)` | `(0.0f/0.0f)` |
+| `__builtin_nan(x)` | `(0.0/0.0)` |
+| `__builtin_huge_valf()` | `__FLT_MAX__` |
+| `__builtin_huge_val()` | `__DBL_MAX__` |
+| `__builtin_offsetof(type,member)` | `((unsigned long)&((type*)0)->member)` |
+| `__builtin_unreachable()` | `((void)0)` |
+| `__builtin_assume(x)` | `((void)0)` |
+| `__builtin_trap()` | `abort()` |
+| `__builtin_memset` | `memset` |
+| `__builtin_memcpy` | `memcpy` |
+| `__builtin_memmove` | `memmove` |
+| `__builtin_memcmp` | `memcmp` |
+| `__builtin_strcmp` | `strcmp` |
+| `__builtin_strncmp` | `strncmp` |
+| `__builtin_strcpy` | `strcpy` |
+| `__builtin_strncpy` | `strncpy` |
+| `__builtin_strlen` | `strlen` |
+| `__builtin_abort()` | `abort()` |
+| `__builtin_exit(n)` | `exit(n)` |
+| `__builtin_malloc` | `malloc` |
+| `__builtin_calloc` | `calloc` |
+| `__builtin_free` | `free` |
+| `__builtin_printf` | `printf` |
+| `__builtin_sprintf` | `sprintf` |
+| `__builtin_putchar(c)` | `putchar(c)` |
+| `__builtin_puts(s)` | `puts(s)` |
+| `__builtin_signbit(x)` | `((x) < 0)` |
+| `__builtin_signbitf(x)` | `((x) < 0)` |
+| `__builtin_signbitl(x)` | `((x) < 0)` |
+
+The string/memory builtins are **object-like** (no parameter
+list). This works better when builtins are referenced through
+macro chains like `#define strcmp __builtin_strcmp` — the
+function-like form would not match a bare-identifier reference.
+
+The `printf`-family entries are subtle: `printf` is variadic on
+ARM64, and an undeclared call would create a variadic-implicit
+declaration that puts all args on the stack. `printf` actually
+needs its first arg in `x0`. The macro maps `__builtin_printf`
+directly to the libc name, ensuring the parser sees a real `printf`
+declaration (when one is in scope) and emits the correct ABI.
+
+### 11.14 `_Pragma` operator
+
+| Name | Body |
+|---|---|
+| `_Pragma(x)` | `` (empty) |
+
+C99's `_Pragma(x)` is an in-expression equivalent of `#pragma x`.
+ncc ignores all pragmas (§12.2), so the operator is a no-op.
+
+### 11.15 `__DATE__` and `__TIME__`
+
+Computed once at the end of `init_macros` via `time(NULL)` +
+`localtime`. Format:
+
+| Name | Format |
+|---|---|
+| `__DATE__` | `"Mon DD YYYY"` (e.g., `"May  3 2026"`) |
+| `__TIME__` | `"HH:MM:SS"` (e.g., `"02:09:21"`) |
+
+These are object-like macros with the formatted string as the
+body. Per §13, the values are fixed at `init_macros` call time,
+not per-translation-unit.
+
+### 11.16 Handler macros
+
+Five macros are registered with `add_macro(name, true, NULL)` and
+have their `handler` field set to a function pointer (§6.5):
+
+| Name | Handler | Output |
+|---|---|---|
+| `__FILE__` | `file_macro` | source filename of macro use site |
+| `__LINE__` | `line_macro` | source line number of macro use site |
+| `__COUNTER__` | `counter_macro` | monotonic counter, increments per use |
+| `__TIMESTAMP__` | `timestamp_macro` | always `"Unknown"` (Q6 / §13) |
+| `__BASE_FILE__` | `base_file_macro` | filename of the original source file |
+
+Handler macros bypass the body-substitution path in `expand_macro`;
+the handler returns a freshly-tokenized replacement.
 
 ---
 
 ## 12. `#line`, `#pragma`, `#error`, `#warning`
 
-> **STUB — to be drafted in batch §11–§12.** `#line` updates
-> `file->line_delta` and optionally `file->display_name`. `#pragma
-> once` is a documented stub (Q4). All other pragmas pass to the
-> registered handler. `#error` / `#warning` concatenate rest-of-line
-> spellings and call `error_tok` / `warn_tok`.
+These four directives are simple and dispatched directly from
+`preprocess2` (§5).
+
+### 12.1 `#line N "filename"?`
+
+Updates the current file's line accounting so subsequent error
+messages and `__LINE__` / `__FILE__` references reflect the
+specified position rather than the actual source position.
+
+Algorithm:
+
+1. The directive's rest-of-line is copied (`copy_line(&tok,
+   tok->next)`), then recursively passed through `preprocess2` to
+   expand any macros. `convert_pp_tokens` lowers `TK_PP_NUM` to
+   `TK_NUM`.
+2. The first resulting token must be `TK_NUM` with `ty->kind ==
+   TY_INT`; otherwise raises `error_tok(t, "invalid line marker")`.
+3. Set `start->file->line_delta = t->val - start->line_no` —
+   subsequent tokens read line numbers as `line_no + line_delta`.
+4. If the next token is `TK_STR`, set `start->file->display_name =
+   t->next->str`. This affects what `__FILE__` and error messages
+   report.
+
+The per-token `tok->line_delta` snapshot (written by `preprocess2`'s
+main loop on every output token, §5.1) captures the current
+`file->line_delta` at output time. This is what makes `__LINE__`
+work correctly across `#line` boundaries.
+
+### 12.2 `#pragma`
+
+Two paths:
+
+1. **`#pragma once`**: recognized and treated as a no-op stub.
+   Per Q4, the spec preserves this stub for Phase 2 (matches main).
+   The directive's rest-of-line is consumed; no per-file
+   include-once tracking is performed. A regression test under
+   `tests/regression/NN_pragma_once.c` (per Q17) documents the
+   stub behavior.
+
+2. **All other pragmas**: silently consumed via a rest-of-line
+   skip (`while (!tok->at_bol && tok->kind != TK_EOF) tok =
+   tok->next;`). The registered `pragma_handler` callback (set
+   via `set_pragma_handler`) is **not** invoked — see Q22 in §13.
+   Per Q22's recommended fix, the new implementation should
+   invoke the handler when one is registered, falling back to
+   silent skip when not.
+
+### 12.3 `#error` and `#warning`
+
+`#error msg`: calls `error_tok(tok, "")` — note the **empty format
+string** per the current implementation. The directive's
+message tokens (`msg`) are not emitted in the diagnostic. See
+Q23 in §13. Per Q23's recommended fix, the new implementation
+should concatenate the message tokens (similar to `read_include_filename`'s
+`<...>` token-concatenation pattern) and pass the result as the
+diagnostic message.
+
+`#warning msg`: similar to `#error` but uses `warn_tok(tok->next,
+"")` (and continues processing — does not abort). Same Q23 fix
+applies.
+
+`error_tok` is `_Noreturn` (declared in `cc.h`); `#error` therefore
+terminates compilation. `warn_tok` does not return abnormally and
+processing continues at the next directive.
+
+---
 
 ---
 
