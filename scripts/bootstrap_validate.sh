@@ -3,15 +3,7 @@
 #
 #   stage1 = host_ncc compiling src/*.c
 #   stage2 = stage1   compiling src/*.c
-#   pass <=> md5(stage1/<ncc>) == md5(stage2/<ncc>)
-#
-# Usage:
-#   bootstrap_validate.sh                 # bootstrap canonical ./ncc
-#   NCC=./ncc-v2 bootstrap_validate.sh    # bootstrap the Phase-2 candidate
-#
-# When bootstrapping ncc-v2, src/preprocess.c is excluded (the v2 binary
-# was built from preprocess_v2.c; bootstrapping must reproduce itself).
-# When bootstrapping ncc, src/preprocess_v2.c is excluded.
+#   pass <=> md5(stage1/ncc) == md5(stage2/ncc)
 #
 # Run from repo root. Exits 0 on fixed point, 1 on mismatch, 2 on build failure.
 
@@ -20,69 +12,41 @@ set -e
 cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 
-NCC="${NCC:-$ROOT/ncc}"
-
-if [ ! -x "$NCC" ]; then
-    echo "no $NCC binary; run 'make' first" >&2
+if [ ! -x "$ROOT/ncc" ]; then
+    echo "no ./ncc binary; run 'make ncc' first" >&2
     exit 2
 fi
 
-# Decide which preprocessor source to exclude based on the binary
-# under test.  ncc-v2 reproduces itself; ncc reproduces itself.
-case "$NCC" in
-    *ncc-v2|*ncc-v2.exe)
-        EXCLUDE="preprocess\.c"
-        BINNAME="ncc-v2"
-        ;;
-    *)
-        EXCLUDE="preprocess_v2\.c"
-        BINNAME="ncc"
-        ;;
-esac
+mkdir -p stage1 stage2
+[ -e stage1/include ] || ln -sf "$ROOT/include" stage1/include
+[ -e stage2/include ] || ln -sf "$ROOT/include" stage2/include
 
-STAGE1="stage1"
-STAGE2="stage2"
-if [ "$BINNAME" = "ncc-v2" ]; then
-    STAGE1="stage1_v2"
-    STAGE2="stage2_v2"
-fi
+rm -f stage1/*.o stage1/ncc stage2/*.o stage2/ncc
 
-mkdir -p "$STAGE1" "$STAGE2"
-[ -e "$STAGE1/include" ] || ln -sf "$ROOT/include" "$STAGE1/include"
-[ -e "$STAGE2/include" ] || ln -sf "$ROOT/include" "$STAGE2/include"
-
-rm -f "$STAGE1"/*.o "$STAGE1/$BINNAME" "$STAGE2"/*.o "$STAGE2/$BINNAME"
-
-echo "stage1: building $BINNAME with host $NCC"
-for f in $(ls src/*.c | grep -v "${EXCLUDE}\$"); do
-    "$NCC" -c -o "$STAGE1/$(basename "${f%.c}").o" "$f" \
-        || { echo "stage1 compile failed on $f" >&2; exit 2; }
+echo "stage1: building ncc with host ncc"
+for f in src/*.c; do
+    ./ncc -c -o "stage1/$(basename "${f%.c}").o" "$f" || { echo "stage1 compile failed on $f" >&2; exit 2; }
 done
-"$NCC" -o "$STAGE1/$BINNAME" "$STAGE1"/*.o \
-    || { echo "stage1 link failed" >&2; exit 2; }
+./ncc -o stage1/ncc stage1/*.o || { echo "stage1 link failed" >&2; exit 2; }
 
-echo "stage2: building $BINNAME with $STAGE1/$BINNAME"
-for f in $(ls src/*.c | grep -v "${EXCLUDE}\$"); do
-    "$STAGE1/$BINNAME" -c -o "$STAGE2/$(basename "${f%.c}").o" "$f" \
-        || { echo "stage2 compile failed on $f" >&2; exit 2; }
+echo "stage2: building ncc with stage1/ncc"
+for f in src/*.c; do
+    stage1/ncc -c -o "stage2/$(basename "${f%.c}").o" "$f" || { echo "stage2 compile failed on $f" >&2; exit 2; }
 done
-"$STAGE1/$BINNAME" -o "$STAGE2/$BINNAME" "$STAGE2"/*.o \
-    || { echo "stage2 link failed" >&2; exit 2; }
+stage1/ncc -o stage2/ncc stage2/*.o || { echo "stage2 link failed" >&2; exit 2; }
 
-if [ "$BINNAME" = "ncc" ]; then
-    ln -sf "stage2/ncc" ncc2
-fi
+ln -sf stage2/ncc ncc2
 
-S1=$(md5 -q "$STAGE1/$BINNAME")
-S2=$(md5 -q "$STAGE2/$BINNAME")
+S1=$(md5 -q stage1/ncc)
+S2=$(md5 -q stage2/ncc)
 
 echo "stage1 md5: $S1"
 echo "stage2 md5: $S2"
 
 if [ "$S1" = "$S2" ]; then
-    echo "FIXED POINT: stage1 == stage2 ($BINNAME)"
+    echo "FIXED POINT: stage1 == ncc2"
     exit 0
 else
-    echo "MISMATCH: stage1 != stage2 ($BINNAME)" >&2
+    echo "MISMATCH: stage1 != ncc2" >&2
     exit 1
 fi
