@@ -1448,7 +1448,7 @@ static Token *attribute_list(Token *tok, Type *ty, VarAttr *attr) {
       } else if (equal(tok, "aligned") || equal(tok, "__aligned__")) {
         tok = tok->next;
         if (consume(&tok, tok, "(")) {
-          int a = const_expr_val(&tok, tok);
+          int64_t a = const_expr_val(&tok, tok);
           tok = skip(tok, ")");
           if (ty) {
             ty->align = a;
@@ -1542,7 +1542,7 @@ static Token *attribute_list(Token *tok, Type *ty, VarAttr *attr) {
       } else if (equal(tok, "vector_size") || equal(tok, "__vector_size__")) {
         tok = tok->next;
         tok = skip(tok, "(");
-        int vs = const_expr_val(&tok, tok);
+        int64_t vs = const_expr_val(&tok, tok);
         tok = skip(tok, ")");
         if (attr) attr->vector_size = vs;
         // If ty is provided directly and we're NOT in declspec (attr is NULL),
@@ -4975,17 +4975,17 @@ static void array_initializer1(Token **rest, Token *tok, Initializer *init) {
 
     // Designated initializer (may jump backward)
     if (equal(tok, "[")) {
-      int lo = const_expr_val(&tok, tok->next);
+      int64_t lo = const_expr_val(&tok, tok->next);
       // Range designator: [lo ... hi] = val
       if (equal(tok, "...")) {
-        int hi = const_expr_val(&tok, tok->next);
+        int64_t hi = const_expr_val(&tok, tok->next);
         tok = skip(tok, "]");
         if (!consume(&tok, tok, "="))
           ; // = is optional in some modes
         // Parse the value via initializer2 for each element (handles
         // both scalar "= 42" and struct "= { .f = v }" forms).
         Token *val_start = tok;
-        for (int j = lo; j <= hi; j++) {
+        for (int64_t j = lo; j <= hi; j++) {
           tok = val_start;
           if (j < init->ty->array_len)
             initializer2(&tok, tok, init->children[j]);
@@ -5208,9 +5208,9 @@ static int count_array_init_elements(Token *tok, Type *ty) {
       if (is_end(tok)) break;
     }
     if (equal(tok, "[")) {
-      int lo = const_expr_val(&tok, tok->next);
+      int64_t lo = const_expr_val(&tok, tok->next);
       if (equal(tok, "...")) {
-        int hi = const_expr_val(&tok, tok->next);
+        int64_t hi = const_expr_val(&tok, tok->next);
         tok = skip(tok, "]");
         consume(&tok, tok, "=");
         initializer2(&tok, tok, dummy);
