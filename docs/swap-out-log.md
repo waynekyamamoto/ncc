@@ -253,9 +253,11 @@ Conditions: macOS 26.0 host (linker), libpython.a built on macOS 26.1 (ABI-compa
 
 ## 2026-05-04: Phase 2 — Preprocessor swap-in CLOSED
 
-**Replaced**: `src/preprocess.c` (1798 lines, chibicc-lineage) → `src/preprocess.c` (1115 lines, spec-derived from `docs/specs/02_preprocessor.md`).
+**Replaced**: `src/preprocess.c` (1798 lines, chibicc-lineage) → `src/preprocess.c` (1817 lines, spec-derived from `docs/specs/02_preprocessor.md`).
 
-**Lines changed**: -1798 / +1115 (-683 net).  The reduction comes from C11 helper consolidation (no `open_memstream`, no `<libgen.h>`, single-pass POSIX-replacement helpers) plus dropping the unused `is_locked` field; behavior is preserved.
+**Lines changed**: -1798 / +1817 (+19 net).  The new file is slightly longer than the chibicc-lineage one despite dropping the unused `is_locked` field and consolidating into C11 helpers (no `open_memstream`, no `<libgen.h>`).  The increase comes from explicit forward declarations, spec-section cross-references in comments, and the `StrBuf` helper used by stringize and `<...>` filename concatenation.  Pure C and behaviorally equivalent: line count is not the success metric.
+
+(Earlier commit message `75436c2` and the first version of this entry incorrectly stated `1798 → 1115 (-683)`; that was a measurement error from a partial state during development.  The actual numbers are above.)
 
 **Excursions**: none.  The new `preprocess.c` uses standard C11 only: a small `StrBuf` realloc-grown buffer in place of `open_memstream`; `strrchr`-based dirname extraction in place of `<libgen.h>`'s `dirname`; `strdup`/`memcpy` patterns in place of POSIX `strndup`.  No `__attribute__`, no `__builtin_*`, no `typeof`, no statement expressions.
 
