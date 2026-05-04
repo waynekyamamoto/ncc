@@ -1393,6 +1393,7 @@ void init_macros(void) {
   define_macro("__imag", "__imag__");
   define_macro("__asm", "asm");
   define_macro("__builtin_va_list", "void *");
+  define_macro("__gnuc_va_list", "__builtin_va_list");
 
   // Builtin function-like macros
   define_macro("__builtin_expect(x,y)", "(x)");
