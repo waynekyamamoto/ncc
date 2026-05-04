@@ -623,20 +623,417 @@ void init_macros(void) {
     m = add_macro("__BASE_FILE__", true, NULL);  m->handler = base_file_macro;
 }
 
-// Suppress -Wunused-function for helpers awaiting their callers in
-// Chunks 4-7.  This array shrinks as later chunks land.
+//
+// Token-spelling string buffer.  Used by stringize and #include
+// <...> token concatenation (spec §7.1, §10.3).  C11-only:
+// realloc-grown buffer instead of POSIX open_memstream.
+//
+
+typedef struct {
+    char *data;
+    size_t len;
+    size_t cap;
+} StrBuf;
+
+static void sb_grow(StrBuf *sb, size_t need) {
+    if (sb->len + need + 1 <= sb->cap)
+        return;
+    if (sb->cap == 0)
+        sb->cap = 64;
+    while (sb->cap < sb->len + need + 1)
+        sb->cap *= 2;
+    sb->data = realloc(sb->data, sb->cap);
+    if (!sb->data)
+        error("out of memory");
+}
+
+static void sb_putc(StrBuf *sb, char c) {
+    sb_grow(sb, 1);
+    sb->data[sb->len++] = c;
+    sb->data[sb->len] = 0;
+}
+
+static void sb_puts(StrBuf *sb, const char *s, int n) {
+    sb_grow(sb, n);
+    memcpy(sb->data + sb->len, s, n);
+    sb->len += n;
+    sb->data[sb->len] = 0;
+}
+
+//
+// Stringize and paste (spec §7)
+//
+
+static Token *stringize(Token *hash, Token *arg) {
+    // Pass 1: concat raw token spellings, separating with one space
+    // when t->has_space is set on a non-first token.  The first
+    // token's own has_space is intentionally ignored (spec §13).
+    StrBuf raw = {0};
+    for (Token *t = arg; t->kind != TK_EOF; t = t->next) {
+        if (t != arg && t->has_space)
+            sb_putc(&raw, ' ');
+        sb_puts(&raw, t->loc, t->len);
+    }
+    // Pass 2: wrap in "..." and escape backslash + double-quote.
+    StrBuf esc = {0};
+    sb_putc(&esc, '"');
+    for (size_t i = 0; i < raw.len; i++) {
+        char c = raw.data[i];
+        if (c == '\\' || c == '"')
+            sb_putc(&esc, '\\');
+        sb_putc(&esc, c);
+    }
+    sb_putc(&esc, '"');
+    free(raw.data);
+    return tokenize(new_file(hash->file->name, hash->file->file_no, esc.data));
+}
+
+static Token *paste(Token *lhs, Token *rhs) {
+    char *buf = format("%.*s%.*s", lhs->len, lhs->loc, rhs->len, rhs->loc);
+    Token *tok = tokenize(new_file(lhs->file->name, lhs->file->file_no, buf));
+    if (tok->next->kind != TK_EOF)
+        error_tok(lhs, "pasting forms \"%s\", an invalid token", buf);
+    return tok;
+}
+
+//
+// Macro expansion (spec §6)
+//
+
+static MacroArg *find_arg(MacroArg *args, Token *tok) {
+    for (MacroArg *ap = args; ap; ap = ap->next)
+        if (tok->len == (int)strlen(ap->name) &&
+            !strncmp(tok->loc, ap->name, tok->len))
+            return ap;
+    return NULL;
+}
+
+// Conditional directives encountered inside a macro argument list
+// (spec §8.5).  Chunk 4 leaves this as a defensive skip — Chunk 5
+// will implement the actual #if / #ifdef / etc. handling that shares
+// cond_incl with the main loop.  Until then, the only observable
+// effect of an in-arg directive is that the directive line is
+// silently consumed.
+static Token *handle_pp_directive_in_arg(Token *tok) {
+    while (!tok->at_bol && tok->kind != TK_EOF)
+        tok = tok->next;
+    return tok;
+}
+
+// Read function-like macro arguments from `tok` (positioned at the
+// macro name; the '(' is tok->next).  Returns the MacroArg list and
+// advances *rest past the closing ')'.
+static MacroArg *read_macro_args(Token **rest, Token *tok, MacroParam *params,
+                                  char *va_args_name) {
+    Token *start = tok;
+    tok = tok->next->next;  // skip name and '('
+
+    MacroArg head = {0};
+    MacroArg *cur = &head;
+
+    MacroParam *pp = params;
+    for (; pp; pp = pp->next) {
+        if (cur != &head)
+            tok = skip(tok, ",");
+
+        MacroArg *arg = calloc_checked(1, sizeof(MacroArg));
+        arg->name = pp->name;
+
+        Token arg_head = {0};
+        Token *arg_cur = &arg_head;
+        int level = 0;
+        while (level > 0 || (!equal(tok, ",") && !equal(tok, ")"))) {
+            if (tok->kind == TK_EOF)
+                error_tok(start, "unclosed macro argument list");
+            if (is_hash(tok)) {
+                tok = handle_pp_directive_in_arg(tok);
+                continue;
+            }
+            if (equal(tok, "(")) level++;
+            if (equal(tok, ")")) level--;
+            arg_cur = arg_cur->next = copy_token(tok);
+            tok = tok->next;
+        }
+        arg_cur->next = new_eof(tok);
+        arg->tok = arg_head.next;
+
+        cur = cur->next = arg;
+    }
+
+    if (va_args_name) {
+        MacroArg *arg = calloc_checked(1, sizeof(MacroArg));
+        arg->name = va_args_name;
+        arg->is_va_args = true;
+
+        // Skip the comma separator between the last fixed param and
+        // the first variadic arg only when fixed params were actually
+        // consumed.  If the macro has no fixed params, any leading
+        // comma is part of the variadic args.
+        if (pp == NULL && cur != &head && equal(tok, ","))
+            tok = tok->next;
+
+        Token arg_head = {0};
+        Token *arg_cur = &arg_head;
+        int level = 0;
+        while (level > 0 || !equal(tok, ")")) {
+            if (tok->kind == TK_EOF)
+                error_tok(start, "unclosed macro argument list");
+            if (is_hash(tok)) {
+                tok = handle_pp_directive_in_arg(tok);
+                continue;
+            }
+            if (equal(tok, "(")) level++;
+            if (equal(tok, ")")) level--;
+            if (level >= 0)
+                arg_cur = arg_cur->next = copy_token(tok);
+            tok = tok->next;
+        }
+        arg_cur->next = new_eof(tok);
+        arg->tok = arg_head.next;
+        cur = cur->next = arg;
+    }
+
+    *rest = skip(tok, ")");
+    return head.next;
+}
+
+// Substitute parameters in a macro body (spec §6.4).  Walks the
+// body left-to-right and produces a new linked list.
+static Token *subst(Token *tok, MacroArg *args) {
+    Token head = {0};
+    Token *cur = &head;
+
+    while (tok->kind != TK_EOF) {
+        // #param — stringize
+        if (equal(tok, "#")) {
+            MacroArg *arg = find_arg(args, tok->next);
+            if (!arg)
+                error_tok(tok->next, "'#' is not followed by a macro parameter");
+            cur = cur->next = stringize(tok, arg->tok);
+            tok = tok->next->next;
+            continue;
+        }
+
+        // tok ## ... — paste, possibly chained (A##B##C##D)
+        if (equal(tok->next, "##")) {
+            // Set up the LHS: copy arg tokens (raw), or copy tok itself
+            MacroArg *arg = find_arg(args, tok);
+            if (arg) {
+                if (arg->tok->kind == TK_EOF) {
+                    // Empty LHS placemarker — skip both arg and ##
+                    tok = tok->next->next;
+                    continue;
+                }
+                for (Token *t = arg->tok; t->kind != TK_EOF; t = t->next)
+                    cur = cur->next = copy_token(t);
+                tok = tok->next->next;  // skip arg and ##
+            } else {
+                cur = cur->next = copy_token(tok);
+                tok = tok->next->next;  // skip tok and ##
+            }
+
+            // Loop on the RHS, handling chains and the placemarker
+            // and GNU `, ## __VA_ARGS__` cases.
+            for (;;) {
+                MacroArg *rhs = find_arg(args, tok);
+                if (rhs) {
+                    if (rhs->tok->kind == TK_EOF && equal(cur, ",")) {
+                        // GNU: empty __VA_ARGS__ after a comma -> delete the comma
+                        Token *prev = &head;
+                        while (prev->next && prev->next != cur)
+                            prev = prev->next;
+                        prev->next = NULL;
+                        cur = prev;
+                    } else if (rhs->tok->kind != TK_EOF && equal(cur, ",")) {
+                        // GNU: non-empty __VA_ARGS__ after a comma ->
+                        // keep the comma, append args directly (no paste)
+                        for (Token *t = rhs->tok; t->kind != TK_EOF; t = t->next)
+                            cur = cur->next = copy_token(t);
+                    } else if (rhs->tok->kind != TK_EOF) {
+                        *cur = *paste(cur, rhs->tok);
+                        for (Token *t = rhs->tok->next; t->kind != TK_EOF; t = t->next)
+                            cur = cur->next = copy_token(t);
+                    }
+                    // else: empty RHS placemarker, no-op
+                    tok = tok->next;
+                } else {
+                    *cur = *paste(cur, tok);
+                    tok = tok->next;
+                }
+                if (equal(tok, "##")) {
+                    tok = tok->next;
+                    continue;
+                }
+                break;
+            }
+            continue;
+        }
+
+        // __VA_OPT__(content) — include content iff variadic non-empty
+        if (equal(tok, "__VA_OPT__") && equal(tok->next, "(")) {
+            MacroArg *va = NULL;
+            for (MacroArg *ap = args; ap; ap = ap->next)
+                if (ap->is_va_args)
+                    va = ap;
+            tok = tok->next->next;  // skip __VA_OPT__ and (
+            if (va && va->tok->kind != TK_EOF) {
+                int level = 1;
+                while (level > 0) {
+                    if (equal(tok, "(")) level++;
+                    if (equal(tok, ")")) {
+                        level--;
+                        if (level == 0) break;
+                    }
+                    cur = cur->next = copy_token(tok);
+                    tok = tok->next;
+                }
+                tok = tok->next;  // skip closing )
+            } else {
+                int level = 1;
+                while (level > 0) {
+                    if (equal(tok, "(")) level++;
+                    if (equal(tok, ")")) level--;
+                    tok = tok->next;
+                }
+            }
+            continue;
+        }
+
+        // Regular parameter substitution — use pre-expanded tokens.
+        // First token inherits has_space from the parameter reference
+        // in the body so that spacing at the call site governs output.
+        MacroArg *arg = find_arg(args, tok);
+        if (arg) {
+            bool first = true;
+            for (Token *t = arg->expanded; t->kind != TK_EOF; t = t->next) {
+                Token *new_tok = copy_token(t);
+                if (first) {
+                    new_tok->has_space = tok->has_space;
+                    first = false;
+                }
+                cur = cur->next = new_tok;
+            }
+            tok = tok->next;
+            continue;
+        }
+
+        // Plain token — copy through.
+        cur = cur->next = copy_token(tok);
+        tok = tok->next;
+    }
+
+    cur->next = new_eof(tok);
+    return head.next;
+}
+
+// Single-step macro expansion (spec §6.2).  Returns true if `tok`
+// was a macro invocation that expanded; *rest then points at the
+// start of the result.  Returns false (without advancing *rest) for
+// non-macro identifiers or hidesetted identifiers.
+static bool expand_macro(Token **rest, Token *tok) {
+    if (hideset_contains(tok->hideset, tok->loc, tok->len))
+        return false;
+
+    Macro *m = find_macro(tok);
+    if (!m)
+        return false;
+
+    // Builtin handler dispatch
+    if (m->handler) {
+        *rest = m->handler(tok);
+        (*rest)->next = tok->next;
+        return true;
+    }
+
+    // Object-like macro
+    if (m->is_objlike) {
+        Hideset *hs = hideset_union(tok->hideset, new_hideset(m->name));
+        Token *body = add_hideset(m->body, hs);
+        for (Token *t = body; t && t->kind != TK_EOF; t = t->next)
+            t->origin = tok;
+        body = append(body, tok->next);
+        *rest = body;
+        return true;
+    }
+
+    // Function-like: must be followed by '('
+    if (!equal(tok->next, "("))
+        return false;
+
+    Token *macro_tok = tok;
+    MacroArg *args = read_macro_args(&tok, tok, m->params, m->va_args_name);
+    Token *rparen = tok;
+
+    // Pre-expand each argument once before substitution (rescan rule)
+    for (MacroArg *ap = args; ap; ap = ap->next)
+        ap->expanded = preprocess2(copy_token_list(ap->tok));
+
+    // Painter's rule for hideset (spec §6.2 / Q9)
+    Hideset *hs = hideset_intersection(macro_tok->hideset, rparen->hideset);
+    hs = hideset_union(hs, new_hideset(m->name));
+
+    Token *body = subst(m->body, args);
+    body = add_hideset(body, hs);
+    for (Token *t = body; t && t->kind != TK_EOF; t = t->next)
+        t->origin = macro_tok;
+    body = append(body, tok);
+
+    *rest = body;
+    return true;
+}
+
+// Read a #define directive's body (spec §6.1).  *rest is advanced
+// past the directive line.
+static Token *read_macro_definition(Token **rest, Token *tok) {
+    if (tok->kind != TK_IDENT && tok->kind != TK_KEYWORD)
+        error_tok(tok, "macro name must be an identifier");
+    char *name = strndup_checked(tok->loc, tok->len);
+    tok = tok->next;
+
+    if (!tok->has_space && equal(tok, "(")) {
+        // Function-like macro
+        tok = tok->next;
+        MacroParam head = {0};
+        MacroParam *cur = &head;
+        char *va_args_name = NULL;
+        while (!equal(tok, ")")) {
+            if (cur != &head)
+                tok = skip(tok, ",");
+            if (equal(tok, "...")) {
+                va_args_name = "__VA_ARGS__";
+                tok = tok->next;
+                break;
+            }
+            if (tok->kind != TK_IDENT && tok->kind != TK_KEYWORD)
+                error_tok(tok, "expected parameter name");
+            if (equal(tok->next, "...")) {
+                va_args_name = strndup_checked(tok->loc, tok->len);
+                tok = tok->next->next;
+                break;
+            }
+            MacroParam *param = calloc_checked(1, sizeof(MacroParam));
+            param->name = strndup_checked(tok->loc, tok->len);
+            cur = cur->next = param;
+            tok = tok->next;
+        }
+        tok = skip(tok, ")");
+        Macro *m = add_macro(name, false, copy_line(rest, tok));
+        m->params = head.next;
+        m->va_args_name = va_args_name;
+        return *rest;
+    }
+
+    // Object-like macro
+    add_macro(name, true, copy_line(rest, tok));
+    return *rest;
+}
+
+// Suppress -Wunused-function for helpers awaiting Chunks 5-7.
 static void *_v2_pending_uses[] __attribute__((unused)) = {
     (void *)is_hash,
     (void *)skip_line,
-    (void *)copy_token,
-    (void *)new_eof,
-    (void *)append,
-    (void *)copy_line,
-    (void *)copy_token_list,
-    (void *)hideset_intersection,
-    (void *)hideset_contains,
-    (void *)add_hideset,
-    (void *)find_macro,
+    (void *)expand_macro,
+    (void *)read_macro_definition,
     (void *)&cond_incl,
     (void *)&pragma_handler,
 };
