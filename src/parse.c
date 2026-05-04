@@ -4160,9 +4160,12 @@ static Node *stmt(Token **rest, Token *tok) {
       error_tok(tok, "stray case");
 
     Node *node = new_node(ND_CASE, tok);
-    int begin = const_expr_val(&tok, tok->next);
+    // Use int64_t — truncating to int sign-extends 32-bit values with bit 31
+    // set when assigned to node->begin (which is long), making case
+    // constants like ioctl numbers (0x80047410UL) compare unequal.
+    int64_t begin = const_expr_val(&tok, tok->next);
 
-    int end;
+    int64_t end;
     if (equal(tok, "...")) {
       // GCC case range extension: case 1 ... 5
       end = const_expr_val(&tok, tok->next);
