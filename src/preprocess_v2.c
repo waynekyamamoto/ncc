@@ -173,11 +173,6 @@ Token *preprocess(Token *tok) {
     return tok;
 }
 
-static Token *preprocess2(Token *tok) {
-    // TODO Chunk 7: directive dispatch + macro expansion per spec §5.
-    return tok;
-}
-
 //
 // Hideset operations (spec §2.4)
 //
@@ -1607,15 +1602,213 @@ static long eval_const_expr(Token **rest, Token *tok) {
     return val;
 }
 
-// Suppress -Wunused-function for helpers awaiting Chunk 7's
-// preprocess2 directive dispatch.
-static void *_v2_pending_uses[] __attribute__((unused)) = {
-    (void *)is_hash,
-    (void *)skip_line,
-    (void *)expand_macro,
-    (void *)read_macro_definition,
-    (void *)read_include_filename,
-    (void *)search_include_next,
-    (void *)include_file,
-    (void *)&pragma_handler,
-};
+
+//
+// Main directive-dispatch loop (spec §5)
+//
+
+// Concatenate the rest-of-line tokens into a single string with
+// has_space-aware spacing.  Used by #error / #warning per Q23 to
+// build the diagnostic message text.
+static char *concat_line_message(Token *tok) {
+    StrBuf sb = {0};
+    bool first = true;
+    for (; !tok->at_bol && tok->kind != TK_EOF; tok = tok->next) {
+        if (!first && tok->has_space)
+            sb_putc(&sb, ' ');
+        sb_puts(&sb, tok->loc, tok->len);
+        first = false;
+    }
+    return sb.data ? sb.data : (char *)"";
+}
+
+static Token *preprocess2(Token *tok) {
+    Token head = {0};
+    Token *cur = &head;
+
+    while (tok->kind != TK_EOF) {
+        pp_token_count++;
+
+        // Try macro expansion first.
+        if (expand_macro(&tok, tok))
+            continue;
+
+        // Non-directive token: append to output and snapshot
+        // file->line_delta onto the per-token field (spec §5.1 step 2).
+        if (!is_hash(tok)) {
+            tok->line_delta = tok->file->line_delta;
+            cur = cur->next = tok;
+            tok = tok->next;
+            continue;
+        }
+
+        // `#`-line directive dispatch (spec §5.2).
+        Token *start = tok;
+        tok = tok->next;
+
+        if (equal(tok, "include")) {
+            bool is_dquote;
+            char *filename = read_include_filename(&tok, tok->next, &is_dquote);
+            char *path = NULL;
+            if (is_dquote) {
+                // Try directory of the including file first.
+                char *dir = strdup(start->file->name);
+                char *slash = strrchr(dir, '/');
+                if (slash) *slash = 0;
+                else strcpy(dir, ".");
+                char *try_path = format("%s/%s", dir, filename);
+                if (path_exists(try_path))
+                    path = try_path;
+                free(dir);
+            }
+            if (!path)
+                path = search_include_paths(filename);
+            if (!path)
+                error_tok(start, "'%s': file not found", filename);
+            tok = include_file(tok, path, start->next);
+            continue;
+        }
+
+        if (equal(tok, "include_next")) {
+            bool is_dquote;
+            char *filename = read_include_filename(&tok, tok->next, &is_dquote);
+            // Find directory of the current file in include_paths so
+            // we can search starting from the next index.
+            char *cur_dir = strdup(start->file->name);
+            char *slash = strrchr(cur_dir, '/');
+            if (slash) *slash = 0;
+            else strcpy(cur_dir, ".");
+            int start_idx = 0;
+            for (int i = 0; i < include_paths.len; i++) {
+                if (!strcmp(include_paths.data[i], cur_dir)) {
+                    start_idx = i + 1;
+                    break;
+                }
+            }
+            free(cur_dir);
+            char *path = search_include_next(filename, start_idx);
+            if (!path)
+                error_tok(start, "'%s': file not found", filename);
+            tok = include_file(tok, path, start->next);
+            continue;
+        }
+
+        if (equal(tok, "define")) {
+            read_macro_definition(&tok, tok->next);
+            continue;
+        }
+
+        if (equal(tok, "undef")) {
+            tok = tok->next;
+            if (tok->kind != TK_IDENT && tok->kind != TK_KEYWORD)
+                error_tok(tok, "macro name must be an identifier");
+            undef_macro(strndup_checked(tok->loc, tok->len));
+            tok = skip_line(tok->next);
+            continue;
+        }
+
+        if (equal(tok, "if")) {
+            long val = eval_const_expr(&tok, tok->next);
+            push_cond_incl(start, val);
+            if (!val)
+                tok = skip_cond_incl(tok);
+            continue;
+        }
+
+        if (equal(tok, "ifdef")) {
+            bool defined = hashmap_get2(&macros, tok->next->loc, tok->next->len);
+            push_cond_incl(tok, defined);
+            tok = skip_line(tok->next->next);
+            if (!defined)
+                tok = skip_cond_incl(tok);
+            continue;
+        }
+
+        if (equal(tok, "ifndef")) {
+            bool defined = hashmap_get2(&macros, tok->next->loc, tok->next->len);
+            push_cond_incl(tok, !defined);
+            tok = skip_line(tok->next->next);
+            if (defined)
+                tok = skip_cond_incl(tok);
+            continue;
+        }
+
+        if (equal(tok, "elif")) {
+            if (!cond_incl || cond_incl->ctx == IN_ELSE)
+                error_tok(start, "stray #elif");
+            cond_incl->ctx = IN_ELIF;
+            if (!cond_incl->included && eval_const_expr(&tok, tok->next))
+                cond_incl->included = true;
+            else
+                tok = skip_cond_incl(tok);
+            continue;
+        }
+
+        if (equal(tok, "else")) {
+            if (!cond_incl || cond_incl->ctx == IN_ELSE)
+                error_tok(start, "stray #else");
+            cond_incl->ctx = IN_ELSE;
+            tok = skip_line(tok->next);
+            if (cond_incl->included)
+                tok = skip_cond_incl(tok);
+            else
+                cond_incl->included = true;
+            continue;
+        }
+
+        if (equal(tok, "endif")) {
+            if (!cond_incl)
+                error_tok(start, "stray #endif");
+            cond_incl = cond_incl->next;
+            tok = skip_line(tok->next);
+            continue;
+        }
+
+        if (equal(tok, "line")) {
+            Token *t = preprocess2(copy_line(&tok, tok->next));
+            convert_pp_tokens(t);
+            if (t->kind != TK_NUM || t->ty->kind != TY_INT)
+                error_tok(t, "invalid line marker");
+            start->file->line_delta = t->val - start->line_no;
+            if (t->next->kind == TK_STR)
+                start->file->display_name = t->next->str;
+            continue;
+        }
+
+        if (equal(tok, "pragma")) {
+            tok = tok->next;
+            if (equal(tok, "once")) {
+                tok = skip_line(tok->next);
+                continue;
+            }
+            // Q22: invoke registered handler if any; otherwise skip line.
+            if (pragma_handler)
+                pragma_handler(start);
+            while (!tok->at_bol && tok->kind != TK_EOF)
+                tok = tok->next;
+            continue;
+        }
+
+        if (equal(tok, "error")) {
+            // Q23: emit the message tokens.
+            char *msg = concat_line_message(tok->next);
+            error_tok(tok, "%s", msg);
+        }
+
+        if (equal(tok, "warning")) {
+            char *msg = concat_line_message(tok->next);
+            warn_tok(tok->next, "%s", msg);
+            tok = skip_line(tok->next);
+            continue;
+        }
+
+        // Null directive: `#` followed by newline.
+        if (tok->at_bol)
+            continue;
+
+        error_tok(tok, "invalid preprocessor directive");
+    }
+
+    cur->next = tok;
+    return head.next;
+}
