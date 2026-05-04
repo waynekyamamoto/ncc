@@ -708,13 +708,62 @@ static MacroArg *find_arg(MacroArg *args, Token *tok) {
     return NULL;
 }
 
+// Forward declarations for Chunk-5 functions used by Chunk-4 code.
+static long eval_const_expr(Token **rest, Token *tok);
+static void push_cond_incl(Token *tok, bool included);
+static Token *skip_cond_incl(Token *tok);
+
 // Conditional directives encountered inside a macro argument list
-// (spec §8.5).  Chunk 4 leaves this as a defensive skip — Chunk 5
-// will implement the actual #if / #ifdef / etc. handling that shares
-// cond_incl with the main loop.  Until then, the only observable
-// effect of an in-arg directive is that the directive line is
-// silently consumed.
+// (spec §8.5).  Shares cond_incl with the main loop — a #if opened
+// in-arg can be closed by an #endif outside it (and vice versa);
+// the post-preprocess stack-empty check catches dangling entries.
 static Token *handle_pp_directive_in_arg(Token *tok) {
+    tok = tok->next;  // skip '#'
+    if (equal(tok, "ifdef") || equal(tok, "ifndef")) {
+        bool is_ifdef = equal(tok, "ifdef");
+        bool defined = hashmap_get2(&macros, tok->next->loc, tok->next->len);
+        push_cond_incl(tok, is_ifdef ? defined : !defined);
+        tok = skip_line(tok->next->next);
+        if (is_ifdef ? !defined : defined)
+            tok = skip_cond_incl(tok);
+        return tok;
+    }
+    if (equal(tok, "if")) {
+        long val = eval_const_expr(&tok, tok->next);
+        push_cond_incl(tok, val);
+        if (!val)
+            tok = skip_cond_incl(tok);
+        return tok;
+    }
+    if (equal(tok, "elif")) {
+        if (cond_incl && cond_incl->ctx != IN_ELSE) {
+            cond_incl->ctx = IN_ELIF;
+            if (!cond_incl->included && eval_const_expr(&tok, tok->next))
+                cond_incl->included = true;
+            else
+                tok = skip_cond_incl(tok);
+        }
+        return tok;
+    }
+    if (equal(tok, "else")) {
+        if (cond_incl && cond_incl->ctx != IN_ELSE) {
+            cond_incl->ctx = IN_ELSE;
+            tok = skip_line(tok->next);
+            if (cond_incl->included)
+                tok = skip_cond_incl(tok);
+            else
+                cond_incl->included = true;
+        }
+        return tok;
+    }
+    if (equal(tok, "endif")) {
+        if (cond_incl)
+            cond_incl = cond_incl->next;
+        tok = skip_line(tok->next);
+        return tok;
+    }
+    // Other directives (#define, #undef, etc.) inside argument lists:
+    // skip the rest of the line.
     while (!tok->at_bol && tok->kind != TK_EOF)
         tok = tok->next;
     return tok;
@@ -1028,12 +1077,545 @@ static Token *read_macro_definition(Token **rest, Token *tok) {
     return *rest;
 }
 
-// Suppress -Wunused-function for helpers awaiting Chunks 5-7.
+//
+// Conditional inclusion (spec §8)
+//
+
+static void push_cond_incl(Token *tok, bool included) {
+    CondIncl *ci = calloc_checked(1, sizeof(CondIncl));
+    ci->next = cond_incl;
+    ci->ctx = IN_THEN;
+    ci->tok = tok;
+    ci->included = included;
+    cond_incl = ci;
+}
+
+// Skip from a nested #if/#ifdef/#ifndef to its matching #endif
+// (recursively); used by skip_cond_incl when it encounters a
+// nested block while seeking the next branch directive.
+static Token *skip_cond_incl2(Token *tok) {
+    while (tok->kind != TK_EOF) {
+        if (is_hash(tok) &&
+            (equal(tok->next, "if") || equal(tok->next, "ifdef") ||
+             equal(tok->next, "ifndef"))) {
+            tok = skip_cond_incl2(tok->next->next);
+            continue;
+        }
+        if (is_hash(tok) && equal(tok->next, "endif"))
+            return tok->next->next;
+        tok = tok->next;
+    }
+    return tok;
+}
+
+// Skip a not-taken conditional branch.  Returns tok positioned at
+// the next #elif/#else/#endif at the current depth.  Nested
+// #if-blocks are skipped via skip_cond_incl2.
+static Token *skip_cond_incl(Token *tok) {
+    while (tok->kind != TK_EOF) {
+        if (is_hash(tok) &&
+            (equal(tok->next, "if") || equal(tok->next, "ifdef") ||
+             equal(tok->next, "ifndef"))) {
+            tok = skip_cond_incl2(tok->next->next);
+            continue;
+        }
+        if (is_hash(tok) &&
+            (equal(tok->next, "elif") || equal(tok->next, "else") ||
+             equal(tok->next, "endif")))
+            break;
+        tok = tok->next;
+    }
+    return tok;
+}
+
+//
+// Constant expression evaluation (spec §9)
+//
+
+// Allowlists for __has_attribute / __has_builtin (spec §9.1, Q13).
+// Both single-underscore and double-underscore forms are accepted.
+static const char *supported_attrs[] = {
+    "packed", "aligned", "section", "unused", "weak", "noinline",
+    "noreturn", "always_inline", "cold", "hot", "pure", "const",
+    "alias", "used", "warn_unused_result", "noclone", "nothrow",
+    "deprecated", "malloc", "flatten", "constructor", "destructor",
+    "transparent_union", "returns_nonnull", "may_alias",
+    "__packed__", "__aligned__", "__section__", "__unused__",
+    "__weak__", "__noinline__", "__noreturn__", "__always_inline__",
+    "__cold__", "__pure__", "__const__", "__alias__", "__used__",
+    "__deprecated__", "__malloc__",
+    NULL
+};
+
+static const char *supported_builtins[] = {
+    "__builtin_va_start", "__builtin_va_end", "__builtin_va_arg",
+    "__builtin_va_copy", "__builtin_va_list",
+    "__builtin_offsetof", "__builtin_types_compatible_p",
+    "__builtin_expect",
+    "__builtin_unreachable",
+    "__builtin_constant_p",
+    "__builtin_bswap16", "__builtin_bswap32", "__builtin_bswap64",
+    "__builtin_clz", "__builtin_clzl", "__builtin_clzll",
+    "__builtin_ctz", "__builtin_ctzl", "__builtin_ctzll",
+    "__builtin_popcount", "__builtin_popcountl", "__builtin_popcountll",
+    "__builtin_memset", "__builtin_memcpy", "__builtin_memcmp",
+    "__builtin_strlen", "__builtin_strcmp",
+    "__builtin_frame_address", "__builtin_return_address",
+    "__builtin_prefetch",
+    "__builtin_alloca",
+    NULL
+};
+
+static bool name_in_list(const char **list, const char *loc, int len) {
+    for (int i = 0; list[i]; i++)
+        if ((int)strlen(list[i]) == len && !strncmp(list[i], loc, len))
+            return true;
+    return false;
+}
+
+//
+// #include resolution (spec §10) — pulled forward of Chunk 6 because
+// __has_include in read_const_expr needs search_include_paths.
+//
+
+// File-existence probe.  Q2: replaces main's leaking fopen with
+// access(R_OK), which doesn't open a file descriptor (one of the
+// few deliberate divergences from main's observable behavior;
+// invisible to all tests but eliminates an FD leak per #include
+// probe).
+static bool path_exists(const char *path) {
+    return access(path, R_OK) == 0;
+}
+
+// Search the include_paths list for `filename`.  Absolute paths are
+// returned as-is.
+static char *search_include_paths(char *filename) {
+    if (filename[0] == '/')
+        return filename;
+    for (int i = 0; i < include_paths.len; i++) {
+        char *path = format("%s/%s", include_paths.data[i], filename);
+        if (path_exists(path))
+            return path;
+    }
+    return NULL;
+}
+
+// Like search_include_paths but starting at an arbitrary index in
+// include_paths; used by #include_next.
+static char *search_include_next(char *filename, int start) {
+    for (int i = start; i < include_paths.len; i++) {
+        char *path = format("%s/%s", include_paths.data[i], filename);
+        if (path_exists(path))
+            return path;
+    }
+    return NULL;
+}
+
+// Read the operand of #include / #include_next.  Three patterns:
+//   1. "foo.h"  (TK_STR)
+//   2. <foo.h>  (token sequence between < and >)
+//   3. macro    (recursively macro-expand the line, then re-parse)
+// Sets *is_dquote per pattern (true for 1, false for 2/3).
+static char *read_include_filename(Token **rest, Token *tok, bool *is_dquote) {
+    if (tok->kind == TK_STR) {
+        *is_dquote = true;
+        *rest = skip_line(tok->next);
+        return strndup_checked(tok->str, tok->ty->array_len - 1);
+    }
+    if (equal(tok, "<")) {
+        Token *start = tok;
+        for (; !equal(tok, ">"); tok = tok->next)
+            if (tok->at_bol || tok->kind == TK_EOF)
+                error_tok(start, "expected '>'");
+        *is_dquote = false;
+        *rest = skip_line(tok->next);
+
+        StrBuf sb = {0};
+        for (Token *t = start->next; t != tok; t = t->next) {
+            if (t != start->next && t->has_space)
+                sb_putc(&sb, ' ');
+            sb_puts(&sb, t->loc, t->len);
+        }
+        return sb.data;
+    }
+    if (tok->kind == TK_IDENT) {
+        // Macro-expanded form: preprocess the rest-of-line, then recurse.
+        Token *tok2 = preprocess2(copy_line(rest, tok));
+        return read_include_filename(&tok2, tok2, is_dquote);
+    }
+    error_tok(tok, "expected a filename");
+}
+
+// Splice an included file's tokens into the current stream.
+// `tok` is the token that follows the #include directive (i.e., the
+// position to which the included stream is logically prepended).
+// Per Q11, the spec does not mandate the splice mechanism; this
+// implementation reuses the included file's terminal TK_EOF node by
+// overwriting it with `tok`'s contents (saves an allocation).
+static Token *include_file(Token *tok, char *path, Token *filename_tok) {
+    Token *tok2 = tokenize_file(path);
+    if (!tok2)
+        error_tok(filename_tok, "%s: cannot open file: %s", path, strerror(errno));
+    Token *t = tok2;
+    while (t->kind != TK_EOF)
+        t = t->next;
+    *t = *tok;
+    return tok2;
+}
+
+// Read a #if (or #elif) expression's rest-of-line.  Performs the
+// pre-evaluation lowerings: __has_attribute/builtin/feature(NAME)
+// -> 0/1, __has_include/include_next(...) -> 0/1, defined(X) /
+// defined X -> 0/1.  Returns the rewritten token list (terminated
+// by TK_EOF), advances *rest past the directive line.
+static Token *read_const_expr(Token **rest, Token *tok) {
+    tok = copy_line(rest, tok);
+
+    // First pass: lower __has_attribute / __has_builtin /
+    // __has_feature.  Each is recognized as an identifier followed
+    // by '(' NAME ')'; replace the entire 4-token sequence with a
+    // single TK_PP_NUM "0"/"1".
+    for (Token *t = tok; t->kind != TK_EOF; t = t->next) {
+        if ((t->kind != TK_IDENT && t->kind != TK_KEYWORD))
+            continue;
+
+        bool is_attr = (t->len == 15 && !strncmp(t->loc, "__has_attribute", 15));
+        bool is_builtin = (t->len == 13 && !strncmp(t->loc, "__has_builtin", 13));
+        bool is_feature = (t->len == 13 && !strncmp(t->loc, "__has_feature", 13));
+
+        if (!is_attr && !is_builtin && !is_feature)
+            continue;
+        if (!equal(t->next, "("))
+            continue;
+
+        // Argument is a single identifier; find the matching close-paren.
+        Token *arg = t->next->next;
+        const char *arg_loc = NULL;
+        int arg_len = 0;
+        if (arg->kind == TK_IDENT || arg->kind == TK_KEYWORD) {
+            arg_loc = arg->loc;
+            arg_len = arg->len;
+        }
+        Token *end = t->next->next;
+        int level = 1;
+        while (end->kind != TK_EOF && level > 0) {
+            if (equal(end, "(")) level++;
+            if (equal(end, ")")) level--;
+            if (level > 0) end = end->next;
+        }
+
+        int result = 0;
+        if (is_attr && arg_loc)
+            result = name_in_list(supported_attrs, arg_loc, arg_len) ? 1 : 0;
+        else if (is_builtin && arg_loc)
+            result = name_in_list(supported_builtins, arg_loc, arg_len) ? 1 : 0;
+        // is_feature: result stays 0 per Q5.
+
+        Token *next = end ? end->next : new_eof(t);
+        *t = *new_eof(t);
+        t->kind = TK_PP_NUM;
+        t->loc = result ? "1" : "0";
+        t->len = 1;
+        t->next = next;
+    }
+
+    // Second pass: lower __has_include / __has_include_next.
+    for (Token *t = tok; t->kind != TK_EOF; t = t->next) {
+        if (t->kind != TK_IDENT && t->kind != TK_KEYWORD)
+            continue;
+        bool is_inc = (t->len == 13 && !strncmp(t->loc, "__has_include", 13));
+        bool is_inc_next = (t->len == 18 && !strncmp(t->loc, "__has_include_next", 18));
+        if (!is_inc && !is_inc_next)
+            continue;
+        if (!equal(t->next, "("))
+            continue;
+
+        // Argument is "..." (TK_STR) or <...> (a sequence of tokens
+        // between < and >).  Find the matching close-paren.
+        Token *arg = t->next->next;
+        Token *end = arg;
+        int level = 1;
+        while (end->kind != TK_EOF && level > 0) {
+            if (equal(end, "(")) level++;
+            if (equal(end, ")")) level--;
+            if (level > 0) end = end->next;
+        }
+
+        char *fname = NULL;
+        if (arg->kind == TK_STR) {
+            fname = strndup_checked(arg->str, arg->ty->array_len - 1);
+        } else if (equal(arg, "<")) {
+            StrBuf sb = {0};
+            for (Token *x = arg->next; x->kind != TK_EOF && !equal(x, ">"); x = x->next)
+                sb_puts(&sb, x->loc, x->len);
+            fname = sb.data;
+        }
+
+        int result = (fname && search_include_paths(fname)) ? 1 : 0;
+        Token *next = end ? end->next : new_eof(t);
+        *t = *new_eof(t);
+        t->kind = TK_PP_NUM;
+        t->loc = result ? "1" : "0";
+        t->len = 1;
+        t->next = next;
+    }
+
+    // Third pass: lower defined(X) / defined X to 0/1.
+    Token head = {0};
+    Token *cur = &head;
+    while (tok->kind != TK_EOF) {
+        if (equal(tok, "defined")) {
+            Token *start = tok;
+            tok = tok->next;
+            bool has_paren = false;
+            if (equal(tok, "(")) {
+                has_paren = true;
+                tok = tok->next;
+            }
+            if (tok->kind != TK_IDENT && tok->kind != TK_KEYWORD)
+                error_tok(start, "macro name must be an identifier");
+            Macro *m = hashmap_get2(&macros, tok->loc, tok->len);
+            tok = tok->next;
+            if (has_paren)
+                tok = skip(tok, ")");
+            Token *t = copy_token(start);
+            t->kind = TK_PP_NUM;
+            t->loc = m ? "1" : "0";
+            t->len = 1;
+            cur = cur->next = t;
+            continue;
+        }
+        cur = cur->next = tok;
+        tok = tok->next;
+    }
+    cur->next = tok;  // EOF
+    return head.next;
+}
+
+// Recursive-descent evaluator.  Forward decls per the grammar.
+static long const_expr_(Token **rest, Token *tok);
+static long cond_(Token **rest, Token *tok);
+static long logor_(Token **rest, Token *tok);
+static long logand_(Token **rest, Token *tok);
+static long bitor_(Token **rest, Token *tok);
+static long bitxor_(Token **rest, Token *tok);
+static long bitand_(Token **rest, Token *tok);
+static long equality_(Token **rest, Token *tok);
+static long relational_(Token **rest, Token *tok);
+static long shift_(Token **rest, Token *tok);
+static long add_(Token **rest, Token *tok);
+static long mul_(Token **rest, Token *tok);
+static long unary_(Token **rest, Token *tok);
+static long primary_(Token **rest, Token *tok);
+
+static long const_expr_(Token **rest, Token *tok) { return cond_(rest, tok); }
+
+static long cond_(Token **rest, Token *tok) {
+    long val = logor_(&tok, tok);
+    if (!equal(tok, "?")) {
+        *rest = tok;
+        return val;
+    }
+    tok = tok->next;
+    long t = const_expr_(&tok, tok);
+    tok = skip(tok, ":");
+    long f = cond_(rest, tok);
+    return val ? t : f;
+}
+
+static long logor_(Token **rest, Token *tok) {
+    long val = logand_(&tok, tok);
+    while (equal(tok, "||")) {
+        tok = tok->next;
+        val = logand_(&tok, tok) || val;
+    }
+    *rest = tok;
+    return val;
+}
+
+static long logand_(Token **rest, Token *tok) {
+    long val = bitor_(&tok, tok);
+    while (equal(tok, "&&")) {
+        tok = tok->next;
+        long rhs = bitor_(&tok, tok);
+        val = val && rhs;
+    }
+    *rest = tok;
+    return val;
+}
+
+static long bitor_(Token **rest, Token *tok) {
+    long val = bitxor_(&tok, tok);
+    while (equal(tok, "|")) {
+        tok = tok->next;
+        val |= bitxor_(&tok, tok);
+    }
+    *rest = tok;
+    return val;
+}
+
+static long bitxor_(Token **rest, Token *tok) {
+    long val = bitand_(&tok, tok);
+    while (equal(tok, "^")) {
+        tok = tok->next;
+        val ^= bitand_(&tok, tok);
+    }
+    *rest = tok;
+    return val;
+}
+
+static long bitand_(Token **rest, Token *tok) {
+    long val = equality_(&tok, tok);
+    while (equal(tok, "&")) {
+        tok = tok->next;
+        val &= equality_(&tok, tok);
+    }
+    *rest = tok;
+    return val;
+}
+
+static long equality_(Token **rest, Token *tok) {
+    long val = relational_(&tok, tok);
+    for (;;) {
+        if (equal(tok, "==")) { tok = tok->next; val = val == relational_(&tok, tok); }
+        else if (equal(tok, "!=")) { tok = tok->next; val = val != relational_(&tok, tok); }
+        else { *rest = tok; return val; }
+    }
+}
+
+static long relational_(Token **rest, Token *tok) {
+    long val = shift_(&tok, tok);
+    for (;;) {
+        if (equal(tok, "<")) { tok = tok->next; val = val < shift_(&tok, tok); }
+        else if (equal(tok, "<=")) { tok = tok->next; val = val <= shift_(&tok, tok); }
+        else if (equal(tok, ">")) { tok = tok->next; val = val > shift_(&tok, tok); }
+        else if (equal(tok, ">=")) { tok = tok->next; val = val >= shift_(&tok, tok); }
+        else { *rest = tok; return val; }
+    }
+}
+
+static long shift_(Token **rest, Token *tok) {
+    long val = add_(&tok, tok);
+    for (;;) {
+        if (equal(tok, "<<")) { tok = tok->next; val <<= add_(&tok, tok); }
+        else if (equal(tok, ">>")) { tok = tok->next; val >>= add_(&tok, tok); }
+        else { *rest = tok; return val; }
+    }
+}
+
+static long add_(Token **rest, Token *tok) {
+    long val = mul_(&tok, tok);
+    for (;;) {
+        if (equal(tok, "+")) { tok = tok->next; val += mul_(&tok, tok); }
+        else if (equal(tok, "-")) { tok = tok->next; val -= mul_(&tok, tok); }
+        else { *rest = tok; return val; }
+    }
+}
+
+static long mul_(Token **rest, Token *tok) {
+    long val = unary_(&tok, tok);
+    for (;;) {
+        if (equal(tok, "*")) { tok = tok->next; val *= unary_(&tok, tok); }
+        else if (equal(tok, "/")) {
+            tok = tok->next;
+            long div = unary_(&tok, tok);
+            if (div == 0) error_tok(tok, "division by zero in preprocessor expression");
+            val /= div;
+        } else if (equal(tok, "%")) {
+            tok = tok->next;
+            long div = unary_(&tok, tok);
+            if (div == 0) error_tok(tok, "division by zero in preprocessor expression");
+            val %= div;
+        } else { *rest = tok; return val; }
+    }
+}
+
+static long unary_(Token **rest, Token *tok) {
+    if (equal(tok, "+")) return unary_(rest, tok->next);
+    if (equal(tok, "-")) return -unary_(rest, tok->next);
+    if (equal(tok, "!")) return !unary_(rest, tok->next);
+    if (equal(tok, "~")) return ~unary_(rest, tok->next);
+    return primary_(rest, tok);
+}
+
+static long primary_(Token **rest, Token *tok) {
+    if (equal(tok, "(")) {
+        long val = const_expr_(&tok, tok->next);
+        *rest = skip(tok, ")");
+        return val;
+    }
+    if (tok->kind == TK_NUM) {
+        *rest = tok->next;
+        return tok->val;
+    }
+    if (tok->kind == TK_PP_NUM) {
+        char *end;
+        long val = strtol(tok->loc, &end, 0);
+        while (*end == 'u' || *end == 'U' || *end == 'l' || *end == 'L')
+            end++;
+        *rest = tok->next;
+        return val;
+    }
+    error_tok(tok, "expected a number");
+}
+
+// Evaluate a #if expression to a long value.  Pipeline (spec §9):
+// read_const_expr -> preprocess2 -> defined post-pass -> ident -> 0
+// -> convert_pp_tokens -> recursive descent.
+static long eval_const_expr(Token **rest, Token *tok) {
+    Token *expr = read_const_expr(rest, tok);
+    expr = preprocess2(expr);
+
+    // Post-expansion pass: defined(X) that surfaced from macro
+    // expansion (e.g., `#define IS_DEFINED(x) defined(x)` then
+    // `#if IS_DEFINED(FOO)`) must be lowered now.  Then any
+    // remaining identifier becomes 0 (C standard rule).
+    for (Token *t = expr; t->kind != TK_EOF; t = t->next) {
+        if (t->kind == TK_IDENT && t->len == 7 && !strncmp(t->loc, "defined", 7)) {
+            Token *u = t->next;
+            bool has_paren = false;
+            if (u && equal(u, "(")) { has_paren = true; u = u->next; }
+            if (u && (u->kind == TK_IDENT || u->kind == TK_KEYWORD)) {
+                Macro *m = hashmap_get2(&macros, u->loc, u->len);
+                Token *end = u->next;
+                if (has_paren && end && equal(end, ")")) end = end->next;
+                Token *next = end;
+                *t = *new_eof(t);
+                t->kind = TK_PP_NUM;
+                t->loc = m ? "1" : "0";
+                t->len = 1;
+                t->next = next;
+                continue;
+            }
+        }
+        if (t->kind == TK_IDENT) {
+            Token *next = t->next;
+            *t = *new_eof(t);
+            t->kind = TK_PP_NUM;
+            t->loc = "0";
+            t->len = 1;
+            t->next = next;
+        }
+    }
+
+    convert_pp_tokens(expr);
+
+    Token *rest2;
+    long val = const_expr_(&rest2, expr);
+    if (rest2->kind != TK_EOF)
+        error_tok(rest2, "extra token in constant expression");
+    return val;
+}
+
+// Suppress -Wunused-function for helpers awaiting Chunk 7's
+// preprocess2 directive dispatch.
 static void *_v2_pending_uses[] __attribute__((unused)) = {
     (void *)is_hash,
     (void *)skip_line,
     (void *)expand_macro,
     (void *)read_macro_definition,
-    (void *)&cond_incl,
+    (void *)read_include_filename,
+    (void *)search_include_next,
+    (void *)include_file,
     (void *)&pragma_handler,
 };
