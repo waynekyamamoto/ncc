@@ -179,25 +179,147 @@ static Token *preprocess2(Token *tok) {
 }
 
 //
+// Hideset operations (spec §2.4)
+//
+
+static Hideset *new_hideset(char *name) {
+    Hideset *hs = calloc_checked(1, sizeof(Hideset));
+    hs->name = name;
+    return hs;
+}
+
+// Set union — concatenate hs1 onto a chain shared with hs2's tail.
+// No deduplication: harmless because hideset_contains returns on
+// first match (spec §2.4 Q3).
+static Hideset *hideset_union(Hideset *hs1, Hideset *hs2) {
+    Hideset head = {0};
+    Hideset *cur = &head;
+    for (; hs1; hs1 = hs1->next)
+        cur = cur->next = new_hideset(hs1->name);
+    cur->next = hs2;
+    return head.next;
+}
+
+// Set intersection — elements of hs1 whose name also appears in hs2.
+// Used by expand_macro for the painter's-rule (spec §6.2 / Q9) when
+// expanding function-like macros.
+static Hideset *hideset_intersection(Hideset *hs1, Hideset *hs2) {
+    Hideset head = {0};
+    Hideset *cur = &head;
+    for (; hs1; hs1 = hs1->next) {
+        for (Hideset *h = hs2; h; h = h->next) {
+            if (!strcmp(hs1->name, h->name)) {
+                cur = cur->next = new_hideset(hs1->name);
+                break;
+            }
+        }
+    }
+    return head.next;
+}
+
+// Membership test — linear scan with strncmp.
+static bool hideset_contains(Hideset *hs, char *s, int len) {
+    for (; hs; hs = hs->next)
+        if ((int)strlen(hs->name) == len && !strncmp(hs->name, s, len))
+            return true;
+    return false;
+}
+
+// Copy every token in `tok` (up to TK_EOF), unioning `hs` into each
+// copy's hideset field; copies the EOF too so the result is an
+// independent list.
+static Token *add_hideset(Token *tok, Hideset *hs) {
+    Token head = {0};
+    Token *cur = &head;
+    for (; tok->kind != TK_EOF; tok = tok->next) {
+        Token *t = copy_token(tok);
+        t->hideset = hideset_union(t->hideset, hs);
+        cur = cur->next = t;
+    }
+    cur->next = new_eof(tok);
+    return head.next;
+}
+
+//
+// Macro table (spec §2.6)
+//
+
+static Macro *find_macro(Token *tok) {
+    if (tok->kind != TK_IDENT && tok->kind != TK_KEYWORD)
+        return NULL;
+    return hashmap_get2(&macros, tok->loc, tok->len);
+}
+
+static Macro *add_macro(char *name, bool is_objlike, Token *body) {
+    Macro *m = calloc_checked(1, sizeof(Macro));
+    m->name = name;
+    m->is_objlike = is_objlike;
+    m->body = body;
+    hashmap_put(&macros, name, m);
+    return m;
+}
+
+void undef_macro(char *name) {
+    hashmap_delete(&macros, name);
+}
+
+//
+// Builtin handler macros (spec §6.5)
+//
+
+// Walk the expansion-origin chain to the deepest source token (the
+// one the user actually wrote).  Used by file_macro and line_macro
+// so that __FILE__ / __LINE__ report the macro use site rather than
+// any internal expansion site.
+static Token *origin_walk(Token *tok) {
+    while (tok->origin)
+        tok = tok->origin;
+    return tok;
+}
+
+static Token *file_macro(Token *tmpl) {
+    Token *t = origin_walk(tmpl);
+    char *buf = format("\"%s\"", t->file->display_name);
+    return tokenize(new_file(t->file->name, t->file->file_no, buf));
+}
+
+static Token *line_macro(Token *tmpl) {
+    Token *t = origin_walk(tmpl);
+    int line = t->line_no + t->file->line_delta;
+    char *buf = format("%d", line);
+    return tokenize(new_file(t->file->name, t->file->file_no, buf));
+}
+
+static Token *counter_macro(Token *tmpl) {
+    char *buf = format("%d", counter_val++);
+    return tokenize(new_file(tmpl->file->name, tmpl->file->file_no, buf));
+}
+
+static Token *timestamp_macro(Token *tmpl) {
+    return tokenize(new_file(tmpl->file->name, tmpl->file->file_no,
+                             "\"Unknown\""));
+}
+
+static Token *base_file_macro(Token *tmpl) {
+    char *buf = format("\"%s\"", base_file ? base_file : "");
+    return tokenize(new_file(tmpl->file->name, tmpl->file->file_no, buf));
+}
+
+//
 // Stubs for the remaining public API.  Filled in by later chunks.
 //
 
 void define_macro(char *name, char *buf) {
     (void)name; (void)buf;
-}
-
-void undef_macro(char *name) {
-    (void)name;
+    // Chunk 3 — calls tokenize on the body and add_macro to register.
 }
 
 void init_macros(void) {
     // Chunk 3 fills in spec §11.
 }
 
-// Suppress -Wunused-function warnings for helpers awaiting later
-// chunks.  Each name listed here is referenced from a future chunk
-// (Chunk 2-7); referencing them in this no-op array keeps clang
-// happy without changing observable behavior.
+// Suppress -Wunused-function for helpers and handlers awaiting their
+// callers in later chunks.  Each entry is referenced in Chunks 4-7.
 static void *_v2_pending_uses[] __attribute__((unused)) = {
     (void *)is_hash,
     (void *)skip_line,
@@ -206,8 +328,16 @@ static void *_v2_pending_uses[] __attribute__((unused)) = {
     (void *)append,
     (void *)copy_line,
     (void *)copy_token_list,
-    (void *)&macros,
+    (void *)hideset_intersection,
+    (void *)hideset_contains,
+    (void *)add_hideset,
+    (void *)find_macro,
+    (void *)add_macro,
+    (void *)file_macro,
+    (void *)line_macro,
+    (void *)counter_macro,
+    (void *)timestamp_macro,
+    (void *)base_file_macro,
     (void *)&cond_incl,
     (void *)&pragma_handler,
-    (void *)&counter_val,
 };
