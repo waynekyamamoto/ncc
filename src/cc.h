@@ -225,6 +225,8 @@ typedef enum {
   ND_BUILTIN_SETJMP,    // __builtin_setjmp(buf)
   ND_BUILTIN_LONGJMP,   // __builtin_longjmp(buf, val)
   ND_TRAMPOLINE,       // create trampoline for nested function
+  ND_VA_START_ELF,     // __builtin_va_start under -target elf (AAPCS64)
+  ND_VA_ARG_ELF,       // __builtin_va_arg under -target elf (AAPCS64)
 } NodeKind;
 
 // AST node
@@ -341,7 +343,13 @@ struct Obj {
   Obj *params;
   Node *body;
   Obj *locals;
-  Obj *va_area;        // __va_area__ for variadic functions
+  Obj *va_area;        // __va_area__ for variadic functions (Apple: pointer to
+                       // caller-stack overflow; ELF: pointer to GP reg save area
+                       // adjusted for named-arg consumption)
+  Obj *va_reg_save;    // 64-byte GP register save area (ELF/AAPCS64 only).
+                       // Prologue saves x0..x7 here at function entry.
+  Obj *va_stack_save;  // pointer to caller's stack overflow start (ELF only;
+                       // captured at function entry to seed va_list.__stack)
   Obj *alloca_bottom;  // __alloca_bottom__
   int stack_size;
   bool is_variadic;

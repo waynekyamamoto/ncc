@@ -3296,10 +3296,21 @@ static Node *primary(Token **rest, Token *tok) {
     tok = skip(tok, ",");
     Type *ty = typename_(&tok, tok);
     *rest = skip(tok, ")");
+    add_type(ap);
+
+    if (opt_elf) {
+      // AAPCS64 va_arg: branch on ap.__gr_offs sign — register save area
+      // when negative, caller stack overflow when zero/positive. Codegen
+      // emits the runtime conditional directly; we just package ap and
+      // the result type into a node.
+      Node *n = new_node(ND_VA_ARG_ELF, tok);
+      n->lhs = ap;
+      n->ty = ty;
+      return n;
+    }
 
     // Apple ARM64 va_arg: read value from current ap position, then advance ap.
     // tmp = (type*)ap; ap = (char*)ap + align(sizeof(type), 8); return *tmp
-    add_type(ap);
     int sz = align_to(ty->size < 8 ? 8 : ty->size, 8);
 
     // Create: *((type*)(ap_old)), where ap_old = ap before increment
@@ -3334,6 +3345,15 @@ static Node *primary(Token **rest, Token *tok) {
     // Skip the last_named parameter — we don't need it on ARM64
     assign(&tok, tok);
     *rest = skip(tok, ")");
+
+    if (opt_elf && current_fn && current_fn->va_reg_save) {
+      // AAPCS64: ap is a 32-byte struct. Codegen will emit field-by-field
+      // initialization of the struct from the function-prologue locals
+      // (__va_reg_save__ and __va_stack_save__).
+      Node *n = new_node(ND_VA_START_ELF, tok);
+      n->lhs = ap;
+      return n;
+    }
 
     // On Apple ARM64, variadic args are on the stack after named args.
     // The function prologue created __va_area__ for this.
@@ -5843,6 +5863,19 @@ static Token *function(Token *tok, Type *fn_ty, VarAttr *attr) {
   if (fn_ty->is_variadic) {
     fn->va_area = new_lvar("__va_area__", pointer_to(ty_char));
     fn->va_area->align = 8;
+    // ELF (AAPCS64): also a 64-byte GP register save area + a pointer
+    // capturing the caller's stack overflow start. The function prologue
+    // initializes both at entry; va_start reads them to populate the
+    // 32-byte __va_list struct. va_arg uses __gr_offs to choose between
+    // reading from the saved register area and reading from the caller's
+    // stack overflow.
+    if (opt_elf) {
+      Type *reg_save_ty = array_of(ty_char, 64);
+      fn->va_reg_save = new_lvar("__va_reg_save__", reg_save_ty);
+      fn->va_reg_save->align = 8;
+      fn->va_stack_save = new_lvar("__va_stack_save__", pointer_to(ty_char));
+      fn->va_stack_save->align = 8;
+    }
   }
 
   // alloca bottom

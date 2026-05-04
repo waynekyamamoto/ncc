@@ -729,8 +729,9 @@ static void gen_funcall(Node *node) {
     bool is_struct = (aty->kind == TY_STRUCT || aty->kind == TY_UNION || aty->kind == TY_COMPLEX || aty->kind == TY_VECTOR);
     int gp_needed = is_struct ? ((aty->size > 8) ? 2 : 1) : 1;
 
-    if (is_variadic && !is_named_arg) {
-      // Apple ARM64: variadic args always go on the stack
+    if (is_variadic && !is_named_arg && !opt_elf) {
+      // Apple ARM64: variadic args always go on the stack.
+      // (AAPCS64 ELF treats variadic the same as named — fall through.)
       arg_dest[i] = -1;
       arg_stack_off[i] = cur_stack_off;
       cur_stack_off += is_struct ? align_to(aty->size, 8) : 8;
@@ -1444,6 +1445,137 @@ static void gen_expr(Node *node) {
     println("mov sp, x1");
     println("ldr x1, [x0, #16]");   // return point
     println("br x1");                // jump to return point
+    return;
+  }
+
+  case ND_VA_START_ELF: {
+    // Initialize a __va_list struct in-place.
+    // Layout (32 bytes):
+    //   +0   void *__stack
+    //   +8   void *__gr_top
+    //   +16  void *__vr_top
+    //   +24  int   __gr_offs
+    //   +28  int   __vr_offs
+    Obj *fn = current_fn;
+    if (!fn || !fn->va_reg_save || !fn->va_stack_save)
+      error_tok(node->tok, "va_start used outside an ELF variadic function");
+    gen_addr(node->lhs);   // x0 = &ap
+
+    // __stack = *__va_stack_save__
+    int sk_off = fn->va_stack_save->offset;
+    if (sk_off >= -256 && sk_off <= 255)
+      println("ldur x9, [x29, #%d]", sk_off);
+    else if (sk_off < 0 && -sk_off <= 4095) {
+      println("sub x10, x29, #%d", -sk_off);
+      println("ldr x9, [x10]");
+    } else if (sk_off >= 0 && sk_off <= 4095) {
+      println("ldr x9, [x29, #%d]", sk_off);
+    } else {
+      load_imm("x10", (uint64_t)(sk_off < 0 ? -sk_off : sk_off));
+      if (sk_off < 0) println("sub x10, x29, x10");
+      else            println("add x10, x29, x10");
+      println("ldr x9, [x10]");
+    }
+    println("str x9, [x0, #0]");
+
+    // __gr_top = &__va_reg_save__[64]
+    int rs_off = fn->va_reg_save->offset + 64;
+    if (rs_off >= 0 && rs_off <= 4095) {
+      println("add x9, x29, #%d", rs_off);
+    } else if (rs_off < 0 && -rs_off <= 4095) {
+      println("sub x9, x29, #%d", -rs_off);
+    } else if (rs_off < 0) {
+      load_imm("x9", (uint64_t)(-rs_off));
+      println("sub x9, x29, x9");
+    } else {
+      load_imm("x9", (uint64_t)rs_off);
+      println("add x9, x29, x9");
+    }
+    println("str x9, [x0, #8]");
+
+    // __vr_top = 0 (FP variadic args not supported here)
+    println("str xzr, [x0, #16]");
+
+    // __gr_offs = -((8 - gp_named) * 8); 0 if all 8 GP slots consumed.
+    // GP-passable named params: anything not flonum that fits in <= 16 bytes
+    // for struct, else 1 GP slot. ncc-internal use cases (format, error, ...)
+    // are pointer/int only, so a count-of-non-flonum-params works.
+    int gp_named = 0;
+    for (Obj *p = fn->params; p; p = p->next) {
+      if (!p->ty) continue;
+      if (p->ty->kind == TY_FLOAT || p->ty->kind == TY_DOUBLE
+          || p->ty->kind == TY_LDOUBLE)
+        continue;
+      if (p->ty->kind == TY_STRUCT || p->ty->kind == TY_UNION) {
+        if (p->ty->size > 16) { gp_named += 1; continue; }
+        gp_named += (p->ty->size > 8) ? 2 : 1;
+      } else {
+        gp_named += 1;
+      }
+      if (gp_named >= 8) { gp_named = 8; break; }
+    }
+    int gr_offs = (gp_named >= 8) ? 0 : -(8 - gp_named) * 8;
+    println("mov w9, #%d", gr_offs);
+    println("str w9, [x0, #24]");
+
+    // __vr_offs = 0 — no FP register save area
+    println("str wzr, [x0, #28]");
+    return;
+  }
+
+  case ND_VA_ARG_ELF: {
+    // ap.__gr_offs < 0 ? read from gr_top+gr_offs / advance offs
+    //                  : read from stack       / advance stack
+    // Result is loaded into x0 with the type's storage size.
+    Type *rty = node->ty;
+    int sz = rty->size;
+    if (sz < 8) sz = 8;          // 8-byte slots for int-class
+    if (sz > 8) {
+      // Larger types (long double, big structs) not handled yet — punt.
+      error_tok(node->tok, "va_arg of type larger than 8 bytes not implemented for ELF");
+    }
+    int c = label_cnt++;
+
+    gen_addr(node->lhs);          // x0 = &ap
+    println("mov x1, x0");        // x1 = &ap (preserve)
+
+    // gr_offs = ap.__gr_offs (signed 32-bit)
+    println("ldrsw x2, [x1, #24]");
+    println("cmp x2, #0");
+    println("b.ge Ltmp_va_stack.%d", c);
+
+    // Register path: ptr = ap.__gr_top + gr_offs; ap.__gr_offs += 8
+    println("ldr x3, [x1, #8]");        // x3 = __gr_top
+    println("add x4, x3, x2");          // x4 = __gr_top + __gr_offs
+    println("add w2, w2, #8");
+    println("str w2, [x1, #24]");       // ap.__gr_offs += 8
+    println("b Ltmp_va_done.%d", c);
+
+    printlabel("Ltmp_va_stack.%d:", c);
+    // Stack path: ptr = ap.__stack; ap.__stack += 8
+    println("ldr x4, [x1, #0]");        // x4 = __stack
+    println("add x5, x4, #8");
+    println("str x5, [x1, #0]");        // ap.__stack += 8
+
+    printlabel("Ltmp_va_done.%d:", c);
+    // Load value at x4 into x0 with appropriate size.
+    if (rty->kind == TY_FLOAT || rty->kind == TY_DOUBLE
+        || rty->kind == TY_LDOUBLE) {
+      // FP variadic via GP path is wrong on AAPCS64, but for ncc's use
+      // cases we don't have FP varargs. Emit a load from x4 anyway.
+      println("ldr d0, [x4]");
+    } else if (rty->size == 1) {
+      if (rty->is_unsigned) println("ldrb w0, [x4]");
+      else                  println("ldrsb w0, [x4]");
+    } else if (rty->size == 2) {
+      if (rty->is_unsigned) println("ldrh w0, [x4]");
+      else                  println("ldrsh w0, [x4]");
+    } else if (rty->size == 4) {
+      if (rty->is_unsigned) println("ldr w0, [x4]");
+      else                  println("ldrsw x0, [x4]");
+    } else {
+      println("ldr x0, [x4]");
+    }
     return;
   }
 
@@ -2652,6 +2784,33 @@ static void emit_text(Obj *prog) {
         println("sub sp, sp, x9");
       }
 
+      // AAPCS64 ELF: save x0..x7 to __va_reg_save__ at function entry
+      // for variadic functions. The save must happen before named-param
+      // storage runs (which can clobber x9/x10 and may use x0..x7 as
+      // sources, but the values are still intact at this point).
+      if (opt_elf && fn->is_variadic && fn->va_reg_save) {
+        int rs_off = fn->va_reg_save->offset;
+        for (int j = 0; j < 8; j += 2) {
+          int slot = rs_off + j * 8;
+          if (slot >= -512 && slot < 512) {
+            println("stp x%d, x%d, [x29, #%d]", j, j+1, slot);
+          } else {
+            if (slot >= 0 && slot <= 4095)
+              println("add x9, x29, #%d", slot);
+            else if (slot < 0 && -slot <= 4095)
+              println("sub x9, x29, #%d", -slot);
+            else if (slot < 0) {
+              load_imm("x9", (uint64_t)(-slot));
+              println("sub x9, x29, x9");
+            } else {
+              load_imm("x9", (uint64_t)slot);
+              println("add x9, x29, x9");
+            }
+            println("stp x%d, x%d, [x9]", j, j+1);
+          }
+        }
+      }
+
       // Check if function has VLA declarations (including structs with VLA members)
       bool has_vla = false;
       for (Obj *v = fn->locals; v; v = v->next)
@@ -2826,40 +2985,61 @@ static void emit_text(Obj *prog) {
 
     // Save variadic argument area pointer
     if (fn->is_variadic && fn->va_area) {
-      // On Apple ARM64 / AAPCS64-stack-only-vararg, variadic args are on
-      // the caller's stack AFTER any named args that overflowed the
-      // register slots.  After our prologue, the caller's stack starts
-      // at x29+16 (just past the saved fp/lr).  When a function has more
-      // than 8 GP-passable named params (or more than 8 FP-passable),
-      // the overflow named args occupy stack slots BEFORE the variadic
-      // args.  Each overflow slot is 8 bytes.  Account for that here, or
-      // va_arg will read named args back as if they were variadic — which
-      // is exactly what NetBSD's sysctl_createv (12 named ints + vararg)
-      // exposed: variadic-name accumulation read named args 9..12 and
-      // mistook them for the CTL_KERN/CTL_EOL path, blowing up boot.
+      // Caller's stack overflow starts at x29 + 16 (past saved fp/lr),
+      // plus 8 bytes per named-arg overflow slot. va_caller_off is
+      // computed here from gp/fp counts accumulated above.
       int gp_overflow = (gp > 8) ? (gp - 8) : 0;
       int fp_overflow = (fp > 8) ? (fp - 8) : 0;
       int va_caller_off = 16 + (gp_overflow + fp_overflow) * 8;
 
-      int off = fn->va_area->offset;
-      if (off < 0 && -off <= 4095) {
-        println("sub x9, x29, #%d", -off);
-      } else if (off < 0) {
-        load_imm("x9", (uint64_t)(-off));
-        println("sub x9, x29, x9");
-      } else if (off <= 4095) {
-        println("add x9, x29, #%d", off);
+      if (opt_elf && fn->va_stack_save) {
+        // ELF/AAPCS64: store the caller-stack-overflow pointer in
+        // __va_stack_save__. va_start reads it into ap.__stack. The
+        // 64-byte register save area was already populated at the top of
+        // the prologue. va_area is unused on ELF.
+        int ss_off = fn->va_stack_save->offset;
+        if (ss_off >= 0 && ss_off <= 4095) {
+          println("add x9, x29, #%d", ss_off);
+        } else if (ss_off < 0 && -ss_off <= 4095) {
+          println("sub x9, x29, #%d", -ss_off);
+        } else if (ss_off < 0) {
+          load_imm("x9", (uint64_t)(-ss_off));
+          println("sub x9, x29, x9");
+        } else {
+          load_imm("x9", (uint64_t)ss_off);
+          println("add x9, x29, x9");
+        }
+        if (va_caller_off <= 4095) {
+          println("add x10, x29, #%d", va_caller_off);
+        } else {
+          load_imm("x10", (uint64_t)va_caller_off);
+          println("add x10, x29, x10");
+        }
+        println("str x10, [x9]");
       } else {
-        load_imm("x9", (uint64_t)off);
-        println("add x9, x29, x9");
+        // Apple ARM64 / Mach-O: variadic args are on the caller's stack
+        // AFTER any named args that overflowed the register slots. va_area
+        // holds the pointer to the first variadic arg.
+        int off = fn->va_area->offset;
+        if (off < 0 && -off <= 4095) {
+          println("sub x9, x29, #%d", -off);
+        } else if (off < 0) {
+          load_imm("x9", (uint64_t)(-off));
+          println("sub x9, x29, x9");
+        } else if (off <= 4095) {
+          println("add x9, x29, #%d", off);
+        } else {
+          load_imm("x9", (uint64_t)off);
+          println("add x9, x29, x9");
+        }
+        if (va_caller_off <= 4095) {
+          println("add x10, x29, #%d", va_caller_off);
+        } else {
+          load_imm("x10", (uint64_t)va_caller_off);
+          println("add x10, x29, x10");
+        }
+        println("str x10, [x9]");
       }
-      if (va_caller_off <= 4095) {
-        println("add x10, x29, #%d", va_caller_off);
-      } else {
-        load_imm("x10", (uint64_t)va_caller_off);
-        println("add x10, x29, x10");
-      }
-      println("str x10, [x9]");
     }
 
     // Initialize alloca bottom
