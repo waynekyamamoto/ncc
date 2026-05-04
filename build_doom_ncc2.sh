@@ -3,7 +3,7 @@
 set -e
 
 ROOT=$(cd "$(dirname "$0")" && pwd)
-NCC2=$ROOT/ncc2
+NCC2="${NCC2:-$ROOT/ncc2}"
 DOOMDIR=$ROOT/tests/doom
 BUILDDIR=$ROOT/build/doom_ncc2
 
