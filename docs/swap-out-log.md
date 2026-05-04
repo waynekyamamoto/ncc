@@ -248,3 +248,56 @@ Full validation pyramid run on swap-out tip after the two `b710056` catch-up com
 Real-program builds were carried implicitly through Phase-1 close via PASS=28 corpus equivalence (token streams bit-identical to chibicc baseline). Today's run measures them directly and confirms the implicit reasoning held.
 
 Conditions: macOS 26.0 host (linker), libpython.a built on macOS 26.1 (ABI-compatible warnings only). cpython override: `NCC=$PWD/ncc2 PYDIR=/tmp/Python-3.12.3` (avoids the script's default `/Users/yamamoto/ncc/ncc2`, which is the chibicc-lineage repo and out of swap-out's lane).
+
+---
+
+## 2026-05-04: Phase 2 — Preprocessor swap-in CLOSED
+
+**Replaced**: `src/preprocess.c` (1798 lines, chibicc-lineage) → `src/preprocess.c` (1115 lines, spec-derived from `docs/specs/02_preprocessor.md`).
+
+**Lines changed**: -1798 / +1115 (-683 net).  The reduction comes from C11 helper consolidation (no `open_memstream`, no `<libgen.h>`, single-pass POSIX-replacement helpers) plus dropping the unused `is_locked` field; behavior is preserved.
+
+**Excursions**: none.  The new `preprocess.c` uses standard C11 only: a small `StrBuf` realloc-grown buffer in place of `open_memstream`; `strrchr`-based dirname extraction in place of `<libgen.h>`'s `dirname`; `strdup`/`memcpy` patterns in place of POSIX `strndup`.  No `__attribute__`, no `__builtin_*`, no `typeof`, no statement expressions.
+
+**Validation pyramid (post-swap)**:
+| Check | Result | phase-2-baseline |
+|---|---|---|
+| `scripts/bootstrap_validate.sh` | FIXED POINT (md5 `f2af9fc30d93c5991061ccb87655009d`) | FIXED POINT (`596456d1...`) |
+| `scripts/validate_tokenizer.sh` | PASS=33/33 | PASS=28/28 (corpus grew with 17–21 + 22–23) |
+| `scripts/validate_preprocessor.sh` | PASS=35/35 (sanity, ncc vs ncc) | n/a (harness was new) |
+| `tests/torture/run.sh` | 964/995 PASS, 100% non-skip | 964/995 |
+| `tests/regression/run.sh` | 23/23 PASS | 16/16 baseline (now with 7 new Phase-2 tests) |
+| `tests/sqlite/build.sh` | 20/20 SQL tests PASS | 20/20 |
+| `build_doom_ncc2.sh` | 83/83 C files compiled | 83/83 |
+| `tests/cpython/build.sh` | 153/153 core files; Python runs | 153/153 |
+
+The bootstrap md5 differs from `phase-2-baseline`'s because the canonical `preprocess.c` source changed; the new md5 is reproducible (stage1 == stage2 under self-host).
+
+**Closing commits on `swap-out`**:
+- `1b24c2a` — Chunk 1: data structures + utility helpers
+- `e57db4e` — Chunk 2: hideset ops + macro table + builtin handlers
+- `54191f7` — Chunk 3: `init_macros` (full predefine table per §11)
+- `47e060c` — Chunk 4: macro expansion machinery
+- `47cd710` — Chunk 5+6: cond inclusion + `eval_const_expr` + `#include` resolution
+- `ee1ee0e` — Chunk 7: directive dispatch + Q22/Q23 fixes — PASS=33/33
+- `201318a` — validation scripts: support `NCC=ncc-v2` for dual-build testing
+- `75436c2` — Phase 2 swap-in: spec-derived preprocessor becomes canonical
+- `7529141` — Q17 follow-up regression tests (`22_pragma_once_stub`, `23_directive_in_arg`)
+- `221760b` — Q13: move `__has_attribute` / `__has_builtin` allowlists to `cc.h`
+
+**Deliberate divergences from `main`'s preprocessor** (each documented in spec §13, with regression tests where applicable):
+- **Q1**: `__SCHAR_MAX__` defined exactly once instead of twice (same value, no observable effect; spec.md regression test 11_preprocessor_predefines.c covers it).
+- **Q2**: include-path probing uses `access(R_OK)` instead of `fopen`; eliminates a real FD leak (one per `#include` probe).  No test coverage — the leak is invisible to existing harnesses, but the behavior is recorded for future audit.
+- **Q22**: `pragma_handler` callback (set via `set_pragma_handler`) is now invoked when registered.  `main`'s preprocessor stores the callback but never calls it — dead infrastructure.
+- **Q23**: `#error` and `#warning` now emit the directive's rest-of-line message tokens.  `main`'s preprocessor passes `""` as the format string, dropping the message text entirely.
+
+**Provenance**: `chibicc/preprocess.c` → `ncc/src/preprocess.c` → `docs/specs/02_preprocessor.md` → new `src/preprocess.c`.  The first two share lineage; the spec was authored with full source visibility (necessary for swap-out specification per the AT&T/Sun-OS analogy: clean-room replacement of a *codebase* requires examining the codebase to know what's being replaced); the implementation step adhered to strict no-peek discipline (the spec was the only reference; `src/preprocess.c` was not opened during the implementation).  Bytes from `chibicc/preprocess.c` no longer remain in `src/`.
+
+**Decisions baked in (Q1–Q23)**:
+- Q1–Q21: from `docs/specs/02_preprocessor_questions.md`, all resolved 2026-05-03 via "accept defaults".
+- Q22, Q23: surfaced during spec drafting (Chunks 5 and 7); resolved 2026-05-03 by Wayne accepting recommendation to fix.
+
+**Open** (post-Phase-2):
+- Q17.G (#include_next regression test) skipped — multi-include-path fixture work; will land if a real failure surfaces.
+- Phase 5 work (deferred per spec §15): `-target elf` predefines, `__sync_*` builtin codegen, and the Q14 follow-up to extract POSIX-replacement helpers into a shared `compat.c` if other phases need them too.
+- Phase 1's open divergence-log backlog (`150f17d`, `e7e7393`, `ff529fb`, `8fe8dda`, `4ed0320`, `93c6ecc`) remains gated on Phase 4/5 work — no Phase-2 entries added since cut-point.
