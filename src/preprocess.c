@@ -1129,7 +1129,10 @@ static Token *skip_cond_incl(Token *tok) {
 
 // Allowlists for __has_attribute / __has_builtin (spec §9.1, Q13).
 // Both single-underscore and double-underscore forms are accepted.
-static const char *supported_attrs[] = {
+// Declared extern in cc.h so future cross-module consumers (e.g.,
+// parse.c if it ever needs to validate the same names) share a
+// single source of truth.
+const char *supported_attrs[] = {
     "packed", "aligned", "section", "unused", "weak", "noinline",
     "noreturn", "always_inline", "cold", "hot", "pure", "const",
     "alias", "used", "warn_unused_result", "noclone", "nothrow",
@@ -1142,7 +1145,7 @@ static const char *supported_attrs[] = {
     NULL
 };
 
-static const char *supported_builtins[] = {
+const char *supported_builtins[] = {
     "__builtin_va_start", "__builtin_va_end", "__builtin_va_arg",
     "__builtin_va_copy", "__builtin_va_list",
     "__builtin_offsetof", "__builtin_types_compatible_p",

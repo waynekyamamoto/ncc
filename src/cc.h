@@ -150,6 +150,14 @@ void init_macros(void);
 typedef void PragmaHandler(Token *tok);
 void set_pragma_handler(PragmaHandler *fn);
 
+// __has_attribute / __has_builtin allowlists.  Single source of truth
+// for what attributes / builtins ncc claims to support; consulted by
+// the preprocessor's #if __has_*(NAME) lowering and available to the
+// parser for any future cross-validation.  Each array is NULL-
+// terminated.  Defined in preprocess.c.
+extern const char *supported_attrs[];
+extern const char *supported_builtins[];
+
 //
 // parse.c
 //
