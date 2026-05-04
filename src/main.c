@@ -207,6 +207,9 @@ static StringArray ld_extra_flags;
 // Link .o files to executable
 static void link_files(StringArray *inputs, char *output) {
   StringArray cmd = {};
+#ifdef __APPLE__
+  // macOS: invoke ld(1) directly with the SDK syslibroot. Mach-O entry is
+  // _main (with leading underscore).
   strarray_push(&cmd, "ld");
   strarray_push(&cmd, "-o");
   strarray_push(&cmd, output);
@@ -217,6 +220,17 @@ static void link_files(StringArray *inputs, char *output) {
   strarray_push(&cmd, "arm64");
   strarray_push(&cmd, "-e");
   strarray_push(&cmd, "_main");
+#else
+  // Linux (and other ELF targets): use the system C compiler as the linker
+  // driver. Picks up crt*.o, libc, and the dynamic linker without us
+  // having to know the multiarch path. ELF entry is `main` (no underscore).
+  // -no-pie because ncc emits absolute `adrp+add` for static symbol
+  // addresses, which is incompatible with default-PIE on modern distros.
+  strarray_push(&cmd, "cc");
+  strarray_push(&cmd, "-no-pie");
+  strarray_push(&cmd, "-o");
+  strarray_push(&cmd, output);
+#endif
 
   for (int i = 0; i < inputs->len; i++)
     strarray_push(&cmd, inputs->data[i]);
