@@ -303,3 +303,62 @@ The bootstrap md5 differs from `phase-2-baseline`'s because the canonical `prepr
 - Q17.G (#include_next regression test) skipped — multi-include-path fixture work; will land if a real failure surfaces.
 - Phase 5 work (deferred per spec §15): `-target elf` predefines, `__sync_*` builtin codegen, and the Q14 follow-up to extract POSIX-replacement helpers into a shared `compat.c` if other phases need them too.
 - Phase 1's open divergence-log backlog (`150f17d`, `e7e7393`, `ff529fb`, `8fe8dda`, `4ed0320`, `93c6ecc`) remains gated on Phase 4/5 work — no Phase-2 entries added since cut-point.
+
+---
+
+## 2026-05-04: Phase 3 — Type system swap-in CLOSED
+
+**Replaced**: `src/type.c` (435 lines, chibicc-lineage) → `src/type.c` (499 lines, spec-derived from `docs/specs/03_type.md`).
+
+**Lines changed**: -435 / +499 (+64 net).  The new file is slightly longer because it adds spec-section cross-references in comments and has more explicit forward declarations.  Pure C11 with no behavioral change.
+
+**Excursions**: none.  The new `type.c` uses standard C11 only.  C99 compound literals at file scope (the 15 `ty_*` singletons) are standard, not a GCC extension.  No `__attribute__`, no `__builtin_*`, no `typeof`, no statement expressions, no POSIX deps.
+
+**Validation pyramid (post-swap)**:
+| Check | Result | phase-2-closed |
+|---|---|---|
+| `scripts/bootstrap_validate.sh` | FIXED POINT (md5 `ef9e8d896f7affbc971bd9820af41124`) | FIXED POINT (`f2af9fc3...`) |
+| `scripts/validate_tokenizer.sh` | PASS=35/35 | PASS=35/35 |
+| `scripts/validate_preprocessor.sh` | PASS=35/35 (sanity, ncc vs ncc) | PASS=35/35 |
+| `tests/torture/run.sh` | 964/995 PASS, 100% non-skip | 964/995 |
+| `tests/regression/run.sh` | 23/23 PASS | 23/23 |
+| `tests/sqlite/build.sh` | 20/20 SQL tests PASS | 20/20 |
+| `build_doom_ncc2.sh` | 83/83 C files compiled | 83/83 |
+| `tests/cpython/build.sh` | 153/153 core files; Python runs | 153/153 |
+
+The bootstrap md5 differs from `phase-2-closed`'s because the canonical `type.c` source changed.  Stage1 == stage2 reproducibility holds.
+
+**Closing commits on `swap-out`**:
+- `c9ce306` — docs/swap-out-log: correct Phase 2 line-count error (cleanup carry-over)
+- `9848f31` — `docs/specs/03_type_questions.md` — design questions for Phase 3
+- `84a8e5c` — `docs/specs/03_type.md` — Phase 3 spec, end-to-end draft
+- `b44d658` — Phase 3 dual-build scaffolding: ncc + ncc-v2 (type_v2.c skeleton)
+- `4452fc3` — type_v2.c full implementation — passes everything (commit subject says "preprocess_v2 / Phase 3" — typo from copy-paste, content is correct)
+- `5220102` — Phase 3 swap-in: spec-derived type system becomes canonical
+
+**No deliberate divergences** from `main`'s observable behavior.  All Q1–Q12 questions resolved by accepting current behavior; the swap-in is purely a re-derivation under the no-peek discipline (spec-author phase peeked freely, implementation phase did not).
+
+**Provenance**: `chibicc/type.c` → `ncc/src/type.c` → `docs/specs/03_type.md` → new `src/type.c`.  Same pattern as Phase 1 and Phase 2.  Bytes from `chibicc/type.c` no longer remain in `src/`.
+
+**Decisions baked in (Q1–Q12)**:
+- Q1: Predefined Type singletons preserved at file-scope compound-literal addresses (identity-compared by callers).
+- Q2: `is_compatible` recursion preserved (chains are bounded; iteration is permitted optimization, not required).
+- Q3: `copy_type` sets `origin = ty` and explicitly resets `next = NULL`.
+- Q4: `vector_of` reuses `array_len` as element count (preserved overload, documented semantically).
+- Q5: `add_type` idempotency check at function entry (load-bearing for parse.c speculative calls).
+- Q6: VLA decay deferral to parse.c's `new_add`/`new_sub` preserved.
+- Q7: Bitfield promotion sign rules preserved (unsigned width-<32 → `ty_int` per C standard's "value preserving" rule).
+- Q8: `__real__`/`__imag__` on non-complex returns operand type (GCC convention).
+- Q9: `*(func)` returns function type (GCC `typeof` extension support).
+- Q10: `long double` size = 8 (Apple ARM64 ABI).
+- Q11: New regression tests (B/C/D/E from questions doc) **not added in this session** — deferred until a real failure surfaces or until Phase 4 needs the test fixtures.
+- Q12: Single-pass spec draft — completed in `84a8e5c`.
+
+**Open** (post-Phase-3):
+- Q11 follow-up regression tests (bitfield promotion, `__real__` non-complex, `typeof(*func)`, typedef compatibility) — deferred but worth adding to make Phase 3 invariants regression-proof.
+- Phase 4 (parser, 6136 lines — the monster) is the natural next phase.  Inventory will be substantial.
+
+**Source-base state at this tag** (`phase-3-closed`):
+- 3 of 6 phases done: Phase 1 (tokenize.c), Phase 2 (preprocess.c), Phase 3 (type.c).
+- Spec-derived: tokenize.c (679) + preprocess.c (1817) + type.c (499) = 2995 lines (~22% of src/).
+- Remaining chibicc-lineage: parse.c (6136), codegen_arm64.c (2829), main.c (547), cc.h (567), alloc.c (37), unicode.c (84), hashmap.c (105) = 10305 lines.
