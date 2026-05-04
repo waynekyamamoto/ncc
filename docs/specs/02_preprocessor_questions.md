@@ -499,3 +499,43 @@ synchronous co-authoring model is slow. Two alternative cadences:
 **Recommended:** **A**, with N=3 sections at a time. Catches direction
 errors early without fragmenting your attention; matches your stated
 preference for not being the bottleneck on every line.
+
+---
+
+## Resolution log
+
+All Q1–Q21 resolved 2026-05-03 by Wayne accepting the recommended
+defaults ("let's go with your preference"). Spec drafted in 4
+batches per Q21A, landing as commits 3a813b9, 991a64d, f59dfd8,
+7da2c5c.
+
+Two additional questions surfaced during spec drafting:
+
+### Q22. Should the new implementation invoke the registered `pragma_handler` callback?
+
+**Context:** `set_pragma_handler` API exists and stores a callback,
+but the current `preprocess2` `#pragma` branch never invokes it.
+Dead infrastructure with a public promise.
+
+**Recommended:** invoke it (see §12.2 + §13 of the spec).
+
+**Resolved 2026-05-03:** Wayne accepted recommendation. Spec §12.2
+and §13 updated; the new impl invokes the handler when registered,
+silently skips when not. Marked as a deliberate divergence from
+main's observable behavior.
+
+### Q23. Should `#error` and `#warning` emit the directive's message tokens?
+
+**Context:** Current implementation calls `error_tok` / `warn_tok`
+with empty format strings, so the diagnostic has no message text —
+just the source-line caret. The directive's rest-of-line tokens
+are silently dropped.
+
+**Recommended:** fix — concatenate message tokens and pass as the
+diagnostic message.
+
+**Resolved 2026-05-03:** Wayne accepted recommendation. Spec §12.3
+and §13 updated; the new impl concatenates the rest-of-line
+message tokens (using the same token-spelling-with-`has_space`
+pattern as `read_include_filename`'s `<...>` form). Marked as a
+deliberate divergence from main's observable behavior.

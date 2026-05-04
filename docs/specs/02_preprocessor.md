@@ -1488,31 +1488,32 @@ Two paths:
    `tests/regression/NN_pragma_once.c` (per Q17) documents the
    stub behavior.
 
-2. **All other pragmas**: silently consumed via a rest-of-line
-   skip (`while (!tok->at_bol && tok->kind != TK_EOF) tok =
-   tok->next;`). The registered `pragma_handler` callback (set
-   via `set_pragma_handler`) is **not** invoked — see Q22 in §13.
-   Per Q22's recommended fix, the new implementation should
-   invoke the handler when one is registered, falling back to
-   silent skip when not.
+2. **All other pragmas**: if a `pragma_handler` callback has been
+   registered via `set_pragma_handler`, invoke it with the
+   directive's start token (`tok` positioned at the `#`); the
+   callback is responsible for advancing past the directive. If no
+   handler is registered, silently consume the rest of the line.
+   This fixes the dead-callback bug on `main` (Q22 in §13).
 
 ### 12.3 `#error` and `#warning`
 
-`#error msg`: calls `error_tok(tok, "")` — note the **empty format
-string** per the current implementation. The directive's
-message tokens (`msg`) are not emitted in the diagnostic. See
-Q23 in §13. Per Q23's recommended fix, the new implementation
-should concatenate the message tokens (similar to `read_include_filename`'s
-`<...>` token-concatenation pattern) and pass the result as the
-diagnostic message.
+Both directives concatenate the rest-of-line message tokens (using
+the same token-spelling-with-`has_space`-spacing pattern as
+`read_include_filename`'s `<...>` form, §10.3 Pattern 2) and pass
+the resulting string as the diagnostic message:
 
-`#warning msg`: similar to `#error` but uses `warn_tok(tok->next,
-"")` (and continues processing — does not abort). Same Q23 fix
-applies.
-
+`#error msg`: calls `error_tok(tok, "%s", concatenated_msg)`.
 `error_tok` is `_Noreturn` (declared in `cc.h`); `#error` therefore
-terminates compilation. `warn_tok` does not return abnormally and
-processing continues at the next directive.
+terminates compilation.
+
+`#warning msg`: calls `warn_tok(tok->next, "%s", concatenated_msg)`,
+then `skip_line` advances past the directive. Processing continues
+at the next directive.
+
+This fixes the empty-message bug on `main` (Q23 in §13). The
+current `main` implementation passes `""` as the format string,
+emitting just the source-line caret with no descriptive text; the
+new implementation produces useful diagnostics.
 
 ---
 
@@ -1587,31 +1588,31 @@ so a re-implementer does not "fix" them by accident.
   reads it. The new implementation drops it; recursive-expansion
   prevention is the hideset.
 
-- **`pragma_handler` callback is registered but never invoked.** The
-  public `set_pragma_handler` API exists (`cc.h`) and stores the
-  function pointer in a module-level `static`, but `preprocess2`'s
-  `#pragma` branch never calls it. Currently all non-standard
-  pragmas (everything except `#pragma once`) are silently absorbed
-  by the rest-of-line skip. The new implementation matches this
-  behavior — the public API is preserved for binary compatibility
-  but is effectively dead. **Q22 (raised during §5–§7 drafting):**
-  should the new implementation invoke the registered handler, or
-  should `set_pragma_handler` be removed from the public API
-  entirely? Recommended: invoke it (the API is documented; dead
-  infrastructure that promises a callback is worse than working
-  code).
+- **`pragma_handler` callback is now invoked (Q22, resolved
+  2026-05-03).** The current `src/preprocess.c` registers a callback
+  via `set_pragma_handler` but never calls it — dead infrastructure.
+  The new implementation **invokes** the registered handler when one
+  is set, falling back to silent skip when not. This is one of the
+  small set of places the swap-out implementation deliberately
+  diverges from `main`'s observable behavior; per Q22 the rationale
+  is that a documented public API that promises a callback is worse
+  than working code. The diff is invisible to validation
+  (no current driver registers a non-NULL handler), but it makes the
+  public API honest.
 
-- **`#error` and `#warning` emit empty diagnostic messages.** Both
-  directives call `error_tok` / `warn_tok` with `""` as the format
-  string, so the diagnostic is just the source-line caret with no
-  descriptive text. The directive's rest-of-line tokens (which by
-  C standard convention are the message) are not emitted. Real
-  compilers (gcc, clang) include the message tokens in the
-  diagnostic. **Q23 (raised during §5–§7 drafting):** preserve the
-  empty-message bug for behavioral compat, or fix to emit the
-  message tokens? Recommended: fix. The bug is plainly broken (no
-  one *wants* `#error "this is broken"` to say nothing); fixing it
-  cannot regress any working program.
+- **`#error` and `#warning` emit the directive's message tokens
+  (Q23, resolved 2026-05-03).** The current `src/preprocess.c`
+  passes `""` as the format string to `error_tok` / `warn_tok`,
+  emitting an empty diagnostic. The new implementation
+  concatenates the rest-of-line tokens (using the same
+  token-spelling-with-`has_space`-spacing pattern as
+  `read_include_filename`'s `<...>` form, §10.3 Pattern 2) and
+  passes the result as the diagnostic message. This is another
+  deliberate divergence from `main`'s observable behavior. The
+  diff is visible if any in-corpus code actually triggers `#error`
+  with a meaningful message — none does today, so validation is
+  unaffected; future use of `#error` will produce useful messages
+  rather than empty source-line carets.
 
 ---
 
