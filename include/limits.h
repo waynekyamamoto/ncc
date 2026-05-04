@@ -1,6 +1,12 @@
 #ifndef __LIMITS_H
 #define __LIMITS_H
 
+// Glibc's /usr/include/limits.h chains to a "compiler-provided" limits.h via
+// `#include_next <limits.h>`, gated on `_GCC_LIMITS_H_` not being defined.
+// Defining it here mirrors what gcc's bundled limits.h does, breaking what
+// would otherwise be a chain that goes off the end of the include path.
+#define _GCC_LIMITS_H_
+
 #define CHAR_BIT 8
 
 #define SCHAR_MIN (-128)
