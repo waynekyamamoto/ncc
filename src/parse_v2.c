@@ -157,6 +157,7 @@ static Node *new_add(Node *lhs, Node *rhs, Token *tok);
 static Node *new_sub(Node *lhs, Node *rhs, Token *tok);
 static Obj *new_anon_gvar(Type *ty);
 static int64_t const_expr_val(Token **rest, Token *tok);
+static bool try_eval_double_v2(Node *n, double *out);
 static Type *typename_(Token **rest, Token *tok);
 static Node *expr(Token **rest, Token *tok);
 static Node *assign(Token **rest, Token *tok);
@@ -1947,6 +1948,66 @@ static Token *parse_gvar_initializer(Token *tok, Obj *var) {
       int64_t v = vals[i];
       for (int b = 0; b < elem_sz; b++)
         buf[i * elem_sz + b] = (v >> (b * 8)) & 0xff;
+    }
+    var->init_data = buf;
+    var->init_data_size = sz;
+    return tok;
+  }
+  // Array of float/double scalar — element-wise const-expr fold via
+  // try_eval_double_v2.  TY_LDOUBLE on Apple ARM64 has size 8 (== double).
+  if (equal(tok, "{") && var->ty->kind == TY_ARRAY && is_flonum(var->ty->base)) {
+    tok = tok->next;
+    long elem_sz = var->ty->base->size;
+    long count = 0;
+    long max_elems = 4096;
+    double *vals = calloc_checked(max_elems, sizeof(double));
+    bool first2 = true;
+    while (!equal(tok, "}")) {
+      if (!first2) tok = skip(tok, ",");
+      first2 = false;
+      if (equal(tok, "}")) break;
+      if (count >= max_elems) error_tok(tok, "too many initializer elements");
+      Node *e = assign(&tok, tok);
+      add_type(e);
+      double dv;
+      if (!try_eval_double_v2(e, &dv))
+        error_tok(eq, "parse_v2: array-of-float gvar init not const-foldable");
+      vals[count++] = dv;
+    }
+    tok = skip(tok, "}");
+    if (var->ty->array_len < 0) {
+      var->ty = array_of(var->ty->base, count);
+      var->align = var->ty->align;
+    }
+    long sz = var->ty->size;
+    char *buf = calloc_checked(1, sz);
+    for (long i = 0; i < count && i * elem_sz < sz; i++) {
+      if (var->ty->base->kind == TY_FLOAT) {
+        float f = (float)vals[i];
+        memcpy(buf + i * elem_sz, &f, 4);
+      } else {
+        memcpy(buf + i * elem_sz, &vals[i], elem_sz < 8 ? (size_t)elem_sz : 8);
+      }
+    }
+    var->init_data = buf;
+    var->init_data_size = sz;
+    return tok;
+  }
+  // Scalar float / double / long double (long double is double-sized
+  // on Apple ARM64 per Phase 3 Q10).
+  if (is_flonum(var->ty)) {
+    Node *e = assign(&tok, tok);
+    add_type(e);
+    double dv;
+    if (!try_eval_double_v2(e, &dv))
+      error_tok(eq, "parse_v2: scalar float gvar init not const-foldable");
+    long sz = var->ty->size;
+    char *buf = calloc_checked(1, sz);
+    if (var->ty->kind == TY_FLOAT) {
+      float f = (float)dv;
+      memcpy(buf, &f, 4);
+    } else {
+      memcpy(buf, &dv, sz < 8 ? (size_t)sz : 8);
     }
     var->init_data = buf;
     var->init_data_size = sz;
@@ -4004,4 +4065,70 @@ int64_t eval_node(Node *node) {
   if (!try_eval_node(node, &v))
     error_tok(node ? node->tok : NULL, "not a compile-time constant");
   return v;
+}
+
+// try_eval_double_v2 — non-fatal floating-point constant folder.
+// Used by parse_gvar_initializer's float arms.  Apple ARM64 long double
+// is 64-bit, so a `double` accumulator preserves the full range.  Mixed
+// int/float fold uses try_eval_node for the integer side.  Bails on
+// anything outside the supported set (caller surfaces the diagnostic).
+static bool try_eval_double_v2(Node *n, double *out) {
+  if (!n) return false;
+  double lv, rv;
+  int64_t iv;
+  switch (n->kind) {
+  case ND_NUM:
+    if (n->ty && is_flonum(n->ty)) { *out = (double)n->fval; return true; }
+    if (n->ty && n->ty->is_unsigned) { *out = (double)(uint64_t)n->val; return true; }
+    *out = (double)n->val; return true;
+  case ND_NEG:
+    if (!try_eval_double_v2(n->lhs, &lv)) return false;
+    *out = -lv; return true;
+  case ND_ADD:
+    if (!try_eval_double_v2(n->lhs, &lv)) return false;
+    if (!try_eval_double_v2(n->rhs, &rv)) return false;
+    *out = lv + rv; return true;
+  case ND_SUB:
+    if (!try_eval_double_v2(n->lhs, &lv)) return false;
+    if (!try_eval_double_v2(n->rhs, &rv)) return false;
+    *out = lv - rv; return true;
+  case ND_MUL:
+    if (!try_eval_double_v2(n->lhs, &lv)) return false;
+    if (!try_eval_double_v2(n->rhs, &rv)) return false;
+    *out = lv * rv; return true;
+  case ND_DIV:
+    if (!try_eval_double_v2(n->lhs, &lv)) return false;
+    if (!try_eval_double_v2(n->rhs, &rv)) return false;
+    *out = lv / rv; return true;
+  case ND_COND: {
+    int64_t c;
+    if (!try_eval_node(n->cond, &c)) return false;
+    return try_eval_double_v2(c ? n->then : n->els, out);
+  }
+  case ND_COMMA:
+    return try_eval_double_v2(n->rhs, out);
+  case ND_CAST:
+    if (n->lhs && n->lhs->ty && is_flonum(n->lhs->ty)) {
+      if (!try_eval_double_v2(n->lhs, &lv)) return false;
+      *out = lv;
+      return true;
+    }
+    if (try_eval_node(n->lhs, &iv)) {
+      if (n->lhs->ty && n->lhs->ty->is_unsigned)
+        *out = (double)(uint64_t)iv;
+      else
+        *out = (double)iv;
+      return true;
+    }
+    return false;
+  default:
+    if (try_eval_node(n, &iv)) {
+      if (n->ty && n->ty->is_unsigned)
+        *out = (double)(uint64_t)iv;
+      else
+        *out = (double)iv;
+      return true;
+    }
+    return false;
+  }
 }
