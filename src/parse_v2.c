@@ -703,9 +703,26 @@ static Token *attribute_list(Token *tok, Type *ty, VarAttr *attr) {
   error_tok(tok, "parse_v2: attribute_list not yet implemented");
 }
 
+// parse_typedef — 04c §B.5 / 04a §I.2.  Comma-separated declarators
+// after a `typedef` declspec; each is bound as a typedef-name in
+// the current scope.  VLA-typedef compute_vla_size emission is
+// deferred (depends on VLA support).
 static Token *parse_typedef(Token *tok, Type *basety) {
-  (void)basety;
-  error_tok(tok, "parse_v2: parse_typedef not yet implemented");
+  bool first = true;
+  while (!equal(tok, ";")) {
+    if (!first) tok = skip(tok, ",");
+    first = false;
+
+    Type *ty = declarator(&tok, tok, basety);
+    if (equal(tok, "__attribute__"))
+      tok = attribute_list(tok->next, ty, NULL);
+    if (!ty->name)
+      error_tok(tok, "typedef declarator requires a name");
+
+    char *name = strndup_checked(ty->name->loc, ty->name->len);
+    push_scope(name)->type_def = ty;
+  }
+  return skip(tok, ";");
 }
 
 // function — definition body parsing (04c_stmt.md §F).  basety is
@@ -1504,9 +1521,32 @@ static Node *assign(Token **rest, Token *tok) {
   return node;
 }
 
-// cond_expr — ternary not yet wired; passthrough to logor.
+// cond_expr — ternary `?:` (04b §D).  Standard form only;
+// GNU Elvis (`a ?: b`) is deferred — it lowers via tmp-var which
+// requires new_lvar in expression context (works fine, just adds
+// noise; folded into a follow-up commit).
 static Node *cond_expr(Token **rest, Token *tok) {
-  return logor(rest, tok);
+  Node *node = logor(&tok, tok);
+  if (!equal(tok, "?")) {
+    *rest = tok;
+    return node;
+  }
+  Token *q = tok;
+  // GNU Elvis: `a ?: b` — defer.  Standard form requires `?` then
+  // an expression then `:` then a cond_expr.
+  if (equal(tok->next, ":"))
+    error_tok(tok, "parse_v2: GNU `?:` Elvis form not yet implemented");
+
+  Node *then_n = expr(&tok, tok->next);
+  tok = skip(tok, ":");
+  Node *els_n = cond_expr(&tok, tok);
+
+  Node *result = new_node(ND_COND, q);
+  result->cond = node;
+  result->then = then_n;
+  result->els = els_n;
+  *rest = tok;
+  return result;
 }
 
 static Node *logor(Token **rest, Token *tok) {
