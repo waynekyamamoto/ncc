@@ -217,8 +217,12 @@ static Node *new_num(int64_t val, Token *tok) {
   return node;
 }
 
+// Spec 04c §A.5 prescribes `.L..%d`, but Mach-O treats `.L`-prefixed
+// labels as external — only labels starting with capital `L` are
+// local in Mach-O.  We use `Ltmp_%d` to match the canonical ncc and
+// the assembler's expectations.  Documented divergence from spec.
 static char *new_unique_name(void) {
-  return format(".L..%d", label_cnt++);
+  return format("Ltmp_%d", label_cnt++);
 }
 
 //
@@ -1160,6 +1164,164 @@ static Node *stmt(Token **rest, Token *tok) {
     Type *ret_ty = current_fn ? current_fn->ty->return_ty : ty_int;
     Node *node = new_unary(ND_RETURN, new_cast(e, ret_ty), ret_tok);
     *rest = skip(tok, ";");
+    return node;
+  }
+
+  // if / else (04c §C.1).  No DCE yet — that's a parser-side
+  // optimization that depends on contains_label + const-folding
+  // and lands once try_eval_node is real.
+  if (equal(tok, "if")) {
+    Token *if_tok = tok;
+    tok = skip(tok->next, "(");
+    Node *cond_n = expr(&tok, tok);
+    tok = skip(tok, ")");
+    Node *then_n = stmt(&tok, tok);
+    Node *els_n = NULL;
+    if (equal(tok, "else"))
+      els_n = stmt(&tok, tok->next);
+    Node *node = new_node(ND_IF, if_tok);
+    node->cond = cond_n;
+    node->then = then_n;
+    node->els = els_n;
+    *rest = tok;
+    return node;
+  }
+
+  // while (04c §D.1).
+  if (equal(tok, "while")) {
+    Token *w_tok = tok;
+    tok = skip(tok->next, "(");
+    Node *cond_n = expr(&tok, tok);
+    tok = skip(tok, ")");
+
+    Node *node = new_node(ND_FOR, w_tok);
+    node->cond = cond_n;
+    node->unique_label = new_unique_name();
+    node->cont_label = new_unique_name();
+
+    char *saved_brk = brk_label, *saved_cont = cont_label;
+    brk_label = node->unique_label;
+    cont_label = node->cont_label;
+    node->then = stmt(&tok, tok);
+    brk_label = saved_brk;
+    cont_label = saved_cont;
+
+    *rest = tok;
+    return node;
+  }
+
+  // do { ... } while ( ... ); (04c §D.2).
+  if (equal(tok, "do")) {
+    Token *do_tok = tok;
+    Node *node = new_node(ND_DO, do_tok);
+    node->unique_label = new_unique_name();
+    node->cont_label = new_unique_name();
+
+    char *saved_brk = brk_label, *saved_cont = cont_label;
+    brk_label = node->unique_label;
+    cont_label = node->cont_label;
+    node->then = stmt(&tok, tok->next);
+    brk_label = saved_brk;
+    cont_label = saved_cont;
+
+    tok = skip(tok, "while");
+    tok = skip(tok, "(");
+    node->cond = expr(&tok, tok);
+    tok = skip(tok, ")");
+    *rest = skip(tok, ";");
+    return node;
+  }
+
+  // for (init; cond; step) stmt (04c §D.3).
+  if (equal(tok, "for")) {
+    Token *for_tok = tok;
+    tok = skip(tok->next, "(");
+
+    Node *node = new_node(ND_FOR, for_tok);
+    node->unique_label = new_unique_name();
+    node->cont_label = new_unique_name();
+
+    enter_scope();
+    char *saved_brk = brk_label, *saved_cont = cont_label;
+    brk_label = node->unique_label;
+    cont_label = node->cont_label;
+
+    // Init: declaration | expr-stmt | `;`.
+    if (equal(tok, ";")) {
+      tok = tok->next;
+    } else if (is_typename(tok)) {
+      VarAttr attr = {0};
+      Type *basety = declspec(&tok, tok, &attr);
+      node->init = declaration(&tok, tok, basety, &attr);
+    } else {
+      Node *e = expr(&tok, tok);
+      node->init = new_unary(ND_EXPR_STMT, e, for_tok);
+      tok = skip(tok, ";");
+    }
+
+    if (!equal(tok, ";"))
+      node->cond = expr(&tok, tok);
+    tok = skip(tok, ";");
+
+    if (!equal(tok, ")"))
+      node->inc = expr(&tok, tok);
+    tok = skip(tok, ")");
+
+    node->then = stmt(&tok, tok);
+
+    brk_label = saved_brk;
+    cont_label = saved_cont;
+    leave_scope();
+
+    *rest = tok;
+    return node;
+  }
+
+  // goto IDENT ; (04c §E.1, direct form).
+  if (equal(tok, "goto")) {
+    if (tok->next->kind != TK_IDENT)
+      error_tok(tok->next, "expected label");
+    Node *node = new_node(ND_GOTO, tok);
+    node->label = strndup_checked(tok->next->loc, tok->next->len);
+    node->goto_next = gotos;
+    gotos = node;
+    *rest = skip(tok->next->next, ";");
+    return node;
+  }
+
+  // break (04c §E.2).
+  if (equal(tok, "break")) {
+    if (!brk_label)
+      error_tok(tok, "stray break");
+    Node *node = new_node(ND_GOTO, tok);
+    node->unique_label = brk_label;
+    *rest = skip(tok->next, ";");
+    return node;
+  }
+
+  // continue (04c §E.3).
+  if (equal(tok, "continue")) {
+    if (!cont_label)
+      error_tok(tok, "stray continue");
+    Node *node = new_node(ND_GOTO, tok);
+    node->unique_label = cont_label;
+    *rest = skip(tok->next, ";");
+    return node;
+  }
+
+  // Labeled statement: `IDENT :` followed by stmt (04c §E.4).
+  if (tok->kind == TK_IDENT && equal(tok->next, ":")) {
+    Node *node = new_node(ND_LABEL, tok);
+    node->label = strndup_checked(tok->loc, tok->len);
+    node->unique_label = new_unique_name();
+    tok = tok->next->next;
+    // Permit trailing __attribute__((...)) per §E.4 step 3.
+    if (equal(tok, "__attribute__"))
+      tok = attribute_list(tok->next, NULL, NULL);
+    node->lhs = stmt(&tok, tok);
+    node->goto_next = labels;
+    labels = node;
+    *rest = tok;
     return node;
   }
 
