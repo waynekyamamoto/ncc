@@ -1734,6 +1734,91 @@ static Token *parse_gvar_initializer(Token *tok, Obj *var) {
     var->rel = rh.next;
     return tok;
   }
+  // Struct gvar init: brace-init of struct fields directly.  Subset:
+  // each field is a string literal (becomes Relocation), pointer
+  // (relocation), or integer/bool const-expr.  Nested aggregates
+  // not yet handled.
+  if (equal(tok, "{") && var->ty->kind == TY_STRUCT) {
+    Type *ty = var->ty;
+    long sz = ty->size;
+    char *buf = calloc_checked(1, sz);
+    Relocation rh = {0};
+    Relocation *rcur = &rh;
+    tok = tok->next;
+    Member *m = ty->members;
+    bool first = true;
+    while (!equal(tok, "}")) {
+      if (!first) tok = skip(tok, ",");
+      first = false;
+      if (equal(tok, "}")) break;
+      if (equal(tok, ".")) {
+        tok = tok->next;
+        if (tok->kind != TK_IDENT) error_tok(tok, "expected member name");
+        Member *target = find_member(ty, tok);
+        if (!target) error_tok(tok, "no such member");
+        tok = skip(tok->next, "=");
+        m = target;
+      }
+      if (!m) error_tok(tok, "excess elements in struct initializer");
+      if (m->ty->kind == TY_PTR && tok->kind == TK_STR) {
+        Obj *anon = new_anon_gvar(tok->ty);
+        anon->init_data = tok->str;
+        anon->init_data_size = tok->ty->size;
+        Relocation *r = calloc_checked(1, sizeof(Relocation));
+        r->offset = (int)m->offset;
+        r->label = &anon->name;
+        rcur = rcur->next = r;
+        tok = tok->next;
+      } else if (equal(tok, "{")) {
+        // Nested aggregate — skip with error (could fall back to
+        // a sub-init, but for now we surface clearly).
+        error_tok(tok, "parse_v2: nested aggregate gvar init not yet implemented");
+      } else {
+        int64_t v = const_expr_val(&tok, tok);
+        for (int b = 0; b < (int)m->ty->size; b++)
+          buf[m->offset + b] = (v >> (b * 8)) & 0xff;
+      }
+      m = m->next;
+    }
+    tok = skip(tok, "}");
+    var->init_data = buf;
+    var->init_data_size = sz;
+    var->rel = rh.next;
+    return tok;
+  }
+
+  // Union gvar init: only the first member is initialized; all
+  // others share its storage.  Subset: integer first member.
+  if (equal(tok, "{") && var->ty->kind == TY_UNION) {
+    Type *ty = var->ty;
+    long sz = ty->size;
+    char *buf = calloc_checked(1, sz);
+    tok = tok->next;
+    Member *m = ty->members;
+    if (!equal(tok, "}") && m) {
+      if (m->ty->kind == TY_PTR && tok->kind == TK_STR) {
+        Obj *anon = new_anon_gvar(tok->ty);
+        anon->init_data = tok->str;
+        anon->init_data_size = tok->ty->size;
+        Relocation *r = calloc_checked(1, sizeof(Relocation));
+        r->offset = 0;
+        r->label = &anon->name;
+        var->rel = r;
+        tok = tok->next;
+      } else {
+        int64_t v = const_expr_val(&tok, tok);
+        for (int b = 0; b < (int)m->ty->size && b < (int)sz; b++)
+          buf[b] = (v >> (b * 8)) & 0xff;
+      }
+    }
+    // Trailing comma allowed.
+    if (equal(tok, ",")) tok = tok->next;
+    tok = skip(tok, "}");
+    var->init_data = buf;
+    var->init_data_size = sz;
+    return tok;
+  }
+
   // Array of struct: brace contains brace per element; each inner
   // brace folds the struct fields.  Subset (matches our table use):
   // each field is either a string literal (becomes Relocation),
