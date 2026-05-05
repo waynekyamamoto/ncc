@@ -104,6 +104,20 @@ static Node *current_switch;
 //
 static Node *expr(Token **rest, Token *tok);
 static Node *assign(Token **rest, Token *tok);
+static Node *cond_expr(Token **rest, Token *tok);
+static Node *logor(Token **rest, Token *tok);
+static Node *logand(Token **rest, Token *tok);
+static Node *bitor_(Token **rest, Token *tok);
+static Node *bitxor(Token **rest, Token *tok);
+static Node *bitand_(Token **rest, Token *tok);
+static Node *equality(Token **rest, Token *tok);
+static Node *relational(Token **rest, Token *tok);
+static Node *shift(Token **rest, Token *tok);
+static Node *add(Token **rest, Token *tok);
+static Node *mul(Token **rest, Token *tok);
+static Node *cast(Token **rest, Token *tok);
+static Node *unary(Token **rest, Token *tok);
+static Node *postfix(Token **rest, Token *tok);
 static Node *primary(Token **rest, Token *tok);
 static Node *stmt(Token **rest, Token *tok);
 static Node *compound_stmt(Token **rest, Token *tok);
@@ -184,6 +198,13 @@ static Node *new_node(NodeKind kind, Token *tok) {
 static Node *new_unary(NodeKind kind, Node *expr_, Token *tok) {
   Node *node = new_node(kind, tok);
   node->lhs = expr_;
+  return node;
+}
+
+static Node *new_binary(NodeKind kind, Node *lhs, Node *rhs, Token *tok) {
+  Node *node = new_node(kind, tok);
+  node->lhs = lhs;
+  node->rhs = rhs;
   return node;
 }
 
@@ -1149,16 +1170,257 @@ static Node *stmt(Token **rest, Token *tok) {
 }
 
 //
-// Expression zone (04b_expr.md) — vertical-slice subset.
+// Expression zone (04b_expr.md).  No vector/complex decomposition
+// yet — those land in dedicated commits.  Compound assignment via
+// to_assign is also deferred; only plain `=` is wired here.
 //
+
+// new_add — pointer-aware addition (04b §J.1).  Subset:
+//   - num + num    → ND_ADD
+//   - ptr + int    → ND_ADD with rhs scaled by sizeof(base)
+//   - int + ptr    → swap and recurse
+//   - ptr + ptr    → error
+static Node *new_add(Node *lhs, Node *rhs, Token *tok) {
+  add_type(lhs);
+  add_type(rhs);
+
+  if (is_numeric(lhs->ty) && is_numeric(rhs->ty))
+    return new_binary(ND_ADD, lhs, rhs, tok);
+
+  if (lhs->ty->base && rhs->ty->base)
+    error_tok(tok, "invalid operands (ptr + ptr)");
+
+  // Canonicalize: ptr on lhs.
+  if (!lhs->ty->base && rhs->ty->base) {
+    Node *t = lhs; lhs = rhs; rhs = t;
+  }
+
+  // ptr + int — scale by element size.
+  long elem_size = lhs->ty->base->size;
+  rhs = new_binary(ND_MUL, rhs, new_num(elem_size, tok), tok);
+  return new_binary(ND_ADD, lhs, rhs, tok);
+}
+
+// new_sub — subset:
+//   - num - num    → ND_SUB
+//   - ptr - int    → ND_SUB with rhs scaled
+//   - ptr - ptr    → byte diff / sizeof(base)  (long result)
+static Node *new_sub(Node *lhs, Node *rhs, Token *tok) {
+  add_type(lhs);
+  add_type(rhs);
+
+  if (is_numeric(lhs->ty) && is_numeric(rhs->ty))
+    return new_binary(ND_SUB, lhs, rhs, tok);
+
+  // ptr - int.
+  if (lhs->ty->base && is_integer(rhs->ty)) {
+    long elem_size = lhs->ty->base->size;
+    rhs = new_binary(ND_MUL, rhs, new_num(elem_size, tok), tok);
+    add_type(rhs);
+    Node *node = new_binary(ND_SUB, lhs, rhs, tok);
+    node->ty = lhs->ty;
+    return node;
+  }
+
+  // ptr - ptr.
+  if (lhs->ty->base && rhs->ty->base) {
+    long elem_size = lhs->ty->base->size;
+    Node *node = new_binary(ND_SUB, lhs, rhs, tok);
+    node->ty = ty_long;
+    return new_binary(ND_DIV, node, new_num(elem_size, tok), tok);
+  }
+
+  error_tok(tok, "invalid operands");
+}
 
 // expr → assign  (no comma operator yet)
 static Node *expr(Token **rest, Token *tok) {
-  return assign(rest, tok);
+  Node *node = assign(&tok, tok);
+  if (equal(tok, ",")) {
+    Node *rhs = expr(&tok, tok->next);
+    node = new_binary(ND_COMMA, node, rhs, tok);
+  }
+  *rest = tok;
+  return node;
 }
 
-// assign → primary  (no operator ladder yet)
+// assign → cond_expr (= assign)?
+//
+// Compound-assignment operators are deferred until `to_assign`
+// lowering lands; only plain `=` is wired here.
 static Node *assign(Token **rest, Token *tok) {
+  Node *node = cond_expr(&tok, tok);
+  if (equal(tok, "=")) {
+    Node *rhs = assign(&tok, tok->next);
+    *rest = tok;
+    return new_binary(ND_ASSIGN, node, rhs, tok);
+  }
+  *rest = tok;
+  return node;
+}
+
+// cond_expr — ternary not yet wired; passthrough to logor.
+static Node *cond_expr(Token **rest, Token *tok) {
+  return logor(rest, tok);
+}
+
+static Node *logor(Token **rest, Token *tok) {
+  Node *node = logand(&tok, tok);
+  while (equal(tok, "||")) {
+    Token *op = tok;
+    Node *rhs = logand(&tok, tok->next);
+    node = new_binary(ND_LOGOR, node, rhs, op);
+  }
+  *rest = tok;
+  return node;
+}
+
+static Node *logand(Token **rest, Token *tok) {
+  Node *node = bitor_(&tok, tok);
+  while (equal(tok, "&&")) {
+    Token *op = tok;
+    Node *rhs = bitor_(&tok, tok->next);
+    node = new_binary(ND_LOGAND, node, rhs, op);
+  }
+  *rest = tok;
+  return node;
+}
+
+static Node *bitor_(Token **rest, Token *tok) {
+  Node *node = bitxor(&tok, tok);
+  while (equal(tok, "|")) {
+    Token *op = tok;
+    Node *rhs = bitxor(&tok, tok->next);
+    node = new_binary(ND_BITOR, node, rhs, op);
+  }
+  *rest = tok;
+  return node;
+}
+
+static Node *bitxor(Token **rest, Token *tok) {
+  Node *node = bitand_(&tok, tok);
+  while (equal(tok, "^")) {
+    Token *op = tok;
+    Node *rhs = bitand_(&tok, tok->next);
+    node = new_binary(ND_BITXOR, node, rhs, op);
+  }
+  *rest = tok;
+  return node;
+}
+
+static Node *bitand_(Token **rest, Token *tok) {
+  Node *node = equality(&tok, tok);
+  while (equal(tok, "&")) {
+    Token *op = tok;
+    Node *rhs = equality(&tok, tok->next);
+    node = new_binary(ND_BITAND, node, rhs, op);
+  }
+  *rest = tok;
+  return node;
+}
+
+static Node *equality(Token **rest, Token *tok) {
+  Node *node = relational(&tok, tok);
+  for (;;) {
+    Token *op = tok;
+    if (equal(tok, "==")) {
+      Node *rhs = relational(&tok, tok->next);
+      node = new_binary(ND_EQ, node, rhs, op);
+    } else if (equal(tok, "!=")) {
+      Node *rhs = relational(&tok, tok->next);
+      node = new_binary(ND_NE, node, rhs, op);
+    } else break;
+  }
+  *rest = tok;
+  return node;
+}
+
+static Node *relational(Token **rest, Token *tok) {
+  Node *node = shift(&tok, tok);
+  for (;;) {
+    Token *op = tok;
+    if (equal(tok, "<")) {
+      Node *rhs = shift(&tok, tok->next);
+      node = new_binary(ND_LT, node, rhs, op);
+    } else if (equal(tok, "<=")) {
+      Node *rhs = shift(&tok, tok->next);
+      node = new_binary(ND_LE, node, rhs, op);
+    } else if (equal(tok, ">")) {
+      // `>` lowers to `ND_LT` with operands swapped.
+      Node *rhs = shift(&tok, tok->next);
+      node = new_binary(ND_LT, rhs, node, op);
+    } else if (equal(tok, ">=")) {
+      Node *rhs = shift(&tok, tok->next);
+      node = new_binary(ND_LE, rhs, node, op);
+    } else break;
+  }
+  *rest = tok;
+  return node;
+}
+
+static Node *shift(Token **rest, Token *tok) {
+  Node *node = add(&tok, tok);
+  for (;;) {
+    Token *op = tok;
+    if (equal(tok, "<<")) {
+      Node *rhs = add(&tok, tok->next);
+      node = new_binary(ND_SHL, node, rhs, op);
+    } else if (equal(tok, ">>")) {
+      Node *rhs = add(&tok, tok->next);
+      node = new_binary(ND_SHR, node, rhs, op);
+    } else break;
+  }
+  *rest = tok;
+  return node;
+}
+
+static Node *add(Token **rest, Token *tok) {
+  Node *node = mul(&tok, tok);
+  for (;;) {
+    Token *op = tok;
+    if (equal(tok, "+")) {
+      Node *rhs = mul(&tok, tok->next);
+      node = new_add(node, rhs, op);
+    } else if (equal(tok, "-")) {
+      Node *rhs = mul(&tok, tok->next);
+      node = new_sub(node, rhs, op);
+    } else break;
+  }
+  *rest = tok;
+  return node;
+}
+
+static Node *mul(Token **rest, Token *tok) {
+  Node *node = cast(&tok, tok);
+  for (;;) {
+    Token *op = tok;
+    if (equal(tok, "*")) {
+      Node *rhs = cast(&tok, tok->next);
+      node = new_binary(ND_MUL, node, rhs, op);
+    } else if (equal(tok, "/")) {
+      Node *rhs = cast(&tok, tok->next);
+      node = new_binary(ND_DIV, node, rhs, op);
+    } else if (equal(tok, "%")) {
+      Node *rhs = cast(&tok, tok->next);
+      node = new_binary(ND_MOD, node, rhs, op);
+    } else break;
+  }
+  *rest = tok;
+  return node;
+}
+
+// cast — passthrough until the typename-cast branch lands.
+static Node *cast(Token **rest, Token *tok) {
+  return unary(rest, tok);
+}
+
+// unary — passthrough until prefix operators land.
+static Node *unary(Token **rest, Token *tok) {
+  return postfix(rest, tok);
+}
+
+// postfix — passthrough until [], (), ., ->, ++, -- land.
+static Node *postfix(Token **rest, Token *tok) {
   return primary(rest, tok);
 }
 
