@@ -706,21 +706,28 @@ static Member *struct_members(Token **rest, Token *tok) {
   return head.next;
 }
 
-// struct_layout — assign offsets and compute size + align.  No
-// packed / bitfield support yet.
+// struct_layout — assign offsets and compute size + align.
+// Packed: skip per-member alignment and final round-up.  Bitfield
+// support not yet implemented.
 static void struct_layout(Type *ty) {
   long offset = 0;
   int max_align = 1;
   for (Member *m = ty->members; m; m = m->next) {
     int al = m->align ? m->align : m->ty->align;
     if (al < 1) al = 1;
-    offset = align_to(offset, al);
+    if (!ty->is_packed)
+      offset = align_to(offset, al);
     m->offset = offset;
     offset += m->ty->size;
     if (al > max_align) max_align = al;
   }
-  ty->align = max_align;
-  ty->size = align_to(offset, max_align);
+  if (ty->is_packed) {
+    if (ty->align < 1) ty->align = 1;
+    ty->size = offset;
+  } else {
+    if (max_align > ty->align) ty->align = max_align;
+    ty->size = align_to(offset, ty->align);
+  }
 }
 
 // union_layout — all members at offset 0, size = max member size,
@@ -745,11 +752,23 @@ static void union_layout(Type *ty) {
 // __attribute__ blobs are consumed-and-ignored for now (real
 // honoring lands with attribute_list).
 static Type *struct_or_union(Token **rest, Token *tok, bool is_union) {
+  // §F.2 step 1: pre-tag __attribute__.  We don't have a temporary
+  // Type yet, so apply to the final type after creation by routing
+  // through a stack-local VarAttr that we re-apply when ty exists.
+  VarAttr early_attr = {0};
+  Type early_ty = {0};
+  while (equal(tok, "__attribute__"))
+    tok = attribute_list(tok->next, &early_ty, &early_attr);
+
   Token *tag = NULL;
   if (tok->kind == TK_IDENT) {
     tag = tok;
     tok = tok->next;
   }
+
+  // §F.2 step 3: between-tag-and-body __attribute__.
+  while (equal(tok, "__attribute__"))
+    tok = attribute_list(tok->next, &early_ty, &early_attr);
 
   // Forward reference / lookup.
   if (tag && !equal(tok, "{")) {
@@ -779,11 +798,25 @@ static Type *struct_or_union(Token **rest, Token *tok, bool is_union) {
     ty = struct_type();
     ty->kind = is_union ? TY_UNION : TY_STRUCT;
   }
+  // Apply early attributes before laying out so packed/aligned
+  // affect the layout (§F.2 step 5).
+  if (early_ty.is_packed) ty->is_packed = true;
+  if (early_attr.align && early_attr.align > ty->align) ty->align = early_attr.align;
+
   ty->members = struct_members(&tok, tok);
   if (is_union)
     union_layout(ty);
   else
     struct_layout(ty);
+
+  // §F.2 step 5 last bullet: trailing __attribute__ may force packed
+  // re-layout.
+  while (equal(tok, "__attribute__")) {
+    bool was_packed = ty->is_packed;
+    tok = attribute_list(tok->next, ty, NULL);
+    if (!was_packed && ty->is_packed && !is_union)
+      struct_layout(ty);
+  }
 
   if (tag) {
     // Push only if not already in scope (avoid duplicate entries
@@ -913,9 +946,107 @@ static Token *parse_alignas(Token *tok, VarAttr *attr) {
   error_tok(tok, "parse_v2: _Alignas not yet implemented");
 }
 
+// attribute_list — 04a §G subset.  Caller has consumed the
+// `__attribute__` token; `tok` points at the first `(` of `((`.
+// Loops over chained `__attribute__((...))` clauses.  Honors
+// packed / aligned / vector_size / mode / alias.  Other attributes
+// are parsed-and-ignored.  Per-attribute argument lists are
+// brace-balanced-consumed when not interpreted.
+static bool tok_name_eq(Token *tok, const char *name) {
+  size_t n = strlen(name);
+  return tok->len == (int)n && !strncmp(tok->loc, name, n);
+}
+
 static Token *attribute_list(Token *tok, Type *ty, VarAttr *attr) {
-  (void)ty; (void)attr;
-  error_tok(tok, "parse_v2: attribute_list not yet implemented");
+  for (;;) {
+    tok = skip(tok, "(");
+    tok = skip(tok, "(");
+    bool first = true;
+    while (!equal(tok, ")")) {
+      if (!first) tok = skip(tok, ",");
+      first = false;
+      if (equal(tok, ")")) break;
+
+      Token *name_tok = tok;
+      tok = tok->next;
+      bool has_args = equal(tok, "(");
+
+      if (tok_name_eq(name_tok, "packed") || tok_name_eq(name_tok, "__packed__")) {
+        if (ty && ty->kind != TY_FUNC) ty->is_packed = true;
+        if (has_args) {
+          // packed takes no args; tolerate empty `()`.
+          tok = tok->next;
+          tok = skip(tok, ")");
+        }
+      } else if (tok_name_eq(name_tok, "aligned") || tok_name_eq(name_tok, "__aligned__")) {
+        int n = 16;
+        if (has_args) {
+          tok = tok->next;
+          n = (int)const_expr_val(&tok, tok);
+          tok = skip(tok, ")");
+        }
+        if (attr) attr->align = n;
+        if (ty) ty->align = n;
+      } else if (tok_name_eq(name_tok, "vector_size") ||
+                 tok_name_eq(name_tok, "__vector_size__")) {
+        int n = 0;
+        if (has_args) {
+          tok = tok->next;
+          n = (int)const_expr_val(&tok, tok);
+          tok = skip(tok, ")");
+        }
+        if (attr) attr->vector_size = n;
+      } else if (tok_name_eq(name_tok, "mode") || tok_name_eq(name_tok, "__mode__")) {
+        // mode(QI|HI|SI|DI|word) — map to byte width 1/2/4/8.
+        int kind = 0;
+        if (has_args) {
+          tok = tok->next;
+          if (tok->kind == TK_IDENT) {
+            if (tok_name_eq(tok, "QI") || tok_name_eq(tok, "__QI__"))      kind = 1;
+            else if (tok_name_eq(tok, "HI") || tok_name_eq(tok, "__HI__")) kind = 2;
+            else if (tok_name_eq(tok, "SI") || tok_name_eq(tok, "__SI__")) kind = 4;
+            else if (tok_name_eq(tok, "DI") || tok_name_eq(tok, "__DI__")) kind = 8;
+            else if (tok_name_eq(tok, "word"))                              kind = 8;
+            tok = tok->next;
+          }
+          tok = skip(tok, ")");
+        }
+        if (attr) attr->mode_kind = kind;
+      } else if (tok_name_eq(name_tok, "alias") || tok_name_eq(name_tok, "__alias__")) {
+        if (has_args) {
+          // brace-balanced skip; honoring would set attr->alias_target,
+          // but the field doesn't live on VarAttr currently.  Recorded
+          // as parsed-and-ignored for now.
+          tok = tok->next;
+          int depth = 1;
+          while (depth > 0 && tok->kind != TK_EOF) {
+            if (equal(tok, "(")) depth++;
+            else if (equal(tok, ")")) { depth--; if (depth == 0) break; }
+            tok = tok->next;
+          }
+          tok = skip(tok, ")");
+        }
+      } else {
+        // Parsed-and-ignored: consume optional ( ... ) brace-balanced.
+        if (has_args) {
+          tok = tok->next;
+          int depth = 1;
+          while (depth > 0 && tok->kind != TK_EOF) {
+            if (equal(tok, "(")) depth++;
+            else if (equal(tok, ")")) { depth--; if (depth == 0) break; }
+            tok = tok->next;
+          }
+          tok = skip(tok, ")");
+        }
+      }
+    }
+    tok = skip(tok, ")");
+    tok = skip(tok, ")");
+
+    if (!equal(tok, "__attribute__")) break;
+    tok = tok->next;
+  }
+  return tok;
 }
 
 // parse_typedef — 04c §B.5 / 04a §I.2.  Comma-separated declarators
