@@ -1787,6 +1787,14 @@ static Token *parse_gvar_initializer(Token *tok, Obj *var) {
         r->label = &anon->name;
         rcur = rcur->next = r;
         tok = tok->next;
+      } else if (m->ty->kind == TY_ARRAY && m->ty->base->kind == TY_CHAR &&
+                 tok->kind == TK_STR) {
+        // Direct char-array init from string literal.
+        long s = tok->ty->array_len;
+        long n = m->ty->array_len > 0 && m->ty->array_len < s ? m->ty->array_len : s;
+        for (long i = 0; i < n && (m->offset + i) < sz; i++)
+          buf[m->offset + i] = tok->str[i];
+        tok = tok->next;
       } else if (equal(tok, "{")) {
         // Nested aggregate — skip with error (could fall back to
         // a sub-init, but for now we surface clearly).
