@@ -102,6 +102,8 @@ static Node *current_switch;
 //
 // Forward declarations.
 //
+static Node *declaration(Token **rest, Token *tok, Type *basety, VarAttr *attr);
+static Node *new_var_node(Obj *var, Token *tok);
 static Node *expr(Token **rest, Token *tok);
 static Node *assign(Token **rest, Token *tok);
 static Node *cond_expr(Token **rest, Token *tok);
@@ -1108,10 +1110,8 @@ static Token *skip_static_assert(Token *tok) {
 // Statement zone (04c_stmt.md).
 //
 
-// compound_stmt — `{` already consumed by caller.  Parses statements
-// until `}` and returns an ND_BLOCK.  Currently only dispatches to
-// stmt() — local declarations and other branches land in later
-// commits.
+// compound_stmt — `{` already consumed by caller.  Parses
+// declarations and statements until `}` and returns an ND_BLOCK.
 static Node *compound_stmt(Token **rest, Token *tok) {
   Node *node = new_node(ND_BLOCK, tok);
   Node head = {0};
@@ -1119,6 +1119,19 @@ static Node *compound_stmt(Token **rest, Token *tok) {
 
   enter_scope();
   while (!equal(tok, "}")) {
+    // Declaration: is_typename and the next token isn't `:` (which
+    // would make it a labeled statement using a typedef name).
+    if (is_typename(tok) && !equal(tok->next, ":")) {
+      VarAttr attr = {0};
+      Type *basety = declspec(&tok, tok, &attr);
+      if (attr.is_typedef) {
+        tok = parse_typedef(tok, basety);
+        continue;
+      }
+      cur = cur->next = declaration(&tok, tok, basety, &attr);
+      add_type(cur);
+      continue;
+    }
     cur = cur->next = stmt(&tok, tok);
     add_type(cur);
   }
@@ -1154,7 +1167,89 @@ static Node *stmt(Token **rest, Token *tok) {
   if (equal(tok, "{"))
     return compound_stmt(rest, tok->next);
 
-  error_tok(tok, "parse_v2: unsupported statement (slice incomplete)");
+  // Empty statement: `;`.
+  if (equal(tok, ";")) {
+    Node *node = new_node(ND_BLOCK, tok);
+    *rest = tok->next;
+    return node;
+  }
+
+  // Fall-through: expression statement (04c §E.7).
+  Node *e = expr(&tok, tok);
+  Node *node = new_unary(ND_EXPR_STMT, e, tok);
+  *rest = skip(tok, ";");
+  return node;
+}
+
+// declaration — local-declaration impl (04a §H).  Subset:
+//   - Per-declarator loop: declarator, void check, name check.
+//   - Storage class: extern (no storage) and normal new_lvar.
+//     `static` local lifts to anon gvar — deferred until
+//     gvar_initializer lands; flagged as not implemented if seen.
+//   - Initializer: scalar `T x = expr;` only — array/struct/brace
+//     forms (lvar_initializer) deferred until 04d lands.
+//   - Returns ND_BLOCK whose body is the chain of init statements.
+static Node *declaration(Token **rest, Token *tok, Type *basety, VarAttr *attr) {
+  Node head = {0};
+  Node *cur = &head;
+  bool first = true;
+
+  while (!equal(tok, ";")) {
+    if (!first)
+      tok = skip(tok, ",");
+    first = false;
+
+    Type *ty = declarator(&tok, tok, basety);
+    if (ty->kind == TY_VOID) {
+      if (attr->is_extern) {
+        ty = copy_type(ty_char);
+      } else {
+        error_tok(tok, "variable declared void");
+      }
+    }
+    if (!ty->name)
+      error_tok(tok, "declarator requires a name");
+
+    if (equal(tok, "__attribute__"))
+      tok = attribute_list(tok->next, ty, attr);
+
+    char *name = strndup_checked(ty->name->loc, ty->name->len);
+
+    if (attr->is_static) {
+      error_tok(tok, "parse_v2: static local not yet implemented");
+    }
+
+    if (attr->is_extern) {
+      Obj *var = new_gvar(name, ty);
+      var->is_definition = false;
+      // No storage; no initializer permitted with extern + decl.
+      if (equal(tok, "="))
+        error_tok(tok, "parse_v2: extern with initializer not yet implemented");
+      continue;
+    }
+
+    Obj *var = new_lvar(name, ty);
+    if (attr->align)
+      var->align = attr->align;
+
+    if (equal(tok, "=")) {
+      // Scalar initializer fast path: `T x = expr;` lowers to an
+      // ND_EXPR_STMT(ND_ASSIGN(var, expr)).  Brace-form, struct, and
+      // array initializers route through lvar_initializer (deferred).
+      if (equal(tok->next, "{"))
+        error_tok(tok, "parse_v2: brace initializer not yet implemented");
+      Token *eq = tok;
+      Node *lhs = new_var_node(var, ty->name);
+      Node *rhs = assign(&tok, tok->next);
+      Node *expr_ = new_binary(ND_ASSIGN, lhs, rhs, eq);
+      cur = cur->next = new_unary(ND_EXPR_STMT, expr_, eq);
+    }
+  }
+
+  Node *node = new_node(ND_BLOCK, tok);
+  node->body = head.next;
+  *rest = skip(tok, ";");
+  return node;
 }
 
 //
