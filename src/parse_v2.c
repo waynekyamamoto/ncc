@@ -3150,6 +3150,22 @@ static Node *unary(Token **rest, Token *tok) {
     return new_unary(ND_BITNOT, operand, op);
   }
 
+  // §G.7 — __real__ x / __imag__ x.
+  if (equal(tok, "__real__") || equal(tok, "__real")) {
+    Token *op = tok;
+    Node *operand = cast(rest, tok->next);
+    Node *node = new_unary(ND_REAL, operand, op);
+    add_type(node);
+    return node;
+  }
+  if (equal(tok, "__imag__") || equal(tok, "__imag")) {
+    Token *op = tok;
+    Node *operand = cast(rest, tok->next);
+    Node *node = new_unary(ND_IMAG, operand, op);
+    add_type(node);
+    return node;
+  }
+
   // §G.8 — pre-inc/dec: ++x  /  --x.
   // For non-bitfield: to_assign(new_add(x, ±1)).  Bitfield path
   // deferred until struct support lands.
