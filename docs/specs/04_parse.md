@@ -204,47 +204,60 @@ A misclassification corrupts everything downstream.  The function
 
 ### 5.2 Exhaustive keyword set (Q5.A)
 
-`is_typename` returns `true` if the token's spelling is one of
-the following keywords, **or** if the token is an identifier that
-resolves via `find_typedef` to a typedef name in scope.
+`is_typename` returns `true` if the token's spelling matches any
+keyword in the table below, **or** if the token is an identifier
+that resolves via the ordinary-namespace scope chain to a typedef
+binding (`VarScope.type_def != NULL`).
 
-**C11 storage-class specifiers (parsed here, semantic checking
-elsewhere):**
-`static`, `extern`, `auto`, `register`, `_Thread_local`, `__thread`,
-`typedef`.
+The table below is the complete normative list — 35 keywords
+total, taken verbatim from `src/parse.c` lines 682–690 on `main`
+at `phase-4-baseline`.  Adding or removing a keyword changes the
+language.
 
-**C11 type qualifiers:**
-`const`, `volatile`, `restrict`, `_Atomic`.
+| Group | Keywords |
+|---|---|
+| Primitive types | `void`, `_Bool`, `char`, `short`, `int`, `long`, `float`, `double` |
+| Signedness / complex | `signed`, `unsigned`, `_Complex`, `__complex__` |
+| Tag specifiers | `struct`, `union`, `enum` |
+| Storage class | `typedef`, `static`, `extern`, `auto`, `register`, `_Thread_local`, `__thread` |
+| Function specifiers | `inline`, `_Noreturn` |
+| Qualifiers | `const`, `volatile`, `restrict`, `_Atomic` |
+| Alignment specifier | `_Alignas` |
+| `typeof` family | `typeof`, `__typeof`, `__typeof__` |
+| GCC misc | `__extension__`, `__builtin_va_list`, `__attribute__` |
 
-**C11 function specifiers:**
-`inline`, `_Noreturn`.
-
-**C11 primitive type specifiers:**
-`void`, `_Bool`, `char`, `short`, `int`, `long`, `float`, `double`,
-`signed`, `unsigned`, `_Complex`.
-
-**C11 user-defined type specifiers:**
-`struct`, `union`, `enum`.
-
-**GCC/clang extension type-related keywords accepted by ncc:**
-`__signed__`, `__signed`, `__unsigned`, `__const`, `__volatile__`,
-`__volatile`, `__restrict`, `__restrict__`, `__inline`,
-`__inline__`, `__typeof__`, `__typeof`.
-
-**C99/GCC alignment specifiers:**
-`_Alignas`, `__alignof__`, `__alignof` (the `__alignof*` forms
-appear in `is_typename` because of `__alignof__(T)` where T is a
-type-name; the operator-on-expression form is detected later).
+**Notes:**
+- The bare-`typeof` form is a GCC extension, not a C11 keyword;
+  `is_typename` accepts it for source-compatibility with GCC
+  headers.
+- `_Alignas` triggers a special `_Alignas(N)` / `_Alignas(T)`
+  parse path inside `declspec`; it is not the operator
+  `_Alignof`.  `_Alignof` lives in unary expression parsing
+  (`04b_expr.md` §G.1) and is **not** in `is_typename`.
+- `__restrict` and `__restrict__` are **not** in `is_typename`.
+  They are accepted as pointer qualifiers inside `pointers()`
+  (`04a_decl.md` §C) but cannot start a declaration on their own.
+  This matches GCC's behavior: `int *__restrict p;` is valid;
+  `__restrict int *p;` is not.
+- `__signed`, `__signed__`, `__unsigned`, `__const`, `__volatile`,
+  `__volatile__`, `__inline`, `__inline__` are **not** accepted.
+  Sources that need them rely on system headers `#define`-ing
+  them to the bare form.
+- `_Alignof`, `__alignof`, `__alignof__` are operator-position-only
+  and not in `is_typename`.
 
 **Identifier resolution:** for any token of kind `TK_IDENT`,
-`is_typename` calls `find_typedef(tok)` which walks the scope
-chain looking for an ordinary-namespace entry of typedef kind.
-Returns `true` iff such an entry is found in any enclosing scope.
+`is_typename` calls `find_var(tok)` and returns `true` iff the
+resulting `VarScope` is non-NULL **and** has a non-NULL
+`type_def` field.  Lookup walks the scope chain inward to
+outward.  An identifier that is bound as both a variable and a
+typedef in different enclosing scopes resolves to the innermost
+binding.
 
-The keyword check is implemented as a static hashmap (parse.c
-current line ~683); the reimplementation may use the same shape
-or a perfect-hash table generated at build time.  The list itself
-is normative — adding or removing a keyword changes the language.
+The keyword check is implemented as a linear search over a
+`static const char *kw[]` array (parse.c current line 682); the
+reimplementation may use the same shape or a perfect-hash table
+generated at build time.
 
 ### 5.3 Typedef chain resolution
 
