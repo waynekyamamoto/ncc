@@ -156,8 +156,9 @@ int x = sizeof(T);   // 4 — typedef
 int y = T;            // 5 — variable
 ```
 
-(See `tests/regression/NN_typedef_shadow.c` once authored —
-deferred per Q14.A; the existing torture covers the common cases.)
+(No dedicated regression test — Q14.A dropped on 2026-05-05;
+the existing torture suite covers typedef-vs-variable namespace
+separation passively across many programs.)
 
 ### 4.2 Scope chain
 
@@ -710,7 +711,7 @@ Phase 4 closes when **all** of:
    md5 fixed point).
 2. Full test corpus passes:
    - `tests/regression/` — all entries including new Phase 4
-     contract tests (Q14: A, B, C, D, E, F).
+     contract tests (Q14 revised: B, C, D, F).
    - `tests/compliance/` — all entries including the new
      forward-static-fn compliance test (§12).
    - `tests/torture/` — gcc torture suite at parity with `main`.
