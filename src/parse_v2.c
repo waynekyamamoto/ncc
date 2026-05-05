@@ -674,8 +674,11 @@ static Type *declspec(Token **rest, Token *tok, VarAttr *attr) {
 //
 
 // struct_members — `{` already consumed.  Comma-separated decls
-// terminated by `}`.  Bitfield, anonymous-member, flexible-array,
-// per-member-attribute, and in-body _Static_assert paths deferred.
+// terminated by `}`.  Anonymous-member support: a declspec with
+// no following declarator and a STRUCT/UNION type creates a member
+// with name = NULL whose `ty` is the inner aggregate (find_member
+// recurses through these — see §F.8).  Bitfield, flexible-array,
+// per-member attribute honoring deferred.
 static Member *struct_members(Token **rest, Token *tok) {
   Member head = {0};
   Member *cur = &head;
@@ -683,6 +686,22 @@ static Member *struct_members(Token **rest, Token *tok) {
   while (!equal(tok, "}")) {
     VarAttr attr = {0};
     Type *basety = declspec(&tok, tok, &attr);
+
+    // Anonymous member: the declspec was a struct/union and the
+    // declarator is empty (`;` immediately follows).
+    if (equal(tok, ";") &&
+        (basety->kind == TY_STRUCT || basety->kind == TY_UNION)) {
+      Member *m = calloc_checked(1, sizeof(Member));
+      m->ty = basety;
+      m->name = NULL;
+      m->tok = NULL;
+      m->idx = idx++;
+      m->align = basety->align;
+      cur = cur->next = m;
+      tok = tok->next;
+      continue;
+    }
+
     bool first = true;
     while (!equal(tok, ";")) {
       if (!first) tok = skip(tok, ",");
@@ -841,8 +860,9 @@ static Type *union_decl(Token **rest, Token *tok) {
   return struct_or_union(rest, tok, true);
 }
 
-// find_member — direct linear search; anonymous-member recursion
-// deferred until anonymous-member support lands.
+// find_member — direct linear search.  Returns the matching member
+// in the immediate type; anonymous nested members are handled at
+// the call site by struct_ref via recursion.
 static Member *find_member(Type *ty, Token *name) {
   for (Member *m = ty->members; m; m = m->next) {
     if (m->name && name->len == m->name->len &&
@@ -852,18 +872,52 @@ static Member *find_member(Type *ty, Token *name) {
   return NULL;
 }
 
+// has_member_named — does the (possibly nested anonymous) struct/
+// union type ty contain a member with the given name?  Walks
+// anonymous members recursively.
+static bool has_member_named(Type *ty, Token *name) {
+  for (Member *m = ty->members; m; m = m->next) {
+    if (m->name) {
+      if (name->len == m->name->len &&
+          !strncmp(m->name->loc, name->loc, name->len))
+        return true;
+    } else if (m->ty->kind == TY_STRUCT || m->ty->kind == TY_UNION) {
+      if (has_member_named(m->ty, name))
+        return true;
+    }
+  }
+  return false;
+}
+
 // struct_ref — wrap node in ND_MEMBER for `node . name`.  Caller
-// must have applied ND_DEREF for `->`.
+// must have applied ND_DEREF for `->`.  When `name` is not directly
+// a member, recurse through anonymous members building an
+// ND_MEMBER(ND_MEMBER(node, anon), real) chain so codegen sees the
+// correct cumulative offset.
 static Node *struct_ref(Node *node, Token *name) {
   add_type(node);
   if (node->ty->kind != TY_STRUCT && node->ty->kind != TY_UNION)
     error_tok(node->tok, "not a struct or union");
+
+  // Direct hit.
   Member *m = find_member(node->ty, name);
-  if (!m)
-    error_tok(name, "no such member");
-  Node *n = new_unary(ND_MEMBER, node, name);
-  n->member = m;
-  return n;
+  if (m) {
+    Node *n = new_unary(ND_MEMBER, node, name);
+    n->member = m;
+    return n;
+  }
+
+  // Walk anonymous members: each anon hop adds an ND_MEMBER node.
+  for (Member *am = node->ty->members; am; am = am->next) {
+    if (am->name) continue;
+    if (am->ty->kind != TY_STRUCT && am->ty->kind != TY_UNION) continue;
+    if (!has_member_named(am->ty, name)) continue;
+    Node *anon_ref = new_unary(ND_MEMBER, node, name);
+    anon_ref->member = am;
+    return struct_ref(anon_ref, name);
+  }
+
+  error_tok(name, "no such member");
 }
 
 // enum_specifier — `enum` already consumed.  04a §F.7 subset:
