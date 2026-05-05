@@ -107,6 +107,7 @@ static Node *new_var_node(Obj *var, Token *tok);
 static Node *to_assign(Node *binary);
 static Node *new_inc_dec(Node *node, Token *tok, int addend);
 static int64_t const_expr_val(Token **rest, Token *tok);
+static Type *typename_(Token **rest, Token *tok);
 static Node *expr(Token **rest, Token *tok);
 static Node *assign(Token **rest, Token *tok);
 static Node *cond_expr(Token **rest, Token *tok);
@@ -170,7 +171,6 @@ static VarScope *push_scope(char *name) {
   return vs;
 }
 
-#if 0  // unused until tag-zone fills.
 static TagScope *find_tag(Token *tok) {
   for (Scope *sc = scope; sc; sc = sc->next)
     for (TagScope *ts = sc->tags; ts; ts = ts->next)
@@ -187,7 +187,6 @@ static void push_tag_scope(Token *tok, Type *ty) {
   ts->next = scope->tags;
   scope->tags = ts;
 }
-#endif
 
 //
 // Node construction helpers (04b_expr.md §A).
@@ -681,9 +680,72 @@ static Type *union_decl(Token **rest, Token *tok) {
   error_tok(tok, "parse_v2: union_decl not yet implemented");
 }
 
+// enum_specifier — `enum` already consumed.  04a §F.7 subset:
+//   - enum Tag                 → forward reference / lookup
+//   - enum [Tag] { name [=v], ... }
+// C23 fixed underlying-type (`enum Tag : T { ... }`) is parsed and
+// discarded.
 static Type *enum_specifier(Token **rest, Token *tok) {
-  (void)rest;
-  error_tok(tok, "parse_v2: enum_specifier not yet implemented");
+  // Optional tag.
+  Token *tag = NULL;
+  if (tok->kind == TK_IDENT) {
+    tag = tok;
+    tok = tok->next;
+  }
+
+  // Forward reference: `enum Tag` with no body — look up or create
+  // an incomplete entry.
+  if (tag && !equal(tok, "{")) {
+    TagScope *ts = find_tag(tag);
+    if (ts) {
+      if (ts->ty->kind != TY_ENUM)
+        error_tok(tag, "not an enum tag");
+      *rest = tok;
+      return ts->ty;
+    }
+    Type *ty = enum_type();
+    push_tag_scope(tag, ty);
+    *rest = tok;
+    return ty;
+  }
+
+  // Body required.
+  // C23 fixed underlying type — `: type-name` before `{`.
+  if (equal(tok, ":")) {
+    typename_(&tok, tok->next);
+    // discard
+  }
+  tok = skip(tok, "{");
+
+  Type *ty = enum_type();
+  int val = 0;
+  bool first = true;
+  while (!equal(tok, "}")) {
+    if (!first) tok = skip(tok, ",");
+    first = false;
+    if (equal(tok, "}")) break; // trailing comma
+    if (tok->kind != TK_IDENT)
+      error_tok(tok, "expected identifier");
+    char *name = strndup_checked(tok->loc, tok->len);
+    Token *name_tok = tok;
+    tok = tok->next;
+    if (equal(tok, "=")) {
+      val = (int)const_expr_val(&tok, tok->next);
+    }
+    // Optional trailing __attribute__((...)) per spec note.
+    if (equal(tok, "__attribute__"))
+      tok = attribute_list(tok->next, NULL, NULL);
+
+    VarScope *vs = push_scope(name);
+    vs->enum_ty  = ty;
+    vs->enum_val = val++;
+    (void)name_tok;
+  }
+  *rest = skip(tok, "}");
+
+  if (tag)
+    push_tag_scope(tag, ty);
+  return ty;
 }
 
 static Type *typeof_specifier(Token **rest, Token *tok) {
