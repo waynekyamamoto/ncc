@@ -2527,21 +2527,27 @@ static int64_t const_expr_val(Token **rest, Token *tok) {
 
 
 // cast — 04b §F.  Disambiguate `( typename )`:
-//   - followed by `{` → compound literal (deferred).
+//   - followed by `{` → compound literal — defer to unary so
+//     postfix's prologue handles it.
 //   - otherwise → cast: parse cast operand, wrap in ND_CAST.
-//   - `( expr )` → fall through to unary→postfix→primary's parens.
+//   - `( expr )` → fall through to unary.
 static Node *cast(Token **rest, Token *tok) {
   if (equal(tok, "(") && is_typename(tok->next)) {
-    Token *open = tok;
+    // Two-token-lookahead disambiguator: peek past the closing `)`
+    // to see if this is a compound literal.  If so, return the
+    // original tok (untouched) to unary so postfix can re-parse.
+    Token *probe = tok->next;
+    Type *throwaway = NULL;
+    (void)throwaway;
+    Token *after_type;
+    typename_(&after_type, probe);
+    if (equal(after_type, ")") && equal(after_type->next, "{")) {
+      return unary(rest, tok);
+    }
+
+    // True cast.
     Type *ty = typename_(&tok, tok->next);
     tok = skip(tok, ")");
-    if (equal(tok, "{")) {
-      // Compound literal — deferred.  Fall back to a unary parse on
-      // the original `(` so primary handles the brace... actually
-      // primary doesn't handle `{` either.  Surface a clear error
-      // until compound-literal lands.
-      error_tok(open, "parse_v2: compound literals not yet implemented");
-    }
     Node *operand = cast(rest, tok);
     Node *node = new_cast(operand, ty);
     add_type(node);
