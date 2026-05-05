@@ -362,3 +362,74 @@ The bootstrap md5 differs from `phase-2-closed`'s because the canonical `type.c`
 - 3 of 6 phases done: Phase 1 (tokenize.c), Phase 2 (preprocess.c), Phase 3 (type.c).
 - Spec-derived: tokenize.c (679) + preprocess.c (1817) + type.c (499) = 2995 lines (~22% of src/).
 - Remaining chibicc-lineage: parse.c (6136), codegen_arm64.c (2829), main.c (547), cc.h (567), alloc.c (37), unicode.c (84), hashmap.c (105) = 10305 lines.
+
+---
+
+## Phase 4 autonomous session — 2026-05-05 (03:22–05:00 PDT)
+
+Working session on `swap-out` branch.  46 commits, all pushed
+after each green slice (per the durable feedback rule about
+concurrent sessions).  Bootstrap fixed point on canonical ncc
+preserved at `ef9e8d896f7affbc971bd9820af41124` throughout.
+
+**State on session start** (`3cd1e16`):
+- parse_v2.c at 886 lines.  Spine + declspec + declarator + global_variable for `int x;`-style only.
+- Most expr/stmt/init machinery still stubbed.
+- Empty function bodies, no expression operators, no control flow.
+
+**State on session end** (`9c5cdaa`):
+- parse_v2.c at 4001 lines (65% of canonical parse.c at 6136).
+- Torture pass rate: **881 / 995 (88.5%)** vs canonical 986/995 (99.1%).
+- All 9 ncc source files compile through ncc-v2 — including
+  parse_v2.c compiling itself.  `ncc-v2 → /tmp/v2-pure/ncc` is a
+  working compiler that runs simple programs end-to-end.
+
+**Surface added** (organized by spec section):
+
+04a (declarations):
+- §B (declspec): _Alignas; typeof family.
+- §C/§D (declarator/array): array_dimensions full subset, multi-dim, [static], qualifiers, VLA scaffold.
+- §E (function prototypes): func_params normal list + parameter type adjustments + variadic; K&R-style param decls in function bodies.
+- §F (struct/union/enum): bodies, layout (with packed + bitfields per §F.5), self-referential structs, anonymous members, enum_specifier full, _Static_assert at file and block scope.
+- §G (attribute_list): real impl with packed/aligned/vector_size/mode/alias honored, parsed-and-ignored set consumed.
+- §H (declaration): scalar/array/string/struct/brace local init, designators, static-local lift to anon gvar, extern.
+- §I (parse top-level): K&R routing, C89 implicit-int rule, parse_typedef.
+
+04b (expressions):
+- Full operator ladder: comma, assign + compound (via to_assign), conditional, logor/logand, bitwise, equality, relational, shift, additive (with new_add/new_sub pointer arith), multiplicative, cast, unary, postfix.
+- unary: +, -, &, *, !, ~, sizeof (both forms), _Alignof, pre-inc/dec, __real__, __imag__, &&label.
+- postfix: [i], (call), .field, ->field, ++/-- with new_inc_dec lowering, compound literal at head (local).
+- primary: parens, GNU stmt-expr, _Generic, TK_NUM, TK_STR, IDENT, __func__, implicit function decl.
+- new_cast real ND_CAST emission.
+- try_eval_node / eval_node integer-only fold (full operator set per §K.1) + pointer-cast pass-through.
+- const_expr_val helper.
+- Builtins: __builtin_expect, constant_p, types_compatible_p, unreachable, va_start/end/copy/arg, offsetof, alloca, frame_address, return_address, *_overflow, clz/ctz/ffs/popcount/parity/clrsb/bswap32/64 (with l/ll suffix variants).
+
+04c (statements):
+- compound_stmt with declaration vs stmt dispatch, _Static_assert routing.
+- stmt: return, if/else, while, do, for, switch/case/default, break, continue, goto (direct + computed `goto *expr`), label, asm (template-only skeleton), expr-stmt, empty.
+- function() definition with per-fn state save/restore, parameter scope, alloca/va_area infra, body via compound_stmt, K&R param-decl section, label resolution (including ND_LABEL_VAL case).
+
+04d (initializers):
+- Local: scalar, brace for arrays of scalars, struct member-by-member with `.name` designators, char-array string init, incomplete-length resolution.
+- Global: extracted into parse_gvar_initializer; handles char[] string, char* anon-string, integer-array, pointer-array (string and addr-of variants), struct (with member-char-array + designators), union, array-of-struct.
+- Compound literal: at head of postfix (local) and at file scope (struct + integer-array, with relocations for &-of-gvar).
+
+**Self-host status:**
+- ncc-v2 compiles every src/*.c file including parse_v2.c itself.
+- Linking yields a working `ncc` (`/tmp/v2-pure/ncc`).
+- Stage-2 build (the v2-built ncc compiling sources for stage-3) currently SIGBUSes inside `scan_pp_num_v2` on non-trivial input — code-gen mismatch vs canonical at scale.  Trivial programs work; the bug is scale-dependent.  **Open** for the next session — fixed-point bootstrap is gated on this.
+
+**Open work for swap-in:**
+- Stage-2 SIGBUS investigation.
+- Nested function definitions (compound_stmt §B.4 hint).
+- `__label__` local label declarations.
+- Array-of-struct nested-brace local init.
+- File-scope union and array-of-array gvar init.
+- ASM operands (currently template-only).
+- Float fold in eval_node (eval_double).
+- Anonymous-member case in find_member's general traversal (currently only struct_ref's recursion handles it).
+- Q14 regression tests (deferred; see project_phase4_plan).
+
+Session checkpoint commit: `9c5cdaa`.
+
