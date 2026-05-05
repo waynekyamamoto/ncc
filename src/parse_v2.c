@@ -106,6 +106,7 @@ static Node *declaration(Token **rest, Token *tok, Type *basety, VarAttr *attr);
 static Node *new_var_node(Obj *var, Token *tok);
 static Node *to_assign(Node *binary);
 static Node *new_inc_dec(Node *node, Token *tok, int addend);
+static int64_t const_expr_val(Token **rest, Token *tok);
 static Node *expr(Token **rest, Token *tok);
 static Node *assign(Token **rest, Token *tok);
 static Node *cond_expr(Token **rest, Token *tok);
@@ -1329,6 +1330,70 @@ static Node *stmt(Token **rest, Token *tok) {
     return node;
   }
 
+  // switch (cond) stmt (04c §C.2).
+  if (equal(tok, "switch")) {
+    Token *sw_tok = tok;
+    tok = skip(tok->next, "(");
+    Node *cond_n = expr(&tok, tok);
+    tok = skip(tok, ")");
+
+    Node *node = new_node(ND_SWITCH, sw_tok);
+    node->cond = cond_n;
+    node->unique_label = new_unique_name();
+
+    Node *saved_switch = current_switch;
+    char *saved_brk = brk_label;
+    current_switch = node;
+    brk_label = node->unique_label;
+    node->then = stmt(&tok, tok);
+    current_switch = saved_switch;
+    brk_label = saved_brk;
+
+    *rest = tok;
+    return node;
+  }
+
+  // case CONST [...CONST] : stmt (04c §C.3).
+  if (equal(tok, "case")) {
+    if (!current_switch)
+      error_tok(tok, "stray case");
+    Token *case_tok = tok;
+    int64_t begin = const_expr_val(&tok, tok->next);
+    int64_t end = begin;
+    if (equal(tok, "...")) {
+      end = const_expr_val(&tok, tok->next);
+    }
+    tok = skip(tok, ":");
+
+    Node *node = new_node(ND_CASE, case_tok);
+    node->label = new_unique_name();
+    node->begin = (long)begin;
+    node->end = (long)end;
+    node->lhs = stmt(&tok, tok);
+
+    node->case_next = current_switch->case_next;
+    current_switch->case_next = node;
+
+    *rest = tok;
+    return node;
+  }
+
+  // default : stmt (04c §C.3).
+  if (equal(tok, "default")) {
+    if (!current_switch)
+      error_tok(tok, "stray default");
+    Token *def_tok = tok;
+    tok = skip(tok->next, ":");
+
+    Node *node = new_node(ND_CASE, def_tok);
+    node->label = new_unique_name();
+    node->lhs = stmt(&tok, tok);
+    current_switch->default_case = node;
+
+    *rest = tok;
+    return node;
+  }
+
   // goto IDENT ; (04c §E.1, direct form).
   if (equal(tok, "goto")) {
     if (tok->next->kind != TK_IDENT)
@@ -1844,6 +1909,15 @@ static Type *typename_(Token **rest, Token *tok) {
   ty = declarator(&tok, tok, ty);
   *rest = tok;
   return ty;
+}
+
+// const_expr_val — parse a cond_expr and fold (04b §K).
+static int64_t const_expr_val(Token **rest, Token *tok) {
+  Node *node = cond_expr(&tok, tok);
+  add_type(node);
+  int64_t v = eval_node(node);
+  *rest = tok;
+  return v;
 }
 
 
