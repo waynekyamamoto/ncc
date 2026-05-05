@@ -931,9 +931,21 @@ static Type *enum_specifier(Token **rest, Token *tok) {
   return ty;
 }
 
+// typeof_specifier — `typeof` / `__typeof` / `__typeof__` keyword
+// is `tok`.  04a §B.7.  Form: `typeof ( type-name | expr )`.
 static Type *typeof_specifier(Token **rest, Token *tok) {
-  (void)rest;
-  error_tok(tok, "parse_v2: typeof not yet implemented");
+  tok = tok->next;  // consume the keyword
+  tok = skip(tok, "(");
+  Type *ty;
+  if (is_typename(tok)) {
+    ty = typename_(&tok, tok);
+  } else {
+    Node *e = expr(&tok, tok);
+    add_type(e);
+    ty = e->ty ? e->ty : ty_int;
+  }
+  *rest = skip(tok, ")");
+  return ty;
 }
 
 static Type *atomic_specifier(Token **rest, Token *tok) {
@@ -2510,6 +2522,17 @@ static Obj *new_anon_gvar(Type *ty) {
 //   6. TK_NUM
 //   8. IDENT (variable / enum constant; calls handled later via postfix)
 static Node *primary(Token **rest, Token *tok) {
+  // GNU statement expression: ( { stmt-list } ).  The value is the
+  // last expression-statement's value.  04c §G + 04b §H.4 step 2.
+  if (equal(tok, "(") && equal(tok->next, "{")) {
+    Token *open = tok;
+    Node *body = compound_stmt(&tok, tok->next->next);
+    Node *node = new_node(ND_STMT_EXPR, open);
+    node->body = body->body;
+    *rest = skip(tok, ")");
+    return node;
+  }
+
   // ( expr )
   if (equal(tok, "(")) {
     Node *node = expr(&tok, tok->next);
