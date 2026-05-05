@@ -2655,11 +2655,81 @@ static Node *primary(Token **rest, Token *tok) {
     return node;
   }
 
-  // Identifier — variable reference or enum constant.
+  // Identifier — first dispatch known builtins, then fall through
+  // to var/enum/implicit-call lookup.
   if (tok->kind == TK_IDENT) {
+    // __builtin_expect(expr, c)  — returns expr.
+    if (tok_name_eq(tok, "__builtin_expect")) {
+      Token *bi = tok;
+      tok = skip(tok->next, "(");
+      Node *first = assign(&tok, tok);
+      tok = skip(tok, ",");
+      // Discard the hint expression value.
+      assign(&tok, tok);
+      tok = skip(tok, ")");
+      *rest = tok;
+      add_type(first);
+      (void)bi;
+      return first;
+    }
+
+    // __builtin_constant_p(expr) — folds to 1 if try_eval_node
+    // succeeds on the operand, else 0.  04b §M.2.
+    if (tok_name_eq(tok, "__builtin_constant_p")) {
+      Token *bi = tok;
+      tok = skip(tok->next, "(");
+      Node *e = assign(&tok, tok);
+      add_type(e);
+      tok = skip(tok, ")");
+      int64_t v;
+      Node *node = new_num(try_eval_node(e, &v) ? 1 : 0, bi);
+      *rest = tok;
+      return node;
+    }
+
+    // __builtin_types_compatible_p(t1, t2) — folds to 1 iff the two
+    // types are compatible.  Approximation: same kind + same size.
+    if (tok_name_eq(tok, "__builtin_types_compatible_p")) {
+      Token *bi = tok;
+      tok = skip(tok->next, "(");
+      Type *t1 = typename_(&tok, tok);
+      tok = skip(tok, ",");
+      Type *t2 = typename_(&tok, tok);
+      tok = skip(tok, ")");
+      int compat = (t1->kind == t2->kind && t1->size == t2->size);
+      Node *node = new_num(compat, bi);
+      *rest = tok;
+      return node;
+    }
+
+    // __builtin_unreachable() — emit a return of 0 (parser-only
+    // approximation; codegen has no unreachable hint of its own).
+    if (tok_name_eq(tok, "__builtin_unreachable")) {
+      Token *bi = tok;
+      tok = skip(tok->next, "(");
+      tok = skip(tok, ")");
+      *rest = tok;
+      return new_num(0, bi);
+    }
+
     VarScope *vs = find_var(tok);
-    if (!vs || (!vs->var && !vs->enum_ty))
+    if (!vs || (!vs->var && !vs->enum_ty)) {
+      // Implicit-function declaration (04b §H.5): if next is `(`,
+      // synthesize a variadic int-returning function so the funcall
+      // path in postfix can take it.
+      if (equal(tok->next, "(")) {
+        char *name = strndup_checked(tok->loc, tok->len);
+        Type *fn_ty = func_type(ty_int);
+        fn_ty->is_variadic = true;
+        Obj *fn = new_gvar(name, fn_ty);
+        fn->is_function = true;
+        fn->is_definition = false;
+        Node *node = new_var_node(fn, tok);
+        *rest = tok->next;
+        return node;
+      }
       error_tok(tok, "undefined variable");
+    }
     Node *node;
     if (vs->var)
       node = new_var_node(vs->var, tok);
