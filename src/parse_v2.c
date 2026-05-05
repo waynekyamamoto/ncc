@@ -104,6 +104,8 @@ static Node *current_switch;
 //
 static Node *declaration(Token **rest, Token *tok, Type *basety, VarAttr *attr);
 static Node *new_var_node(Obj *var, Token *tok);
+static Node *to_assign(Node *binary);
+static Node *new_inc_dec(Node *node, Token *tok, int addend);
 static Node *expr(Token **rest, Token *tok);
 static Node *assign(Token **rest, Token *tok);
 static Node *cond_expr(Token **rest, Token *tok);
@@ -1506,17 +1508,51 @@ static Node *expr(Token **rest, Token *tok) {
   return node;
 }
 
-// assign → cond_expr (= assign)?
+// assign → cond_expr ( = assign | op= assign )?
 //
-// Compound-assignment operators are deferred until `to_assign`
-// lowering lands; only plain `=` is wired here.
+// Compound assignment per 04b §C.5: build a binary in the chosen
+// kind and lower via to_assign.  Vector/complex/bitfield variants
+// (§C.2/§C.3/§C.4) deferred — currently only the scalar to_assign
+// path is wired.
 static Node *assign(Token **rest, Token *tok) {
   Node *node = cond_expr(&tok, tok);
+
   if (equal(tok, "=")) {
+    Token *eq = tok;
     Node *rhs = assign(&tok, tok->next);
     *rest = tok;
-    return new_binary(ND_ASSIGN, node, rhs, tok);
+    return new_binary(ND_ASSIGN, node, rhs, eq);
   }
+
+  // Compound assignment: pick the kind, build, lower.
+  static const struct { const char *op; NodeKind kind; } cops[] = {
+    {"+=",  ND_ADD},
+    {"-=",  ND_SUB},
+    {"*=",  ND_MUL},
+    {"/=",  ND_DIV},
+    {"%=",  ND_MOD},
+    {"&=",  ND_BITAND},
+    {"|=",  ND_BITOR},
+    {"^=",  ND_BITXOR},
+    {"<<=", ND_SHL},
+    {">>=", ND_SHR},
+  };
+  for (size_t i = 0; i < sizeof(cops) / sizeof(*cops); i++) {
+    if (equal(tok, cops[i].op)) {
+      Token *op = tok;
+      Node *rhs = assign(&tok, tok->next);
+      Node *binary;
+      if (cops[i].kind == ND_ADD)
+        binary = new_add(node, rhs, op);
+      else if (cops[i].kind == ND_SUB)
+        binary = new_sub(node, rhs, op);
+      else
+        binary = new_binary(cops[i].kind, node, rhs, op);
+      *rest = tok;
+      return to_assign(binary);
+    }
+  }
+
   *rest = tok;
   return node;
 }
@@ -1694,6 +1730,73 @@ static Node *mul(Token **rest, Token *tok) {
   return node;
 }
 
+// to_assign — lower a compound-assign-style binary into an
+// address-stash + indirect-update comma chain (04b §C.5):
+//   binary  = lhs op rhs                  (input)
+//   result  = (tmp = &lhs, *tmp = *tmp op rhs)
+// Pointer arithmetic in `binary` is already scaled (caller used
+// new_add / new_sub when applicable), so `new_binary(binary->kind,
+// *tmp, rhs)` is correct for both numeric and ptr+int.
+static Node *to_assign(Node *binary) {
+  add_type(binary->lhs);
+  add_type(binary->rhs);
+  Token *tok = binary->tok;
+
+  Obj *tmp = new_lvar(new_unique_name(), pointer_to(binary->lhs->ty));
+
+  Node *tmp_ref1 = new_var_node(tmp, tok);
+  Node *addr = new_unary(ND_ADDR, binary->lhs, tok);
+  Node *expr1 = new_binary(ND_ASSIGN, tmp_ref1, addr, tok);
+
+  Node *tmp_ref2 = new_var_node(tmp, tok);
+  Node *deref_l = new_unary(ND_DEREF, tmp_ref2, tok);
+  Node *tmp_ref3 = new_var_node(tmp, tok);
+  Node *deref_r = new_unary(ND_DEREF, tmp_ref3, tok);
+  Node *op_node;
+  if (binary->kind == ND_ADD)
+    op_node = new_add(deref_r, binary->rhs, tok);
+  else if (binary->kind == ND_SUB)
+    op_node = new_sub(deref_r, binary->rhs, tok);
+  else
+    op_node = new_binary(binary->kind, deref_r, binary->rhs, tok);
+  Node *expr2 = new_binary(ND_ASSIGN, deref_l, op_node, tok);
+
+  return new_binary(ND_COMMA, expr1, expr2, tok);
+}
+
+// new_inc_dec — post-inc/dec lowering (04b §H.3, non-bitfield):
+//   (tmp = &x, old = *tmp, *tmp = *tmp + addend, old)
+// addend is +1 / -1 (encoded as int, scaled by new_add for ptr).
+static Node *new_inc_dec(Node *node, Token *tok, int addend) {
+  add_type(node);
+  Obj *tmp = new_lvar(new_unique_name(), pointer_to(node->ty));
+  Obj *old = new_lvar(new_unique_name(), node->ty);
+
+  Node *tmp1 = new_var_node(tmp, tok);
+  Node *addr = new_unary(ND_ADDR, node, tok);
+  Node *e1 = new_binary(ND_ASSIGN, tmp1, addr, tok);
+
+  Node *tmp2 = new_var_node(tmp, tok);
+  Node *deref1 = new_unary(ND_DEREF, tmp2, tok);
+  Node *old_ref = new_var_node(old, tok);
+  Node *e2 = new_binary(ND_ASSIGN, old_ref, deref1, tok);
+
+  Node *tmp3 = new_var_node(tmp, tok);
+  Node *deref_l = new_unary(ND_DEREF, tmp3, tok);
+  Node *tmp4 = new_var_node(tmp, tok);
+  Node *deref_r = new_unary(ND_DEREF, tmp4, tok);
+  Node *delta = new_num(addend, tok);
+  Node *sum = new_add(deref_r, delta, tok);
+  Node *e3 = new_binary(ND_ASSIGN, deref_l, sum, tok);
+
+  Node *result = new_var_node(old, tok);
+  // Chain: (e1, (e2, (e3, result)))
+  Node *t = new_binary(ND_COMMA, e3, result, tok);
+  t = new_binary(ND_COMMA, e2, t, tok);
+  t = new_binary(ND_COMMA, e1, t, tok);
+  return t;
+}
+
 // new_ulong — convenience for sizeof / _Alignof results.
 static Node *new_ulong(uint64_t val, Token *tok) {
   Node *node = new_num((int64_t)val, tok);
@@ -1779,6 +1882,18 @@ static Node *unary(Token **rest, Token *tok) {
     return new_unary(ND_BITNOT, operand, op);
   }
 
+  // §G.8 — pre-inc/dec: ++x  /  --x.
+  // For non-bitfield: to_assign(new_add(x, ±1)).  Bitfield path
+  // deferred until struct support lands.
+  if (equal(tok, "++") || equal(tok, "--")) {
+    Token *op = tok;
+    int addend = equal(tok, "++") ? 1 : -1;
+    Node *operand = unary(rest, tok->next);
+    Node *delta = new_num(addend, op);
+    Node *sum = new_add(operand, delta, op);
+    return to_assign(sum);
+  }
+
   // §G.10 — sizeof.  Both forms.
   if (equal(tok, "sizeof")) {
     Token *op = tok;
@@ -1814,6 +1929,16 @@ static Node *postfix(Token **rest, Token *tok) {
       Node *sum = new_add(node, idx, op);
       node = new_unary(ND_DEREF, sum, op);
       add_type(node);
+      continue;
+    }
+
+    // ++ / -- (post-inc/dec).  04b §H.3 lowering — comma chain
+    // returning the original value.
+    if (equal(tok, "++") || equal(tok, "--")) {
+      Token *op = tok;
+      int addend = equal(tok, "++") ? 1 : -1;
+      node = new_inc_dec(node, op, addend);
+      tok = tok->next;
       continue;
     }
 
