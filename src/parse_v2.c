@@ -108,6 +108,7 @@ static Node *to_assign(Node *binary);
 static Node *new_inc_dec(Node *node, Token *tok, int addend);
 static Node *new_add(Node *lhs, Node *rhs, Token *tok);
 static Node *new_sub(Node *lhs, Node *rhs, Token *tok);
+static Obj *new_anon_gvar(Type *ty);
 static int64_t const_expr_val(Token **rest, Token *tok);
 static Type *typename_(Token **rest, Token *tok);
 static Node *expr(Token **rest, Token *tok);
@@ -1478,7 +1479,87 @@ static Token *global_variable(Token *tok, Type *basety, Type *first_ty,
       tok = attribute_list(tok->next, var->ty, attr);
 
     if (equal(tok, "=")) {
-      error_tok(tok, "parse_v2: global initializer not yet implemented");
+      Token *eq = tok;
+      tok = tok->next;
+
+      // Scalar string init for char[]: `char s[] = "...";`
+      if (tok->kind == TK_STR && var->ty->kind == TY_ARRAY &&
+          var->ty->base->kind == TY_CHAR) {
+        long s = tok->ty->array_len;
+        if (var->ty->array_len < 0) {
+          var->ty = array_of(var->ty->base, s);
+          var->align = var->ty->align;
+        }
+        long n = var->ty->array_len < s ? var->ty->array_len : s;
+        char *buf = calloc_checked(1, var->ty->size);
+        for (long i = 0; i < n; i++) buf[i] = tok->str[i];
+        var->init_data = buf;
+        var->init_data_size = var->ty->size;
+        tok = tok->next;
+        (void)eq;
+      }
+      // Pointer to string literal: `char *p = "hi";`
+      else if (tok->kind == TK_STR && var->ty->kind == TY_PTR &&
+               var->ty->base->kind == TY_CHAR) {
+        Obj *anon = new_anon_gvar(tok->ty);
+        anon->init_data = tok->str;
+        anon->init_data_size = tok->ty->size;
+        // Relocate pointer-sized slot at offset 0 to anon's name.
+        Relocation *r = calloc_checked(1, sizeof(Relocation));
+        r->offset = 0;
+        r->label = &anon->name;
+        r->addend = 0;
+        var->rel = r;
+        var->init_data = calloc_checked(1, var->ty->size);
+        var->init_data_size = var->ty->size;
+        tok = tok->next;
+      }
+      // Brace init for arrays of scalar constants — fold each
+      // expression and pack into init_data.
+      else if (equal(tok, "{") && var->ty->kind == TY_ARRAY &&
+               is_integer(var->ty->base)) {
+        tok = tok->next;
+        long elem_sz = var->ty->base->size;
+        long count = 0;
+        // First pass — parse elements into a stack buffer (cap 1024).
+        int64_t vals[1024];
+        bool first2 = true;
+        while (!equal(tok, "}")) {
+          if (!first2) tok = skip(tok, ",");
+          first2 = false;
+          if (equal(tok, "}")) break;
+          if (count >= 1024)
+            error_tok(tok, "too many initializer elements (cap 1024)");
+          int64_t v = const_expr_val(&tok, tok);
+          vals[count++] = v;
+        }
+        tok = skip(tok, "}");
+        if (var->ty->array_len < 0) {
+          var->ty = array_of(var->ty->base, count);
+          var->align = var->ty->align;
+        }
+        long sz = var->ty->size;
+        char *buf = calloc_checked(1, sz);
+        for (long i = 0; i < count && i * elem_sz < sz; i++) {
+          int64_t v = vals[i];
+          for (int b = 0; b < elem_sz; b++)
+            buf[i * elem_sz + b] = (v >> (b * 8)) & 0xff;
+        }
+        var->init_data = buf;
+        var->init_data_size = sz;
+      }
+      // Scalar `T x = const-expr;` — fold and pack bytes.
+      else if (is_integer(var->ty) || var->ty->kind == TY_PTR) {
+        int64_t v = const_expr_val(&tok, tok);
+        long sz = var->ty->size;
+        char *buf = calloc_checked(1, sz);
+        for (long b = 0; b < sz; b++)
+          buf[b] = (v >> (b * 8)) & 0xff;
+        var->init_data = buf;
+        var->init_data_size = sz;
+      } else {
+        error_tok(eq, "parse_v2: this global initializer form not yet implemented");
+      }
     }
 
     if (equal(tok, ",")) { tok = tok->next; continue; }
