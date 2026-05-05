@@ -429,3 +429,35 @@ incremental, Q16 should follow.
 The big decisions are **Q1, Q2, Q3** — they shape everything that
 follows.  Once those are settled, the rest is mostly preserve-
 existing-contract.
+
+---
+
+## F. Resolutions (2026-05-04)
+
+All sixteen questions resolved by Wayne in interactive Q&A.
+
+| Q | Resolution | Match recommendation? |
+|---|---|---|
+| Q1 | **B** — multi-file spec (top-level + 04a/04b/04c/04d sub-chunks) | yes |
+| Q2 | **C** — top-level + first sub-chunk drafted together, then any-order | yes |
+| Q3 | **A** — single big-bang swap-in via parse_v2.c | yes |
+| Q4 | **A** — Node-shape preservation; bootstrap fixed-point as gate | yes |
+| Q5 | **A** — exhaustive is_typename keyword enumeration in spec | yes |
+| Q6 | **A** — eval_node fold scope preserved exactly | yes |
+| Q7 | **A** — complex/vector parse-time lowering preserved | yes |
+| Q8 | **A** — VLA hidden-local insertion point defined explicitly | yes |
+| Q9 | **A** — bootstrap fixed-point + full corpus as closure gate | yes |
+| Q10 | **A** — nested fn parse path preserved (runtime is Phase 5) | yes |
+| Q11 | **A** — C11 §6.7.9 cite + 2–3 worked examples | yes |
+| Q12 | **A** — explicit HONORED / PARSED-AND-IGNORED / REJECTED table | yes |
+| Q13 | **A** — port ff529fb fix during Phase 4 (parser fix in parser phase) | yes |
+| Q14 | **A, B, C, D, E, F** — all six new regression tests | **expanded** (recommendation was B,C,D,F) |
+| Q15 | **B** — Phase 5 prereqs section at end of spec | yes |
+| Q16 | **A** — single phase-4-closed tag (consistent with Q3.A) | yes |
+
+The only redirect is Q14 (six tests instead of four).  Every other
+recommendation accepted as proposed.
+
+These resolutions are the source of truth for spec authoring.
+Subsequent docs (`04_parse.md`, `04a_decl.md`, etc.) cite question
+numbers when invoking a baked-in decision.
