@@ -1021,11 +1021,44 @@ static Type *func_params(Token **rest, Token *tok, Type *ty) {
   return fn;
 }
 
-// array_dimensions — stub.  §D detail (constant vs VLA, leading
-// qualifiers, multi-dimensional) requires expression parsing.
+// array_dimensions — `[` already consumed.  Subset:
+//   [ ]              → array_of(rest_ty, -1)
+//   [ const-expr ]   → array_of(rest_ty, val)
+//   [ runtime-expr ] → vla_of (recorded; runtime emission is
+//                      compute_vla_size's job, deferred).
+// Leading [static] and qualifiers are consumed for compatibility
+// (ncc does not enforce their semantics).
 static Type *array_dimensions(Token **rest, Token *tok, Type *ty) {
-  (void)rest; (void)ty;
-  error_tok(tok, "parse_v2: array_dimensions not yet implemented");
+  // §D.1 — leading qualifiers and `static`.
+  while (equal(tok, "static") || equal(tok, "const") ||
+         equal(tok, "volatile") || equal(tok, "restrict") ||
+         equal(tok, "__restrict") || equal(tok, "__restrict__"))
+    tok = tok->next;
+
+  // §D.2 — empty `[]`.
+  if (equal(tok, "]")) {
+    Type *rest_ty = type_suffix(rest, tok->next, ty);
+    return array_of(rest_ty, -1);
+  }
+
+  // §D.3 / §D.4 — dimension expression.  Constant test reuses
+  // try_eval_node directly (more permissive than the spec's
+  // structural test, but functionally equivalent for the corpus we
+  // can compile right now).  When const_expr_val'd init folds fail,
+  // fall back to vla_of.
+  Token *dim_start = tok;
+  Node *expr_n = cond_expr(&tok, tok);
+  add_type(expr_n);
+  tok = skip(tok, "]");
+  Type *rest_ty = type_suffix(rest, tok, ty);
+
+  int64_t len;
+  if (try_eval_node(expr_n, &len))
+    return array_of(rest_ty, (long)len);
+
+  Type *vla = vla_of(rest_ty, expr_n);
+  vla->vla_dim_tok = dim_start;
+  return vla;
 }
 
 //
