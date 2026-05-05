@@ -2329,13 +2329,24 @@ static Node *declaration(Token **rest, Token *tok, Type *basety, VarAttr *attr) 
             ty = var->ty;
           }
         } else if (ty->kind == TY_STRUCT) {
-          // Struct brace init — member-by-member.
+          // Struct brace init — member-by-member.  Supports the
+          // `.name = expr` designator form.
           Member *m = ty->members;
           bool first2 = true;
           while (!equal(tok, "}")) {
             if (!first2) tok = skip(tok, ",");
             first2 = false;
             if (equal(tok, "}")) break;
+            if (equal(tok, ".")) {
+              tok = tok->next;
+              if (tok->kind != TK_IDENT)
+                error_tok(tok, "expected member name after `.`");
+              Member *target = find_member(ty, tok);
+              if (!target)
+                error_tok(tok, "no such member");
+              tok = skip(tok->next, "=");
+              m = target;
+            }
             if (!m)
               error_tok(tok, "excess elements in struct initializer");
             if (equal(tok, "{"))
@@ -3380,7 +3391,11 @@ static Node *primary(Token **rest, Token *tok) {
       {"__builtin_popcountl",   ND_BUILTIN_POPCOUNT,   true },
       {"__builtin_popcountll",  ND_BUILTIN_POPCOUNT,   true },
       {"__builtin_parity",      ND_BUILTIN_PARITY,     false},
+      {"__builtin_parityl",     ND_BUILTIN_PARITY,     true },
+      {"__builtin_parityll",    ND_BUILTIN_PARITY,     true },
       {"__builtin_clrsb",       ND_BUILTIN_CLRSB,      false},
+      {"__builtin_clrsbl",      ND_BUILTIN_CLRSB,      true },
+      {"__builtin_clrsbll",     ND_BUILTIN_CLRSB,      true },
       {"__builtin_bswap32",     ND_BUILTIN_BSWAP32,    false},
       {"__builtin_bswap64",     ND_BUILTIN_BSWAP64,    true },
     };
