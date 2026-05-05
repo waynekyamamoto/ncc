@@ -1554,6 +1554,143 @@ static Type *array_dimensions(Token **rest, Token *tok, Type *ty) {
 // `int x = 5;` will hit the error_tok arm.
 //
 
+// parse_gvar_initializer — consumes `= initializer` for an Obj that
+// already lives in the globals chain.  Subset (matches the spec's
+// gvar paths in 04d):
+//   - char[] = "literal":   bytes copied; incomplete len resolved.
+//   - char *p = "literal":  anon gvar + Relocation.
+//   - T arr[] of integer = { c1, c2, ... }: packed bytes.
+//   - T arr[] of pointer = { "s1", "s2", 0, ... }: string anon
+//     gvars + relocations + zero slots.
+//   - scalar T x = const-expr: folded little-endian bytes.
+// Other forms surface "this global initializer form not yet
+// implemented" diagnostics.
+static Token *parse_gvar_initializer(Token *tok, Obj *var) {
+  Token *eq = tok;
+  tok = tok->next;
+
+  if (tok->kind == TK_STR && var->ty->kind == TY_ARRAY &&
+      var->ty->base->kind == TY_CHAR) {
+    long s = tok->ty->array_len;
+    if (var->ty->array_len < 0) {
+      var->ty = array_of(var->ty->base, s);
+      var->align = var->ty->align;
+    }
+    long n = var->ty->array_len < s ? var->ty->array_len : s;
+    char *buf = calloc_checked(1, var->ty->size);
+    for (long i = 0; i < n; i++) buf[i] = tok->str[i];
+    var->init_data = buf;
+    var->init_data_size = var->ty->size;
+    return tok->next;
+  }
+  if (tok->kind == TK_STR && var->ty->kind == TY_PTR &&
+      var->ty->base->kind == TY_CHAR) {
+    Obj *anon = new_anon_gvar(tok->ty);
+    anon->init_data = tok->str;
+    anon->init_data_size = tok->ty->size;
+    Relocation *r = calloc_checked(1, sizeof(Relocation));
+    r->offset = 0;
+    r->label = &anon->name;
+    var->rel = r;
+    var->init_data = calloc_checked(1, var->ty->size);
+    var->init_data_size = var->ty->size;
+    return tok->next;
+  }
+  if (equal(tok, "{") && var->ty->kind == TY_ARRAY &&
+      var->ty->base->kind == TY_PTR) {
+    tok = tok->next;
+    long elem_sz = var->ty->base->size;
+    long count = 0;
+    long max_elems = 4096;
+    int64_t *vals = calloc_checked(max_elems, sizeof(int64_t));
+    char **rels = calloc_checked(max_elems, sizeof(char *));
+    bool first2 = true;
+    while (!equal(tok, "}")) {
+      if (!first2) tok = skip(tok, ",");
+      first2 = false;
+      if (equal(tok, "}")) break;
+      if (count >= max_elems) error_tok(tok, "too many initializer elements");
+      if (tok->kind == TK_STR) {
+        Obj *anon = new_anon_gvar(tok->ty);
+        anon->init_data = tok->str;
+        anon->init_data_size = tok->ty->size;
+        rels[count] = anon->name;
+        tok = tok->next;
+      } else {
+        vals[count] = const_expr_val(&tok, tok);
+      }
+      count++;
+    }
+    tok = skip(tok, "}");
+    if (var->ty->array_len < 0) {
+      var->ty = array_of(var->ty->base, count);
+      var->align = var->ty->align;
+    }
+    long sz = var->ty->size;
+    char *buf = calloc_checked(1, sz);
+    Relocation rh = {0};
+    Relocation *rcur = &rh;
+    for (long i = 0; i < count && i * elem_sz < sz; i++) {
+      if (rels[i]) {
+        Relocation *r = calloc_checked(1, sizeof(Relocation));
+        r->offset = (int)(i * elem_sz);
+        for (Obj *o = globals; o; o = o->next) {
+          if (!strcmp(o->name, rels[i])) { r->label = &o->name; break; }
+        }
+        rcur = rcur->next = r;
+      } else {
+        int64_t v = vals[i];
+        for (int b = 0; b < elem_sz; b++)
+          buf[i * elem_sz + b] = (v >> (b * 8)) & 0xff;
+      }
+    }
+    var->init_data = buf;
+    var->init_data_size = sz;
+    var->rel = rh.next;
+    return tok;
+  }
+  if (equal(tok, "{") && var->ty->kind == TY_ARRAY && is_integer(var->ty->base)) {
+    tok = tok->next;
+    long elem_sz = var->ty->base->size;
+    long count = 0;
+    int64_t vals[1024];
+    bool first2 = true;
+    while (!equal(tok, "}")) {
+      if (!first2) tok = skip(tok, ",");
+      first2 = false;
+      if (equal(tok, "}")) break;
+      if (count >= 1024) error_tok(tok, "too many initializer elements (cap 1024)");
+      vals[count++] = const_expr_val(&tok, tok);
+    }
+    tok = skip(tok, "}");
+    if (var->ty->array_len < 0) {
+      var->ty = array_of(var->ty->base, count);
+      var->align = var->ty->align;
+    }
+    long sz = var->ty->size;
+    char *buf = calloc_checked(1, sz);
+    for (long i = 0; i < count && i * elem_sz < sz; i++) {
+      int64_t v = vals[i];
+      for (int b = 0; b < elem_sz; b++)
+        buf[i * elem_sz + b] = (v >> (b * 8)) & 0xff;
+    }
+    var->init_data = buf;
+    var->init_data_size = sz;
+    return tok;
+  }
+  if (is_integer(var->ty) || var->ty->kind == TY_PTR) {
+    int64_t v = const_expr_val(&tok, tok);
+    long sz = var->ty->size;
+    char *buf = calloc_checked(1, sz);
+    for (long b = 0; b < sz; b++)
+      buf[b] = (v >> (b * 8)) & 0xff;
+    var->init_data = buf;
+    var->init_data_size = sz;
+    return tok;
+  }
+  error_tok(eq, "parse_v2: this global initializer form not yet implemented");
+}
+
 static Token *global_variable(Token *tok, Type *basety, Type *first_ty,
                                VarAttr *attr) {
   Type *ty = first_ty;
@@ -1581,154 +1718,7 @@ static Token *global_variable(Token *tok, Type *basety, Type *first_ty,
       tok = attribute_list(tok->next, var->ty, attr);
 
     if (equal(tok, "=")) {
-      Token *eq = tok;
-      tok = tok->next;
-
-      // Scalar string init for char[]: `char s[] = "...";`
-      if (tok->kind == TK_STR && var->ty->kind == TY_ARRAY &&
-          var->ty->base->kind == TY_CHAR) {
-        long s = tok->ty->array_len;
-        if (var->ty->array_len < 0) {
-          var->ty = array_of(var->ty->base, s);
-          var->align = var->ty->align;
-        }
-        long n = var->ty->array_len < s ? var->ty->array_len : s;
-        char *buf = calloc_checked(1, var->ty->size);
-        for (long i = 0; i < n; i++) buf[i] = tok->str[i];
-        var->init_data = buf;
-        var->init_data_size = var->ty->size;
-        tok = tok->next;
-        (void)eq;
-      }
-      // Pointer to string literal: `char *p = "hi";`
-      else if (tok->kind == TK_STR && var->ty->kind == TY_PTR &&
-               var->ty->base->kind == TY_CHAR) {
-        Obj *anon = new_anon_gvar(tok->ty);
-        anon->init_data = tok->str;
-        anon->init_data_size = tok->ty->size;
-        // Relocate pointer-sized slot at offset 0 to anon's name.
-        Relocation *r = calloc_checked(1, sizeof(Relocation));
-        r->offset = 0;
-        r->label = &anon->name;
-        r->addend = 0;
-        var->rel = r;
-        var->init_data = calloc_checked(1, var->ty->size);
-        var->init_data_size = var->ty->size;
-        tok = tok->next;
-      }
-      // Brace init for array-of-pointer (typically string literals
-      // and NULLs).  Each non-string-literal element folds via
-      // const_expr_val.  String literals create anon gvars and
-      // emit relocations.
-      else if (equal(tok, "{") && var->ty->kind == TY_ARRAY &&
-               var->ty->base->kind == TY_PTR) {
-        tok = tok->next;
-        long elem_sz = var->ty->base->size;
-        long count = 0;
-        bool first2 = true;
-        Relocation rel_head = {0};
-        Relocation *rcur = &rel_head;
-        // First pass — collect raw values and possibly relocations.
-        long max_elems = 4096;
-        int64_t *vals = calloc_checked(max_elems, sizeof(int64_t));
-        char **rels = calloc_checked(max_elems, sizeof(char *));
-        while (!equal(tok, "}")) {
-          if (!first2) tok = skip(tok, ",");
-          first2 = false;
-          if (equal(tok, "}")) break;
-          if (count >= max_elems)
-            error_tok(tok, "too many initializer elements");
-          if (tok->kind == TK_STR) {
-            Obj *anon = new_anon_gvar(tok->ty);
-            anon->init_data = tok->str;
-            anon->init_data_size = tok->ty->size;
-            rels[count] = anon->name;
-            tok = tok->next;
-          } else {
-            int64_t v = const_expr_val(&tok, tok);
-            vals[count] = v;
-          }
-          count++;
-        }
-        tok = skip(tok, "}");
-        if (var->ty->array_len < 0) {
-          var->ty = array_of(var->ty->base, count);
-          var->align = var->ty->align;
-        }
-        long sz = var->ty->size;
-        char *buf = calloc_checked(1, sz);
-        for (long i = 0; i < count && i * elem_sz < sz; i++) {
-          if (rels[i]) {
-            Relocation *r = calloc_checked(1, sizeof(Relocation));
-            r->offset = (int)(i * elem_sz);
-            // We need a *pointer to* the name pointer.  The anon
-            // gvar's name field is stable; address-of it is the
-            // recorded slot.
-            // Find the matching Obj from globals (its name slot is
-            // what we want a pointer to).
-            for (Obj *o = globals; o; o = o->next) {
-              if (!strcmp(o->name, rels[i])) {
-                r->label = &o->name;
-                break;
-              }
-            }
-            rcur = rcur->next = r;
-          } else {
-            int64_t v = vals[i];
-            for (int b = 0; b < elem_sz; b++)
-              buf[i * elem_sz + b] = (v >> (b * 8)) & 0xff;
-          }
-        }
-        var->init_data = buf;
-        var->init_data_size = sz;
-        var->rel = rel_head.next;
-      }
-      // Brace init for arrays of scalar constants — fold each
-      // expression and pack into init_data.
-      else if (equal(tok, "{") && var->ty->kind == TY_ARRAY &&
-               is_integer(var->ty->base)) {
-        tok = tok->next;
-        long elem_sz = var->ty->base->size;
-        long count = 0;
-        // First pass — parse elements into a stack buffer (cap 1024).
-        int64_t vals[1024];
-        bool first2 = true;
-        while (!equal(tok, "}")) {
-          if (!first2) tok = skip(tok, ",");
-          first2 = false;
-          if (equal(tok, "}")) break;
-          if (count >= 1024)
-            error_tok(tok, "too many initializer elements (cap 1024)");
-          int64_t v = const_expr_val(&tok, tok);
-          vals[count++] = v;
-        }
-        tok = skip(tok, "}");
-        if (var->ty->array_len < 0) {
-          var->ty = array_of(var->ty->base, count);
-          var->align = var->ty->align;
-        }
-        long sz = var->ty->size;
-        char *buf = calloc_checked(1, sz);
-        for (long i = 0; i < count && i * elem_sz < sz; i++) {
-          int64_t v = vals[i];
-          for (int b = 0; b < elem_sz; b++)
-            buf[i * elem_sz + b] = (v >> (b * 8)) & 0xff;
-        }
-        var->init_data = buf;
-        var->init_data_size = sz;
-      }
-      // Scalar `T x = const-expr;` — fold and pack bytes.
-      else if (is_integer(var->ty) || var->ty->kind == TY_PTR) {
-        int64_t v = const_expr_val(&tok, tok);
-        long sz = var->ty->size;
-        char *buf = calloc_checked(1, sz);
-        for (long b = 0; b < sz; b++)
-          buf[b] = (v >> (b * 8)) & 0xff;
-        var->init_data = buf;
-        var->init_data_size = sz;
-      } else {
-        error_tok(eq, "parse_v2: this global initializer form not yet implemented");
-      }
+      tok = parse_gvar_initializer(tok, var);
     }
 
     if (equal(tok, ",")) { tok = tok->next; continue; }
@@ -2210,7 +2200,18 @@ static Node *declaration(Token **rest, Token *tok, Type *basety, VarAttr *attr) 
     char *name = strndup_checked(ty->name->loc, ty->name->len);
 
     if (attr->is_static) {
-      error_tok(tok, "parse_v2: static local not yet implemented");
+      // Lift to anon file-scope gvar with static linkage.  The local
+      // name is bound in scope so subsequent uses resolve via the
+      // anon gvar.  04a §H.3.
+      Obj *gv = new_anon_gvar(ty);
+      gv->is_static = true;
+      // Bind the user-visible name in the local scope.
+      VarScope *vs = push_scope(name);
+      vs->var = gv;
+      if (attr->align) gv->align = attr->align;
+      if (equal(tok, "="))
+        tok = parse_gvar_initializer(tok, gv);
+      continue;
     }
 
     if (attr->is_extern) {
@@ -3456,6 +3457,12 @@ bool try_eval_node(Node *node, int64_t *out) {
       case 4: *out = node->ty->is_unsigned ? (uint32_t)lv : (int32_t)lv; return true;
       default: *out = lv; return true;
       }
+    }
+    // Pointer cast: pass-through (e.g. (void*)0 → 0).  Float-typed
+    // casts still bail.
+    if (node->ty->kind == TY_PTR) {
+      *out = lv;
+      return true;
     }
     return false;
   }
