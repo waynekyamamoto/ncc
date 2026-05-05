@@ -90,12 +90,18 @@ static Obj *globals;
 static Scope *scope;
 
 //
-// Forward declarations for the spine.
+// Forward declarations.
 //
 static Type *declspec(Token **rest, Token *tok, VarAttr *attr);
+static Type *declarator(Token **rest, Token *tok, Type *ty);
+static Type *type_suffix(Token **rest, Token *tok, Type *ty);
+static Type *func_params(Token **rest, Token *tok, Type *ty);
+static Type *array_dimensions(Token **rest, Token *tok, Type *ty);
+static Type *pointers(Token **rest, Token *tok, Type *ty);
 static Token *parse_typedef(Token *tok, Type *basety);
-static Token *function(Token *tok, Type *basety, VarAttr *attr);
-static Token *global_variable(Token *tok, Type *basety, VarAttr *attr);
+static Token *function(Token *tok, Type *basety, Type *ty, VarAttr *attr);
+static Token *function_declaration(Token *tok, Type *basety, Type *ty, VarAttr *attr);
+static Token *global_variable(Token *tok, Type *basety, Type *first_ty, VarAttr *attr);
 static Token *skip_attribute(Token *tok);
 static Token *skip_static_assert(Token *tok);
 
@@ -122,7 +128,15 @@ static VarScope *find_var(Token *tok) {
   return NULL;
 }
 
-#if 0  // unused in spine; revives in tag-zone fills.
+static VarScope *push_scope(char *name) {
+  VarScope *vs = calloc_checked(1, sizeof(VarScope));
+  vs->name = name;
+  vs->next = scope->vars;
+  scope->vars = vs;
+  return vs;
+}
+
+#if 0  // unused until tag-zone fills.
 static TagScope *find_tag(Token *tok) {
   for (Scope *sc = scope; sc; sc = sc->next)
     for (TagScope *ts = sc->tags; ts; ts = ts->next)
@@ -130,14 +144,6 @@ static TagScope *find_tag(Token *tok) {
           !strncmp(tok->loc, ts->name, tok->len))
         return ts;
   return NULL;
-}
-
-static VarScope *push_scope(char *name) {
-  VarScope *vs = calloc_checked(1, sizeof(VarScope));
-  vs->name = name;
-  vs->next = scope->vars;
-  scope->vars = vs;
-  return vs;
 }
 
 static void push_tag_scope(Token *tok, Type *ty) {
@@ -148,6 +154,49 @@ static void push_tag_scope(Token *tok, Type *ty) {
   scope->tags = ts;
 }
 #endif
+
+//
+// Variable creation helpers (04a_decl.md §J).
+//
+
+static Obj *new_var(char *name, Type *ty) {
+  Obj *var = calloc_checked(1, sizeof(Obj));
+  var->name = name;
+  var->ty = ty;
+  var->align = ty->align;
+  push_scope(name)->var = var;
+  return var;
+}
+
+static Obj *new_gvar(char *name, Type *ty) {
+  Obj *var = new_var(name, ty);
+  var->next = globals;
+  var->is_definition = true;
+  var->is_static = false;
+  globals = var;
+  return var;
+}
+
+//
+// __asm__ label consumer (04a_decl.md §G.1).  Label content is
+// discarded — main does not yet honor explicit asm labels in symbol
+// emission (a known divergence-log item).
+//
+
+static Token *skip_asm_label(Token *tok) {
+  if (!equal(tok, "asm") && !equal(tok, "__asm") && !equal(tok, "__asm__"))
+    return tok;
+  tok = tok->next;
+  tok = skip(tok, "(");
+  int depth = 1;
+  while (depth > 0 && tok->kind != TK_EOF) {
+    if (equal(tok, "(")) depth++;
+    else if (equal(tok, ")")) { depth--; if (depth == 0) break; }
+    tok = tok->next;
+  }
+  tok = skip(tok, ")");
+  return tok;
+}
 
 //
 // is_typename — the watershed (04_parse.md §5).
@@ -224,14 +273,36 @@ Obj *parse(Token *tok) {
       continue;
     }
 
-    // The declarator is parsed inside function() / global_variable()
-    // for now (stubs); real impl per 04a §I.2 step 3-6 will route via
-    // a dedicated declarator() call here and dispatch on the resulting
-    // type kind.
-    if (basety->kind == TY_FUNC) {
-      tok = function(tok, basety, &attr);
+    // Bare struct/union/enum declaration (no declarator follows).
+    // §I.2 step 5: skip `;` and continue.  Detection: declspec
+    // returned a tag type and the next token is `;`.
+    if ((basety->kind == TY_STRUCT || basety->kind == TY_UNION ||
+         basety->kind == TY_ENUM) && equal(tok, ";")) {
+      tok = tok->next;
+      continue;
+    }
+
+    // First declarator.  Subsequent declarators (after `,`) are
+    // handled inside global_variable / function_declaration.
+    Type *ty = declarator(&tok, tok, basety);
+
+    if (ty->kind == TY_FUNC) {
+      // §I.2 step 4: dispatch on the next token.
+      if (equal(tok, "{")) {
+        tok = function(tok, basety, ty, &attr);
+      } else if (is_typename(tok) && !equal(tok, ";") &&
+                 !equal(tok, "__attribute__") &&
+                 !equal(tok, "asm") && !equal(tok, "__asm") &&
+                 !equal(tok, "__asm__")) {
+        // K&R-style function definition.
+        tok = function(tok, basety, ty, &attr);
+      } else {
+        // Function declaration (no body).
+        tok = function_declaration(tok, basety, ty, &attr);
+      }
     } else {
-      tok = global_variable(tok, basety, &attr);
+      // §I.2 step 6: global variable.
+      tok = global_variable(tok, basety, ty, &attr);
     }
   }
 
@@ -559,14 +630,215 @@ static Token *parse_typedef(Token *tok, Type *basety) {
   error_tok(tok, "parse_v2: parse_typedef not yet implemented");
 }
 
-static Token *function(Token *tok, Type *basety, VarAttr *attr) {
-  (void)basety; (void)attr;
-  error_tok(tok, "parse_v2: function not yet implemented");
+static Token *function(Token *tok, Type *basety, Type *ty, VarAttr *attr) {
+  (void)basety; (void)ty; (void)attr;
+  error_tok(tok, "parse_v2: function (definition body) not yet implemented");
 }
 
-static Token *global_variable(Token *tok, Type *basety, VarAttr *attr) {
-  (void)basety; (void)attr;
-  error_tok(tok, "parse_v2: global_variable not yet implemented");
+//
+// Declarator and friends (04a_decl.md §C, §D, §E).
+//
+
+// pointers — process each `*` and the qualifier sequence after it
+// (§C.1).  Multiple `*`s nest left-to-right via pointer_to().
+static Type *pointers(Token **rest, Token *tok, Type *ty) {
+  while (equal(tok, "*")) {
+    ty = pointer_to(ty);
+    tok = tok->next;
+    while (equal(tok, "const") || equal(tok, "volatile") ||
+           equal(tok, "restrict") || equal(tok, "__restrict") ||
+           equal(tok, "__restrict__") || equal(tok, "_Atomic")) {
+      if (equal(tok, "const"))    ty->is_const    = true;
+      if (equal(tok, "volatile")) ty->is_volatile = true;
+      // restrict / __restrict / __restrict__ / _Atomic: consumed
+      // without setting flags (ncc does not enforce restrict
+      // semantics; bare _Atomic on a pointer is a no-op).
+      tok = tok->next;
+    }
+    // Optional __attribute__ that attaches to this pointer.
+    if (equal(tok, "__attribute__"))
+      tok = attribute_list(tok->next, ty, NULL);
+  }
+  *rest = tok;
+  return ty;
+}
+
+// Look-ahead to disambiguate a `(` that could open either a nested
+// declarator or a function parameter list.  This is a simplified
+// heuristic vs the spec's try-parse approach (§C.3): if `(` is
+// followed by `)` or a typename, it's a parameter list; otherwise
+// (`*`, `(`, identifier-not-typename) it's a nested declarator.
+//
+// Known gap: K&R-style declarations like `int f(a, b);` (identifier
+// list, no types) would be misclassified here.  We don't see these
+// in the self-host corpus.
+static bool looks_like_nested_declarator(Token *tok) {
+  // `tok` is the `(`.  Peek one ahead.
+  Token *next = tok->next;
+  if (equal(next, ")")) return false;       // `()` — empty params.
+  if (is_typename(next)) return false;      // typename — params.
+  return true;                              // `*`, `(`, ident — nested.
+}
+
+// declarator — pointers + (nested declarator | identifier) + suffix.
+static Type *declarator(Token **rest, Token *tok, Type *ty) {
+  // §C.1 — pointers.
+  ty = pointers(&tok, tok, ty);
+
+  // §C.2 — post-pointer __attribute__.
+  if (equal(tok, "__attribute__"))
+    tok = attribute_list(tok->next, ty, NULL);
+
+  // §C.3 — nested declarator.
+  if (equal(tok, "(") && looks_like_nested_declarator(tok)) {
+    Token *inner_start = tok->next;
+    Type placeholder = {0};
+    // Walk the inner declarator into a placeholder, find the matching `)`,
+    // then build the suffix and patch the placeholder.
+    Token *after_inner;
+    declarator(&after_inner, inner_start, &placeholder);
+    Token *close = skip(after_inner, ")");
+    Type *real = type_suffix(&tok, close, ty);
+    *rest = tok;
+    // Re-run the inner declarator against the actual outer type.
+    Type *result = declarator(&after_inner, inner_start, real);
+    return result;
+  }
+
+  // §C.4 — identifier (terminal).  Optional for abstract declarators.
+  Token *name = NULL;
+  if (tok->kind == TK_IDENT) {
+    name = tok;
+    tok = tok->next;
+  }
+
+  // §C.5 — type suffix.
+  ty = type_suffix(&tok, tok, ty);
+
+  // §C.6 — result construction.  Tag types share identity with the
+  // tag table (don't copy); everything else gets a fresh copy so
+  // setting `name` doesn't mutate a shared singleton.
+  if (ty->kind != TY_STRUCT && ty->kind != TY_UNION && ty->kind != TY_ENUM)
+    ty = copy_type(ty);
+  ty->name = name;
+  ty->name_pos = name;
+
+  *rest = tok;
+  return ty;
+}
+
+// type_suffix — `(...)` (function), `[...]` (array), or ε.
+static Type *type_suffix(Token **rest, Token *tok, Type *ty) {
+  if (equal(tok, "("))
+    return func_params(rest, tok->next, ty);
+  if (equal(tok, "["))
+    return array_dimensions(rest, tok->next, ty);
+  *rest = tok;
+  return ty;
+}
+
+// func_params — partial impl per §E.1 (empty `()`) and §E.2 (`(void)`).
+// Normal parameter lists are deferred until expr/stmt zone fills land.
+static Type *func_params(Token **rest, Token *tok, Type *ty) {
+  // §E.1 — empty `()`.  Treated as variadic for K&R compatibility.
+  if (equal(tok, ")")) {
+    *rest = tok->next;
+    Type *fn = func_type(ty);
+    fn->is_variadic = true;
+    return fn;
+  }
+
+  // §E.2 — `(void)`.
+  if (equal(tok, "void") && equal(tok->next, ")")) {
+    *rest = tok->next->next;
+    return func_type(ty);
+  }
+
+  error_tok(tok, "parse_v2: function parameter list not yet implemented");
+}
+
+// array_dimensions — stub.  §D detail (constant vs VLA, leading
+// qualifiers, multi-dimensional) requires expression parsing.
+static Type *array_dimensions(Token **rest, Token *tok, Type *ty) {
+  (void)rest; (void)ty;
+  error_tok(tok, "parse_v2: array_dimensions not yet implemented");
+}
+
+//
+// global_variable (04a_decl.md §I.6).  No initializer support yet —
+// `int x = 5;` will hit the error_tok arm.
+//
+
+static Token *global_variable(Token *tok, Type *basety, Type *first_ty,
+                               VarAttr *attr) {
+  Type *ty = first_ty;
+  bool first = true;
+  for (;;) {
+    if (!first) {
+      // Subsequent declarator after `,`.
+      ty = declarator(&tok, tok, basety);
+    }
+    first = false;
+
+    if (!ty->name)
+      error_tok(tok, "parse_v2: global variable requires a name");
+
+    char *name = strndup_checked(ty->name->loc, ty->name->len);
+    Obj *var = new_gvar(name, ty);
+    var->is_static = attr->is_static;
+    var->is_tls    = attr->is_tls;
+    var->is_definition = !attr->is_extern;
+    if (attr->align) var->align = attr->align;
+
+    // Optional __asm__ label and __attribute__ post-declarator.
+    tok = skip_asm_label(tok);
+    if (equal(tok, "__attribute__"))
+      tok = attribute_list(tok->next, var->ty, attr);
+
+    if (equal(tok, "=")) {
+      error_tok(tok, "parse_v2: global initializer not yet implemented");
+    }
+
+    if (equal(tok, ",")) { tok = tok->next; continue; }
+    return skip(tok, ";");
+  }
+}
+
+//
+// function_declaration — non-defining function declaration loop.
+// Per §I.2 step 4 third bullet: comma-separated declarators, each
+// becomes a non-defining Obj with optional asm/attribute, then `;`.
+//
+
+static Token *function_declaration(Token *tok, Type *basety, Type *first_ty,
+                                    VarAttr *attr) {
+  Type *ty = first_ty;
+  bool first = true;
+  for (;;) {
+    if (!first) {
+      ty = declarator(&tok, tok, basety);
+      if (ty->kind != TY_FUNC)
+        error_tok(tok, "parse_v2: mixed function/variable declaration list");
+    }
+    first = false;
+
+    if (!ty->name)
+      error_tok(tok, "parse_v2: function declaration requires a name");
+
+    char *name = strndup_checked(ty->name->loc, ty->name->len);
+    Obj *fn = new_gvar(name, ty);
+    fn->is_function = true;
+    fn->is_definition = false;
+    fn->is_static = attr->is_static;
+    fn->is_inline = attr->is_inline;
+
+    tok = skip_asm_label(tok);
+    if (equal(tok, "__attribute__"))
+      tok = attribute_list(tok->next, fn->ty, attr);
+
+    if (equal(tok, ",")) { tok = tok->next; continue; }
+    return skip(tok, ";");
+  }
 }
 
 // skip_attribute — minimal stray-attribute consumer.  Walks past
