@@ -742,31 +742,19 @@ static Token *function(Token *tok, Type *basety, Type *ty, VarAttr *attr) {
 
   enter_scope();
 
-  // §F.2 — register parameters (declared order: walk the param Type
-  // chain front-to-back, build Obj in reverse via new_lvar so locals
-  // ends up in declaration order).
-  Obj *param_head = NULL;
+  // §F.2 — register parameters.  new_lvar prepends to `locals`, so
+  // walking ty->params front-to-back produces locals in
+  // reverse-declaration order; reverse it once before exposing as
+  // fn->params (which must be declaration order for codegen to
+  // assign register slots correctly).
   for (Type *pt = ty->params; pt; pt = pt->next) {
     char *pname;
     if (pt->name && pt->name->len > 0)
       pname = strndup_checked(pt->name->loc, pt->name->len);
     else
       pname = new_unique_name();
-    Obj *p = new_lvar(pname, pt);
-    // Splice into a separate params chain — locals already holds it
-    // via new_lvar, but the Obj.params field expects *only* the
-    // parameter Objs in declaration order.
-    p->next = NULL;
-    (void)p;
-    // We rebuild fn->params after the loop from `locals` (which is
-    // now in declaration order because we walked params front-to-back
-    // and prepended).  Wait — new_lvar prepends, so locals is in
-    // reverse-declaration order.  Reverse it below.
-    (void)param_head;
+    new_lvar(pname, pt);
   }
-  // Reverse `locals` so it's in declaration order, then assign as
-  // fn->params.  After this, additional locals from the body will be
-  // prepended; fn->locals is set at the end of body parsing.
   Obj *rev = NULL;
   while (locals) {
     Obj *n = locals->next;
@@ -1409,19 +1397,181 @@ static Node *mul(Token **rest, Token *tok) {
   return node;
 }
 
-// cast — passthrough until the typename-cast branch lands.
+// new_ulong — convenience for sizeof / _Alignof results.
+static Node *new_ulong(uint64_t val, Token *tok) {
+  Node *node = new_num((int64_t)val, tok);
+  node->ty = ty_ulong;
+  return node;
+}
+
+// typename_ — declspec + abstract declarator (04a §C.8).  Used by
+// sizeof / cast / _Alignof / etc.
+static Type *typename_(Token **rest, Token *tok) {
+  Type *ty = declspec(&tok, tok, NULL);
+  ty = declarator(&tok, tok, ty);
+  *rest = tok;
+  return ty;
+}
+
+// cast — 04b §F.  Disambiguate `( typename )`:
+//   - followed by `{` → compound literal (deferred).
+//   - otherwise → cast: parse cast operand, wrap in ND_CAST.
+//   - `( expr )` → fall through to unary→postfix→primary's parens.
 static Node *cast(Token **rest, Token *tok) {
+  if (equal(tok, "(") && is_typename(tok->next)) {
+    Token *open = tok;
+    Type *ty = typename_(&tok, tok->next);
+    tok = skip(tok, ")");
+    if (equal(tok, "{")) {
+      // Compound literal — deferred.  Fall back to a unary parse on
+      // the original `(` so primary handles the brace... actually
+      // primary doesn't handle `{` either.  Surface a clear error
+      // until compound-literal lands.
+      error_tok(open, "parse_v2: compound literals not yet implemented");
+    }
+    Node *operand = cast(rest, tok);
+    Node *node = new_cast(operand, ty);
+    add_type(node);
+    return node;
+  }
   return unary(rest, tok);
 }
 
-// unary — passthrough until prefix operators land.
+// unary — 04b §G prefix operators.  Subset:
+//   +x, -x, &x, *x, !x, ~x, sizeof
+// Pre-inc/dec, __real__/__imag__, &&label, _Alignof deferred.
 static Node *unary(Token **rest, Token *tok) {
+  // §G.1 — unary plus is a no-op at the parser level.
+  if (equal(tok, "+"))
+    return cast(rest, tok->next);
+
+  // §G.2 — unary minus.
+  if (equal(tok, "-")) {
+    Token *op = tok;
+    Node *operand = cast(rest, tok->next);
+    return new_unary(ND_NEG, operand, op);
+  }
+
+  // §G.3 — address-of.
+  if (equal(tok, "&")) {
+    Token *op = tok;
+    Node *operand = cast(rest, tok->next);
+    return new_unary(ND_ADDR, operand, op);
+  }
+
+  // §G.4 — indirection.
+  if (equal(tok, "*")) {
+    Token *op = tok;
+    Node *operand = cast(rest, tok->next);
+    Node *node = new_unary(ND_DEREF, operand, op);
+    add_type(node);
+    return node;
+  }
+
+  // §G.5 — logical not.
+  if (equal(tok, "!")) {
+    Token *op = tok;
+    Node *operand = cast(rest, tok->next);
+    return new_unary(ND_NOT, operand, op);
+  }
+
+  // §G.6 — bitwise not.
+  if (equal(tok, "~")) {
+    Token *op = tok;
+    Node *operand = cast(rest, tok->next);
+    return new_unary(ND_BITNOT, operand, op);
+  }
+
+  // §G.10 — sizeof.  Both forms.
+  if (equal(tok, "sizeof")) {
+    Token *op = tok;
+    // sizeof ( type-name )  — disambiguate by is_typename after `(`.
+    if (equal(tok->next, "(") && is_typename(tok->next->next)) {
+      Type *ty = typename_(&tok, tok->next->next);
+      *rest = skip(tok, ")");
+      return new_ulong((uint64_t)ty->size, op);
+    }
+    Node *operand = unary(rest, tok->next);
+    add_type(operand);
+    return new_ulong((uint64_t)operand->ty->size, op);
+  }
+
   return postfix(rest, tok);
 }
 
-// postfix — passthrough until [], (), ., ->, ++, -- land.
+// postfix — 04b §H suffix loop.  Subset:
+//   primary [ expr ]
+//   primary ( arg-list )
+//   primary . ident       (deferred until struct lands)
+//   primary -> ident      (deferred)
+//   primary ++ / --       (deferred — needs to_assign)
 static Node *postfix(Token **rest, Token *tok) {
-  return primary(rest, tok);
+  Node *node = primary(&tok, tok);
+
+  for (;;) {
+    // [ expr ]  — *(node + idx).
+    if (equal(tok, "[")) {
+      Token *op = tok;
+      Node *idx = expr(&tok, tok->next);
+      tok = skip(tok, "]");
+      Node *sum = new_add(node, idx, op);
+      node = new_unary(ND_DEREF, sum, op);
+      add_type(node);
+      continue;
+    }
+
+    // ( arg-list )  — function call.
+    if (equal(tok, "(")) {
+      add_type(node);
+      Type *fn_ty = NULL;
+      if (node->ty->kind == TY_FUNC)
+        fn_ty = node->ty;
+      else if (node->ty->kind == TY_PTR && node->ty->base->kind == TY_FUNC)
+        fn_ty = node->ty->base;
+      if (!fn_ty) break;  // not callable; let caller fail.
+
+      Token *call_tok = tok;
+      tok = tok->next;
+
+      Node head = {0};
+      Node *cur = &head;
+      Type *param_ty = fn_ty->params;
+      while (!equal(tok, ")")) {
+        if (cur != &head) tok = skip(tok, ",");
+        Node *arg = assign(&tok, tok);
+        add_type(arg);
+        if (param_ty) {
+          if (param_ty->kind != TY_STRUCT && param_ty->kind != TY_UNION &&
+              param_ty->kind != TY_VECTOR)
+            arg = new_cast(arg, param_ty);
+          param_ty = param_ty->next;
+        } else if (arg->ty->kind == TY_FLOAT) {
+          // Default argument promotion (variadic): float → double.
+          arg = new_cast(arg, ty_double);
+        }
+        cur = cur->next = arg;
+      }
+
+      Node *call = new_node(ND_FUNCALL, call_tok);
+      call->lhs = node;
+      call->func_ty = fn_ty;
+      call->ty = fn_ty->return_ty;
+      call->args = head.next;
+      if (node->kind == ND_VAR)
+        call->funcname = node->var->name;
+      else
+        call->funcname = "__indirect_call";
+
+      tok = skip(tok, ")");
+      node = call;
+      continue;
+    }
+
+    break;
+  }
+
+  *rest = tok;
+  return node;
 }
 
 // new_var_node — wrap an Obj into an ND_VAR node.
@@ -1504,8 +1654,13 @@ static Node *primary(Token **rest, Token *tok) {
 //
 
 Node *new_cast(Node *expr, Type *ty) {
-  (void)ty;
-  return expr;
+  add_type(expr);
+  Node *node = calloc_checked(1, sizeof(Node));
+  node->kind = ND_CAST;
+  node->tok = expr->tok;
+  node->lhs = expr;
+  node->ty = copy_type(ty);
+  return node;
 }
 
 int64_t eval_node(Node *node) {
