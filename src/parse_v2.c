@@ -84,6 +84,53 @@ int label_cnt;
 int gvar_cnt;
 
 //
+// File-scope tables.
+//
+// These were originally function-static, but parse_v2.c can't yet
+// compile itself when arrays-of-struct appear inside function bodies
+// (array-of-struct gvar init is a follow-up).  Lifting to file scope
+// is a clean workaround that doesn't change semantics.
+//
+
+typedef struct CompoundOp { const char *op; NodeKind kind; } CompoundOp;
+static const CompoundOp compound_op_table[] = {
+  {"+=",  ND_ADD},
+  {"-=",  ND_SUB},
+  {"*=",  ND_MUL},
+  {"/=",  ND_DIV},
+  {"%=",  ND_MOD},
+  {"&=",  ND_BITAND},
+  {"|=",  ND_BITOR},
+  {"^=",  ND_BITXOR},
+  {"<<=", ND_SHL},
+  {">>=", ND_SHR},
+};
+
+typedef struct UnaryBuiltin { const char *name; NodeKind kind; bool is64; } UnaryBuiltin;
+static const UnaryBuiltin unary_builtin_table[] = {
+  {"__builtin_clz",         ND_BUILTIN_CLZ,        false},
+  {"__builtin_clzl",        ND_BUILTIN_CLZ,        true },
+  {"__builtin_clzll",       ND_BUILTIN_CLZ,        true },
+  {"__builtin_ctz",         ND_BUILTIN_CTZ,        false},
+  {"__builtin_ctzl",        ND_BUILTIN_CTZ,        true },
+  {"__builtin_ctzll",       ND_BUILTIN_CTZ,        true },
+  {"__builtin_ffs",         ND_BUILTIN_FFS,        false},
+  {"__builtin_ffsl",        ND_BUILTIN_FFS,        true },
+  {"__builtin_ffsll",       ND_BUILTIN_FFS,        true },
+  {"__builtin_popcount",    ND_BUILTIN_POPCOUNT,   false},
+  {"__builtin_popcountl",   ND_BUILTIN_POPCOUNT,   true },
+  {"__builtin_popcountll",  ND_BUILTIN_POPCOUNT,   true },
+  {"__builtin_parity",      ND_BUILTIN_PARITY,     false},
+  {"__builtin_parityl",     ND_BUILTIN_PARITY,     true },
+  {"__builtin_parityll",    ND_BUILTIN_PARITY,     true },
+  {"__builtin_clrsb",       ND_BUILTIN_CLRSB,      false},
+  {"__builtin_clrsbl",      ND_BUILTIN_CLRSB,      true },
+  {"__builtin_clrsbll",     ND_BUILTIN_CLRSB,      true },
+  {"__builtin_bswap32",     ND_BUILTIN_BSWAP32,    false},
+  {"__builtin_bswap64",     ND_BUILTIN_BSWAP64,    true },
+};
+
+//
 // File-scope parser state.
 //
 static Obj *globals;
@@ -1649,6 +1696,84 @@ static Token *parse_gvar_initializer(Token *tok, Obj *var) {
     var->rel = rh.next;
     return tok;
   }
+  // Array of struct: brace contains brace per element; each inner
+  // brace folds the struct fields.  Subset (matches our table use):
+  // each field is either a string literal (becomes Relocation),
+  // pointer-to-string-literal, or integer/bool const-expr.
+  if (equal(tok, "{") && var->ty->kind == TY_ARRAY &&
+      var->ty->base->kind == TY_STRUCT) {
+    Type *elem_ty = var->ty->base;
+    long elem_sz = elem_ty->size;
+    tok = tok->next;
+    long count = 0;
+    long max_elems = 4096;
+    char *buf = NULL;
+    long alloc_sz = 0;
+    Relocation rh = {0};
+    Relocation *rcur = &rh;
+    bool first2 = true;
+    while (!equal(tok, "}")) {
+      if (!first2) tok = skip(tok, ",");
+      first2 = false;
+      if (equal(tok, "}")) break;
+      if (count >= max_elems) error_tok(tok, "too many initializer elements");
+      tok = skip(tok, "{");
+      // Ensure buf has room for this element.
+      long need = (count + 1) * elem_sz;
+      if (need > alloc_sz) {
+        // Grow.
+        long new_sz = alloc_sz ? alloc_sz * 2 : 64;
+        while (new_sz < need) new_sz *= 2;
+        char *nb = calloc_checked(1, new_sz);
+        if (buf) for (long i = 0; i < alloc_sz; i++) nb[i] = buf[i];
+        buf = nb;
+        alloc_sz = new_sz;
+      }
+      Member *m = elem_ty->members;
+      bool fst = true;
+      while (!equal(tok, "}")) {
+        if (!fst) tok = skip(tok, ",");
+        fst = false;
+        if (equal(tok, "}")) break;
+        if (!m) error_tok(tok, "excess elements in struct initializer");
+        long base_off = count * elem_sz + m->offset;
+        if (m->ty->kind == TY_PTR && tok->kind == TK_STR) {
+          // Anon gvar + relocation.
+          Obj *anon = new_anon_gvar(tok->ty);
+          anon->init_data = tok->str;
+          anon->init_data_size = tok->ty->size;
+          tok = tok->next;
+          Relocation *r = calloc_checked(1, sizeof(Relocation));
+          r->offset = (int)base_off;
+          r->label = &anon->name;
+          rcur = rcur->next = r;
+        } else {
+          int64_t v = const_expr_val(&tok, tok);
+          for (int b = 0; b < (int)m->ty->size; b++)
+            buf[base_off + b] = (v >> (b * 8)) & 0xff;
+        }
+        m = m->next;
+      }
+      tok = skip(tok, "}");
+      count++;
+    }
+    tok = skip(tok, "}");
+    if (var->ty->array_len < 0) {
+      var->ty = array_of(elem_ty, count);
+      var->align = var->ty->align;
+    }
+    long sz = var->ty->size;
+    if (sz > alloc_sz) {
+      char *nb = calloc_checked(1, sz);
+      if (buf) for (long i = 0; i < alloc_sz; i++) nb[i] = buf[i];
+      buf = nb;
+    }
+    var->init_data = buf;
+    var->init_data_size = sz;
+    var->rel = rh.next;
+    return tok;
+  }
+
   if (equal(tok, "{") && var->ty->kind == TY_ARRAY && is_integer(var->ty->base)) {
     tok = tok->next;
     long elem_sz = var->ty->base->size;
@@ -2484,30 +2609,20 @@ static Node *assign(Token **rest, Token *tok) {
     return new_binary(ND_ASSIGN, node, rhs, eq);
   }
 
-  // Compound assignment: pick the kind, build, lower.
-  static const struct { const char *op; NodeKind kind; } cops[] = {
-    {"+=",  ND_ADD},
-    {"-=",  ND_SUB},
-    {"*=",  ND_MUL},
-    {"/=",  ND_DIV},
-    {"%=",  ND_MOD},
-    {"&=",  ND_BITAND},
-    {"|=",  ND_BITOR},
-    {"^=",  ND_BITXOR},
-    {"<<=", ND_SHL},
-    {">>=", ND_SHR},
-  };
-  for (size_t i = 0; i < sizeof(cops) / sizeof(*cops); i++) {
-    if (equal(tok, cops[i].op)) {
+  // Compound assignment: pick the kind, build, lower.  The table
+  // is at file scope (compound_op_table below) so parse_v2.c can
+  // compile itself without array-of-struct gvar-init machinery.
+  for (size_t i = 0; i < sizeof(compound_op_table) / sizeof(*compound_op_table); i++) {
+    if (equal(tok, compound_op_table[i].op)) {
       Token *op = tok;
       Node *rhs = assign(&tok, tok->next);
       Node *binary;
-      if (cops[i].kind == ND_ADD)
+      if (compound_op_table[i].kind == ND_ADD)
         binary = new_add(node, rhs, op);
-      else if (cops[i].kind == ND_SUB)
+      else if (compound_op_table[i].kind == ND_SUB)
         binary = new_sub(node, rhs, op);
       else
-        binary = new_binary(cops[i].kind, node, rhs, op);
+        binary = new_binary(compound_op_table[i].kind, node, rhs, op);
       *rest = tok;
       return to_assign(binary);
     }
@@ -3373,43 +3488,19 @@ static Node *primary(Token **rest, Token *tok) {
       return new_num(0, bi);
     }
 
-    // Bit-manipulation builtins.  Each is a single-argument node;
-    // codegen lowers via the matching ND_BUILTIN_* case (04b §K.2
-    // float branch / direct codegen).  The `node->val` field is set
-    // to the operand width (32 vs 64) per spec note.
-    static const struct { const char *name; NodeKind kind; bool is64; } bi_unary[] = {
-      {"__builtin_clz",         ND_BUILTIN_CLZ,        false},
-      {"__builtin_clzl",        ND_BUILTIN_CLZ,        true },
-      {"__builtin_clzll",       ND_BUILTIN_CLZ,        true },
-      {"__builtin_ctz",         ND_BUILTIN_CTZ,        false},
-      {"__builtin_ctzl",        ND_BUILTIN_CTZ,        true },
-      {"__builtin_ctzll",       ND_BUILTIN_CTZ,        true },
-      {"__builtin_ffs",         ND_BUILTIN_FFS,        false},
-      {"__builtin_ffsl",        ND_BUILTIN_FFS,        true },
-      {"__builtin_ffsll",       ND_BUILTIN_FFS,        true },
-      {"__builtin_popcount",    ND_BUILTIN_POPCOUNT,   false},
-      {"__builtin_popcountl",   ND_BUILTIN_POPCOUNT,   true },
-      {"__builtin_popcountll",  ND_BUILTIN_POPCOUNT,   true },
-      {"__builtin_parity",      ND_BUILTIN_PARITY,     false},
-      {"__builtin_parityl",     ND_BUILTIN_PARITY,     true },
-      {"__builtin_parityll",    ND_BUILTIN_PARITY,     true },
-      {"__builtin_clrsb",       ND_BUILTIN_CLRSB,      false},
-      {"__builtin_clrsbl",      ND_BUILTIN_CLRSB,      true },
-      {"__builtin_clrsbll",     ND_BUILTIN_CLRSB,      true },
-      {"__builtin_bswap32",     ND_BUILTIN_BSWAP32,    false},
-      {"__builtin_bswap64",     ND_BUILTIN_BSWAP64,    true },
-    };
-    for (size_t i = 0; i < sizeof(bi_unary)/sizeof(*bi_unary); i++) {
-      if (!tok_name_eq(tok, bi_unary[i].name)) continue;
+    // Bit-manipulation builtins (table at file scope).  Each is a
+    // single-argument node lowered via ND_BUILTIN_*; node->val is
+    // a 32-vs-64 boolean codegen reads.
+    for (size_t i = 0; i < sizeof(unary_builtin_table)/sizeof(*unary_builtin_table); i++) {
+      if (!tok_name_eq(tok, unary_builtin_table[i].name)) continue;
       Token *bi = tok;
       tok = skip(tok->next, "(");
       Node *arg = assign(&tok, tok);
       tok = skip(tok, ")");
       *rest = tok;
-      Node *node = new_unary(bi_unary[i].kind, arg, bi);
+      Node *node = new_unary(unary_builtin_table[i].kind, arg, bi);
       node->ty = ty_int;
-      // Codegen reads `val` as a boolean: nonzero → 64-bit dispatch.
-      node->val = bi_unary[i].is64 ? 1 : 0;
+      node->val = unary_builtin_table[i].is64 ? 1 : 0;
       return node;
     }
 
