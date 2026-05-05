@@ -1500,10 +1500,29 @@ static Token *skip_attribute(Token *tok) {
   return tok;
 }
 
-// skip_static_assert — stub that errors.  Real path evaluates the
-// const-expr via try_eval_node and emits the message on failure.
+// skip_static_assert — file-scope _Static_assert.  Per the spec
+// note, block-scope variant is silently dropped (in-block branch
+// handled separately at compound_stmt).  Form:
+//   _Static_assert ( const-expr [ , string-literal ] ) ;
 static Token *skip_static_assert(Token *tok) {
-  error_tok(tok, "parse_v2: _Static_assert not yet implemented");
+  Token *kw = tok;
+  tok = tok->next;
+  tok = skip(tok, "(");
+  int64_t v = const_expr_val(&tok, tok);
+  // Optional message string.
+  char *msg = NULL;
+  if (equal(tok, ",")) {
+    tok = tok->next;
+    if (tok->kind != TK_STR)
+      error_tok(tok, "expected string literal in _Static_assert message");
+    msg = tok->str;
+    tok = tok->next;
+  }
+  tok = skip(tok, ")");
+  tok = skip(tok, ";");
+  if (!v)
+    error_tok(kw, "static assertion failed: %s", msg ? msg : "no message");
+  return tok;
 }
 
 //
