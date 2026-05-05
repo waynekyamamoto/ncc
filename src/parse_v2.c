@@ -2889,6 +2889,85 @@ static Node *unary(Token **rest, Token *tok) {
   return postfix(rest, tok);
 }
 
+// init_zero_or_struct — 04d-style brace init for compound literal.
+// Subset (sufficient for ncc self-host):
+//   - {} or {0}                           → memzero only
+//   - {expr1, expr2, ...} for struct of   → memzero + per-member ND_ASSIGN
+//     scalars; member walks ty->members
+//   - {expr1, expr2, ...} for array of    → memzero + indexed *(p+i)=ei
+//     scalars; uses new_add for addressing
+// Returns a comma chain rooted at ND_MEMZERO; the chain's final
+// rhs (just memzero if no inits) carries the var->ty type after
+// add_type.
+static Node *init_compound_literal(Token **rest, Token *tok, Obj *var) {
+  Type *ty = var->ty;
+  Token *open = tok;
+  tok = skip(tok, "{");
+  Node *memzero = new_node(ND_MEMZERO, open);
+  memzero->var = var;
+  Node *chain = memzero;
+
+  if (ty->kind == TY_ARRAY) {
+    long i = 0;
+    long cap = ty->array_len;
+    bool first = true;
+    while (!equal(tok, "}")) {
+      if (!first) tok = skip(tok, ",");
+      first = false;
+      if (equal(tok, "}")) break;
+      if (equal(tok, "{"))
+        error_tok(tok, "parse_v2: nested brace init in compound literal not supported");
+      Node *e = assign(&tok, tok);
+      add_type(e);
+      Node *vref = new_var_node(var, open);
+      Node *sum = new_add(vref, new_num(i, open), open);
+      Node *deref = new_unary(ND_DEREF, sum, open);
+      Node *as = new_binary(ND_ASSIGN, deref, e, open);
+      chain = new_binary(ND_COMMA, chain, as, open);
+      i++;
+      if (cap >= 0 && i >= cap) {
+        while (!equal(tok, "}") && !equal(tok, ",")) tok = tok->next;
+      }
+    }
+    tok = skip(tok, "}");
+    if (cap < 0) {
+      var->ty = array_of(ty->base, i);
+    }
+  } else if (ty->kind == TY_STRUCT) {
+    Member *m = ty->members;
+    bool first = true;
+    while (!equal(tok, "}")) {
+      if (!first) tok = skip(tok, ",");
+      first = false;
+      if (equal(tok, "}")) break;
+      if (!m)
+        error_tok(tok, "excess elements in struct compound literal");
+      if (equal(tok, "{"))
+        error_tok(tok, "parse_v2: nested brace init in compound literal not supported");
+      Node *e = assign(&tok, tok);
+      Node *vref = new_var_node(var, open);
+      Node *mn = new_unary(ND_MEMBER, vref, open);
+      mn->member = m;
+      Node *as = new_binary(ND_ASSIGN, mn, e, open);
+      chain = new_binary(ND_COMMA, chain, as, open);
+      m = m->next;
+    }
+    tok = skip(tok, "}");
+  } else {
+    // Scalar T x = {expr};
+    if (!equal(tok, "}")) {
+      Node *e = assign(&tok, tok);
+      Node *vref = new_var_node(var, open);
+      Node *as = new_binary(ND_ASSIGN, vref, e, open);
+      chain = new_binary(ND_COMMA, chain, as, open);
+      if (equal(tok, ",")) tok = tok->next;
+    }
+    tok = skip(tok, "}");
+  }
+  *rest = tok;
+  return chain;
+}
+
 // postfix — 04b §H suffix loop.  Subset:
 //   primary [ expr ]
 //   primary ( arg-list )
@@ -2896,7 +2975,27 @@ static Node *unary(Token **rest, Token *tok) {
 //   primary -> ident      (deferred)
 //   primary ++ / --       (deferred — needs to_assign)
 static Node *postfix(Token **rest, Token *tok) {
-  Node *node = primary(&tok, tok);
+  Node *node = NULL;
+
+  // Compound literal at head: ( typename ) { ... } — 04b §H.1.
+  if (equal(tok, "(") && is_typename(tok->next)) {
+    Token *probe;
+    Type *cl_ty = typename_(&probe, tok->next);
+    if (equal(probe, ")") && equal(probe->next, "{")) {
+      tok = probe->next;
+      if (current_fn) {
+        Obj *anon = new_lvar(new_unique_name(), cl_ty);
+        Node *chain = init_compound_literal(&tok, tok, anon);
+        Node *vref = new_var_node(anon, tok);
+        node = new_binary(ND_COMMA, chain, vref, tok);
+      } else {
+        error_tok(tok, "parse_v2: file-scope compound literal not yet implemented");
+      }
+    }
+  }
+
+  if (!node)
+    node = primary(&tok, tok);
 
   for (;;) {
     // [ expr ]  — *(node + idx).
