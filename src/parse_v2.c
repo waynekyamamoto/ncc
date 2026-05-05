@@ -389,14 +389,22 @@ Obj *parse(Token *tok) {
       continue;
     }
 
-    // Otherwise: a declaration.  is_typename guards garbage input
-    // so the failure mode is a clear "expected declaration" rather
-    // than declspec errors mid-token.
-    if (!is_typename(tok))
-      error_tok(tok, "parse_v2: expected declaration");
-
+    // C89 implicit-int rule: if the leading token is an identifier
+    // followed by `(`, accept it as a function with implicit `int`
+    // return type.  GCC's older flag combination, used heavily in
+    // the torture corpus.  Strict C99 rejects this — match canonical
+    // ncc which is permissive.
     VarAttr attr = {0};
-    Type *basety = declspec(&tok, tok, &attr);
+    Type *basety;
+    if (!is_typename(tok)) {
+      if (tok->kind == TK_IDENT && equal(tok->next, "(")) {
+        basety = ty_int;
+      } else {
+        error_tok(tok, "parse_v2: expected declaration");
+      }
+    } else {
+      basety = declspec(&tok, tok, &attr);
+    }
 
     if (attr.is_typedef) {
       tok = parse_typedef(tok, basety);
