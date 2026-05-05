@@ -928,6 +928,15 @@ static Type *struct_or_union(Token **rest, Token *tok, bool is_union) {
   if (early_ty.is_packed) ty->is_packed = true;
   if (early_attr.align && early_attr.align > ty->align) ty->align = early_attr.align;
 
+  // Register the tag BEFORE parsing members, so self-referential
+  // pointer fields (`struct S { struct S *next; }`) resolve to this
+  // type rather than creating a fresh incomplete one.
+  if (tag) {
+    TagScope *ts = find_tag(tag);
+    if (!ts)
+      push_tag_scope(tag, ty);
+  }
+
   ty->members = struct_members(&tok, tok);
   if (is_union)
     union_layout(ty);
@@ -941,14 +950,6 @@ static Type *struct_or_union(Token **rest, Token *tok, bool is_union) {
     tok = attribute_list(tok->next, ty, NULL);
     if (!was_packed && ty->is_packed && !is_union)
       struct_layout(ty);
-  }
-
-  if (tag) {
-    // Push only if not already in scope (avoid duplicate entries
-    // when reusing an incomplete forward declaration).
-    TagScope *ts = find_tag(tag);
-    if (!ts)
-      push_tag_scope(tag, ty);
   }
 
   *rest = tok;
@@ -1702,7 +1703,24 @@ static Token *parse_gvar_initializer(Token *tok, Obj *var) {
         rels[count] = anon->name;
         tok = tok->next;
       } else {
-        vals[count] = const_expr_val(&tok, tok);
+        // Try parsing as an expression first to detect address-
+        // taken globals and function references, then fall back to
+        // const_expr_val for plain integers.
+        Token *probe = tok;
+        Node *e = assign(&probe, tok);
+        add_type(e);
+        if (e->kind == ND_ADDR && e->lhs && e->lhs->kind == ND_VAR &&
+            e->lhs->var && !e->lhs->var->is_local) {
+          rels[count] = e->lhs->var->name;
+          tok = probe;
+        } else if (e->kind == ND_VAR && e->var && !e->var->is_local &&
+                   e->var->ty && (e->var->ty->kind == TY_FUNC ||
+                                   e->var->ty->kind == TY_ARRAY)) {
+          rels[count] = e->var->name;
+          tok = probe;
+        } else {
+          vals[count] = const_expr_val(&tok, tok);
+        }
       }
       count++;
     }
