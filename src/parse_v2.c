@@ -89,9 +89,24 @@ int gvar_cnt;
 static Obj *globals;
 static Scope *scope;
 
+// Per-function state.  Saved on the C stack across nested function
+// definitions in `function` (04c §F.1).
+static Obj  *current_fn;
+static Obj  *locals;
+static Node *gotos;
+static Node *labels;
+static char *brk_label;
+static char *cont_label;
+static Node *current_switch;
+
 //
 // Forward declarations.
 //
+static Node *expr(Token **rest, Token *tok);
+static Node *assign(Token **rest, Token *tok);
+static Node *primary(Token **rest, Token *tok);
+static Node *stmt(Token **rest, Token *tok);
+static Node *compound_stmt(Token **rest, Token *tok);
 static Type *declspec(Token **rest, Token *tok, VarAttr *attr);
 static Type *declarator(Token **rest, Token *tok, Type *ty);
 static Type *type_suffix(Token **rest, Token *tok, Type *ty);
@@ -156,6 +171,34 @@ static void push_tag_scope(Token *tok, Type *ty) {
 #endif
 
 //
+// Node construction helpers (04b_expr.md §A).
+//
+
+static Node *new_node(NodeKind kind, Token *tok) {
+  Node *node = calloc_checked(1, sizeof(Node));
+  node->kind = kind;
+  node->tok = tok;
+  return node;
+}
+
+static Node *new_unary(NodeKind kind, Node *expr_, Token *tok) {
+  Node *node = new_node(kind, tok);
+  node->lhs = expr_;
+  return node;
+}
+
+static Node *new_num(int64_t val, Token *tok) {
+  Node *node = new_node(ND_NUM, tok);
+  node->val = val;
+  node->ty = ty_int;
+  return node;
+}
+
+static char *new_unique_name(void) {
+  return format(".L..%d", label_cnt++);
+}
+
+//
 // Variable creation helpers (04a_decl.md §J).
 //
 
@@ -174,6 +217,14 @@ static Obj *new_gvar(char *name, Type *ty) {
   var->is_definition = true;
   var->is_static = false;
   globals = var;
+  return var;
+}
+
+static Obj *new_lvar(char *name, Type *ty) {
+  Obj *var = new_var(name, ty);
+  var->is_local = true;
+  var->next = locals;
+  locals = var;
   return var;
 }
 
@@ -630,9 +681,124 @@ static Token *parse_typedef(Token *tok, Type *basety) {
   error_tok(tok, "parse_v2: parse_typedef not yet implemented");
 }
 
+// function — definition body parsing (04c_stmt.md §F).  basety is
+// retained from the caller for future K&R param-merging; currently
+// unused since we don't yet emit K&R-style parameter promotions.
 static Token *function(Token *tok, Type *basety, Type *ty, VarAttr *attr) {
-  (void)basety; (void)ty; (void)attr;
-  error_tok(tok, "parse_v2: function (definition body) not yet implemented");
+  (void)basety;
+
+  if (!ty->name)
+    error_tok(tok, "parse_v2: function definition requires a name");
+
+  char *name = strndup_checked(ty->name->loc, ty->name->len);
+
+  // §F.1 — create / resolve Obj.  Forward decls: re-use the existing
+  // global by name lookup so codegen sees a single Obj.  Simplified
+  // for now: always new_gvar, which will shadow any prior decl in
+  // the symbol chain.  (Future: dedupe via push_scope's var lookup.)
+  Obj *fn = new_gvar(name, ty);
+  fn->is_function = true;
+  fn->is_definition = true;
+  fn->is_static = attr->is_static;
+  fn->is_inline = attr->is_inline;
+  fn->is_variadic = ty->is_variadic;
+
+  // Save per-function state (§F.1 step 3).
+  Obj  *saved_current_fn    = current_fn;
+  Obj  *saved_locals        = locals;
+  Node *saved_gotos         = gotos;
+  Node *saved_labels        = labels;
+  char *saved_brk           = brk_label;
+  char *saved_cont          = cont_label;
+  Node *saved_switch        = current_switch;
+  current_fn = fn;
+  locals = NULL;
+  gotos = NULL;
+  labels = NULL;
+  brk_label = NULL;
+  cont_label = NULL;
+  current_switch = NULL;
+
+  enter_scope();
+
+  // §F.2 — register parameters (declared order: walk the param Type
+  // chain front-to-back, build Obj in reverse via new_lvar so locals
+  // ends up in declaration order).
+  Obj *param_head = NULL;
+  for (Type *pt = ty->params; pt; pt = pt->next) {
+    char *pname;
+    if (pt->name && pt->name->len > 0)
+      pname = strndup_checked(pt->name->loc, pt->name->len);
+    else
+      pname = new_unique_name();
+    Obj *p = new_lvar(pname, pt);
+    // Splice into a separate params chain — locals already holds it
+    // via new_lvar, but the Obj.params field expects *only* the
+    // parameter Objs in declaration order.
+    p->next = NULL;
+    (void)p;
+    // We rebuild fn->params after the loop from `locals` (which is
+    // now in declaration order because we walked params front-to-back
+    // and prepended).  Wait — new_lvar prepends, so locals is in
+    // reverse-declaration order.  Reverse it below.
+    (void)param_head;
+  }
+  // Reverse `locals` so it's in declaration order, then assign as
+  // fn->params.  After this, additional locals from the body will be
+  // prepended; fn->locals is set at the end of body parsing.
+  Obj *rev = NULL;
+  while (locals) {
+    Obj *n = locals->next;
+    locals->next = rev;
+    rev = locals;
+    locals = n;
+  }
+  locals = rev;
+  fn->params = locals;
+
+  // §F.4 — alloca infrastructure.  Always emit __alloca_bottom__.
+  // Variadic gets __va_area__.
+  if (fn->is_variadic) {
+    Obj *va = new_lvar("__va_area__", pointer_to(ty_char));
+    va->align = 8;
+    fn->va_area = va;
+  }
+  fn->alloca_bottom = new_lvar("__alloca_bottom__", pointer_to(ty_char));
+
+  // §F.5 — body.
+  tok = skip(tok, "{");
+  Node *body = compound_stmt(&tok, tok);
+  add_type(body);
+
+  // Resolve labels (§E.5).  No labels possible yet without goto/label
+  // statements, but the walk is harmless.
+  for (Node *g = gotos; g; g = g->goto_next) {
+    if (g->kind == ND_LABEL_VAL) continue;
+    for (Node *l = labels; l; l = l->goto_next) {
+      if (g->label && l->label && !strcmp(g->label, l->label)) {
+        g->unique_label = l->unique_label;
+        break;
+      }
+    }
+    if (!g->unique_label)
+      error_tok(g->tok, "use of undeclared label");
+  }
+
+  fn->body = body;
+  fn->locals = locals;
+
+  leave_scope();
+
+  // Restore per-function state.
+  current_fn     = saved_current_fn;
+  locals         = saved_locals;
+  gotos          = saved_gotos;
+  labels         = saved_labels;
+  brk_label      = saved_brk;
+  cont_label     = saved_cont;
+  current_switch = saved_switch;
+
+  return tok;
 }
 
 //
@@ -927,6 +1093,85 @@ static Token *skip_attribute(Token *tok) {
 // const-expr via try_eval_node and emits the message on failure.
 static Token *skip_static_assert(Token *tok) {
   error_tok(tok, "parse_v2: _Static_assert not yet implemented");
+}
+
+//
+// Statement zone (04c_stmt.md).
+//
+
+// compound_stmt — `{` already consumed by caller.  Parses statements
+// until `}` and returns an ND_BLOCK.  Currently only dispatches to
+// stmt() — local declarations and other branches land in later
+// commits.
+static Node *compound_stmt(Token **rest, Token *tok) {
+  Node *node = new_node(ND_BLOCK, tok);
+  Node head = {0};
+  Node *cur = &head;
+
+  enter_scope();
+  while (!equal(tok, "}")) {
+    cur = cur->next = stmt(&tok, tok);
+    add_type(cur);
+  }
+  leave_scope();
+
+  *rest = skip(tok, "}");
+  node->body = head.next;
+  return node;
+}
+
+// stmt — statement dispatch.  Currently handles only what the
+// vertical slice needs: `return` and block.  Other branches land
+// incrementally per 04c.
+static Node *stmt(Token **rest, Token *tok) {
+  // `return` ;
+  // `return` expr ;
+  if (equal(tok, "return")) {
+    if (equal(tok->next, ";")) {
+      Node *node = new_unary(ND_RETURN, NULL, tok);
+      *rest = tok->next->next;
+      return node;
+    }
+    Token *ret_tok = tok;
+    Node *e = expr(&tok, tok->next);
+    add_type(e);
+    Type *ret_ty = current_fn ? current_fn->ty->return_ty : ty_int;
+    Node *node = new_unary(ND_RETURN, new_cast(e, ret_ty), ret_tok);
+    *rest = skip(tok, ";");
+    return node;
+  }
+
+  // Block.
+  if (equal(tok, "{"))
+    return compound_stmt(rest, tok->next);
+
+  error_tok(tok, "parse_v2: unsupported statement (slice incomplete)");
+}
+
+//
+// Expression zone (04b_expr.md) — vertical-slice subset.
+//
+
+// expr → assign  (no comma operator yet)
+static Node *expr(Token **rest, Token *tok) {
+  return assign(rest, tok);
+}
+
+// assign → primary  (no operator ladder yet)
+static Node *assign(Token **rest, Token *tok) {
+  return primary(rest, tok);
+}
+
+// primary — vertical-slice subset: TK_NUM only.
+static Node *primary(Token **rest, Token *tok) {
+  if (tok->kind == TK_NUM) {
+    Node *node = new_num(tok->val, tok);
+    if (tok->ty)
+      node->ty = tok->ty;
+    *rest = tok->next;
+    return node;
+  }
+  error_tok(tok, "parse_v2: unsupported primary expression (slice incomplete)");
 }
 
 //
