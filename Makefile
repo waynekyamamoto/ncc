@@ -2,17 +2,26 @@ CC = clang
 CFLAGS = -Wall -Wextra -Werror -std=c11 -g -O2 -Wno-unused-parameter -Wno-switch -Wno-missing-field-initializers -Wno-sign-compare
 LDFLAGS =
 
-SRCS = $(wildcard src/*.c)
-OBJS = $(SRCS:.c=.o)
+# Phase 4 dual-build: ncc links src/parse.c (chibicc-lineage),
+# ncc-v2 links src/parse_v2.c (spec-derived per docs/specs/04*.md).
+# Both share all other src/*.c and cc.h.  When validation passes
+# (bootstrap fixed-point + torture + real programs) for ncc-v2, the
+# swap-in step makes parse_v2.c canonical and drops the dual-build.
 
-ncc: $(OBJS)
+COMMON_SRCS = $(filter-out src/parse.c src/parse_v2.c, $(wildcard src/*.c))
+COMMON_OBJS = $(COMMON_SRCS:.c=.o)
+
+ncc: $(COMMON_OBJS) src/parse.o
+	$(CC) $(LDFLAGS) -o $@ $^
+
+ncc-v2: $(COMMON_OBJS) src/parse_v2.o
 	$(CC) $(LDFLAGS) -o $@ $^
 
 src/%.o: src/%.c src/cc.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
-	rm -f ncc src/*.o
+	rm -f ncc ncc-v2 src/*.o
 
 test: ncc
 	@echo "=== Basic test ==="

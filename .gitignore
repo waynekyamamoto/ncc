@@ -1,6 +1,7 @@
 # Build artifacts
 build/
 ncc
+ncc-v2
 ncc_asan
 ncc_debug
 src/*.o
@@ -21,6 +22,8 @@ tests/sqlite/test_*
 # Bootstrap stages (generated)
 stage1/
 stage2/
+stage1_v2/
+stage2_v2/
 
 # Claude internal state
 .claude/
