@@ -3075,6 +3075,114 @@ static Node *primary(Token **rest, Token *tok) {
       return node;
     }
 
+    // __builtin_offsetof(type, member) — folded.  Subset: top-level
+    // member only (no `.sub.sub` or `[i]` chain).  Wider chains land
+    // when needed.
+    if (tok_name_eq(tok, "__builtin_offsetof")) {
+      Token *bi = tok;
+      tok = skip(tok->next, "(");
+      Type *ty = typename_(&tok, tok);
+      tok = skip(tok, ",");
+      if (ty->kind != TY_STRUCT && ty->kind != TY_UNION)
+        error_tok(bi, "offsetof requires struct/union type");
+      if (tok->kind != TK_IDENT)
+        error_tok(tok, "expected member name");
+      Member *m = find_member(ty, tok);
+      if (!m) {
+        // Search anonymous members.
+        for (Member *am = ty->members; am; am = am->next) {
+          if (am->name) continue;
+          if (am->ty->kind != TY_STRUCT && am->ty->kind != TY_UNION) continue;
+          Member *inner = find_member(am->ty, tok);
+          if (inner) {
+            // Return cumulative offset.  Anonymous members aren't
+            // bitfields in our subset, so direct add.
+            tok = tok->next;
+            tok = skip(tok, ")");
+            *rest = tok;
+            Node *n = new_num(am->offset + inner->offset, bi);
+            n->ty = ty_ulong;
+            return n;
+          }
+        }
+        error_tok(tok, "no such member");
+      }
+      tok = tok->next;
+      tok = skip(tok, ")");
+      *rest = tok;
+      Node *n = new_num(m->offset, bi);
+      n->ty = ty_ulong;
+      return n;
+    }
+
+    // __builtin_alloca(size) — emit ND_BUILTIN_ALLOCA with one arg.
+    if (tok_name_eq(tok, "__builtin_alloca") || tok_name_eq(tok, "alloca")) {
+      Token *bi = tok;
+      tok = skip(tok->next, "(");
+      Node *sz = assign(&tok, tok);
+      tok = skip(tok, ")");
+      *rest = tok;
+      Node *n = new_unary(ND_BUILTIN_ALLOCA, sz, bi);
+      n->ty = pointer_to(ty_void);
+      return n;
+    }
+
+    // __builtin_frame_address(N) — ND_BUILTIN_FRAME_ADDR with depth.
+    if (tok_name_eq(tok, "__builtin_frame_address")) {
+      Token *bi = tok;
+      tok = skip(tok->next, "(");
+      int64_t depth = const_expr_val(&tok, tok);
+      tok = skip(tok, ")");
+      *rest = tok;
+      Node *n = new_node(ND_BUILTIN_FRAME_ADDR, bi);
+      n->val = depth;
+      n->ty = pointer_to(ty_void);
+      return n;
+    }
+
+    // __builtin_return_address(N) — ND_RETURN_ADDR with depth.
+    if (tok_name_eq(tok, "__builtin_return_address")) {
+      Token *bi = tok;
+      tok = skip(tok->next, "(");
+      int64_t depth = const_expr_val(&tok, tok);
+      tok = skip(tok, ")");
+      *rest = tok;
+      Node *n = new_node(ND_RETURN_ADDR, bi);
+      n->val = depth;
+      n->ty = pointer_to(ty_void);
+      return n;
+    }
+
+    // __builtin_(add|sub|mul)_overflow(a, b, &result) — 3-arg form.
+    {
+      const char *names[] = {"__builtin_add_overflow",
+                             "__builtin_sub_overflow",
+                             "__builtin_mul_overflow"};
+      NodeKind kinds[] = {ND_BUILTIN_ADD_OVERFLOW,
+                          ND_BUILTIN_SUB_OVERFLOW,
+                          ND_BUILTIN_MUL_OVERFLOW};
+      for (int i = 0; i < 3; i++) {
+        if (!tok_name_eq(tok, names[i])) continue;
+        Token *bi = tok;
+        tok = skip(tok->next, "(");
+        Node *a = assign(&tok, tok);
+        tok = skip(tok, ",");
+        Node *b = assign(&tok, tok);
+        tok = skip(tok, ",");
+        Node *out = assign(&tok, tok);
+        tok = skip(tok, ")");
+        *rest = tok;
+        add_type(out);
+        Node *n = new_node(kinds[i], bi);
+        n->lhs = a;
+        n->rhs = b;
+        n->args = out;  // codegen reads result-pointer expression here
+        n->overflow_ty = out->ty && out->ty->base ? out->ty->base : ty_int;
+        n->ty = ty_int;  // returns 0/1 overflow flag
+        return n;
+      }
+    }
+
     // __builtin_va_start(ap, last) — Apple ARM64: ap = __va_area__.
     if (tok_name_eq(tok, "__builtin_va_start")) {
       Token *bi = tok;
