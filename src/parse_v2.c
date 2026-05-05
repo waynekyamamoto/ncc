@@ -1175,10 +1175,22 @@ static Token *function(Token *tok, Type *basety, Type *ty, VarAttr *attr) {
   Node *body = compound_stmt(&tok, tok);
   add_type(body);
 
-  // Resolve labels (§E.5).  No labels possible yet without goto/label
-  // statements, but the walk is harmless.
+  // Resolve labels (04c §E.5).
+  // Direct goto:  copy l->unique_label into g->unique_label.
+  // ND_LABEL_VAL: the label was minted at the &&-site, so copy
+  //               g->unique_label into the matching ND_LABEL so
+  //               codegen emits a single label for both.
   for (Node *g = gotos; g; g = g->goto_next) {
-    if (g->kind == ND_LABEL_VAL) continue;
+    if (g->kind == ND_LABEL_VAL) {
+      for (Node *l = labels; l; l = l->goto_next) {
+        if (g->label && l->label && !strcmp(g->label, l->label)) {
+          l->unique_label = g->unique_label;
+          break;
+        }
+      }
+      continue;
+    }
+    if (g->unique_label) continue;  // break/continue resolved already
     for (Node *l = labels; l; l = l->goto_next) {
       if (g->label && l->label && !strcmp(g->label, l->label)) {
         g->unique_label = l->unique_label;
@@ -1783,11 +1795,20 @@ static Node *stmt(Token **rest, Token *tok) {
     return node;
   }
 
-  // goto IDENT ; (04c §E.1, direct form).
+  // goto (04c §E.1).  Direct: `goto IDENT;`.  Computed: `goto * expr;`.
   if (equal(tok, "goto")) {
+    Token *g_tok = tok;
+    // Computed form.
+    if (equal(tok->next, "*")) {
+      Node *e = expr(&tok, tok->next->next);
+      Node *node = new_unary(ND_GOTO_EXPR, e, g_tok);
+      *rest = skip(tok, ";");
+      return node;
+    }
+    // Direct form.
     if (tok->next->kind != TK_IDENT)
       error_tok(tok->next, "expected label");
-    Node *node = new_node(ND_GOTO, tok);
+    Node *node = new_node(ND_GOTO, g_tok);
     node->label = strndup_checked(tok->next->loc, tok->next->len);
     node->goto_next = gotos;
     gotos = node;
@@ -2370,6 +2391,34 @@ static Node *unary(Token **rest, Token *tok) {
     Token *op = tok;
     Node *operand = cast(rest, tok->next);
     return new_unary(ND_NOT, operand, op);
+  }
+
+  // §G.9 — &&label (labels-as-values, GCC).  Reuse a prior matching
+  // ND_LABEL_VAL's unique_label so multiple references resolve to
+  // the same emitted label.
+  if (equal(tok, "&&")) {
+    if (tok->next->kind != TK_IDENT)
+      error_tok(tok->next, "expected label after `&&`");
+    Token *lab_tok = tok->next;
+    char *name = strndup_checked(lab_tok->loc, lab_tok->len);
+
+    char *uniq = NULL;
+    for (Node *g = gotos; g; g = g->goto_next) {
+      if (g->kind == ND_LABEL_VAL && g->label && !strcmp(g->label, name)) {
+        uniq = g->unique_label;
+        break;
+      }
+    }
+    if (!uniq)
+      uniq = format("_cg_%d", label_cnt++);
+
+    Node *node = new_node(ND_LABEL_VAL, tok);
+    node->label = name;
+    node->unique_label = uniq;
+    node->goto_next = gotos;
+    gotos = node;
+    *rest = lab_tok->next;
+    return node;
   }
 
   // §G.6 — bitwise not.
