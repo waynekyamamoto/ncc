@@ -158,6 +158,9 @@ static Node *new_sub(Node *lhs, Node *rhs, Token *tok);
 static Obj *new_anon_gvar(Type *ty);
 static int64_t const_expr_val(Token **rest, Token *tok);
 static bool try_eval_double_v2(Node *n, double *out);
+static Token *gvar_subinit_recursive(Token *tok, Type *ty, char *buf,
+                                      long base_off, long buf_sz,
+                                      Relocation **rh_tail);
 static Type *typename_(Token **rest, Token *tok);
 static Node *expr(Token **rest, Token *tok);
 static Node *assign(Token **rest, Token *tok);
@@ -1797,9 +1800,8 @@ static Token *parse_gvar_initializer(Token *tok, Obj *var) {
           buf[m->offset + i] = tok->str[i];
         tok = tok->next;
       } else if (equal(tok, "{")) {
-        // Nested aggregate — skip with error (could fall back to
-        // a sub-init, but for now we surface clearly).
-        error_tok(tok, "parse_v2: nested aggregate gvar init not yet implemented");
+        // Nested aggregate field — recurse.
+        tok = gvar_subinit_recursive(tok, m->ty, buf, m->offset, sz, &rcur);
       } else {
         int64_t v = const_expr_val(&tok, tok);
         for (int b = 0; b < (int)m->ty->size; b++)
@@ -4131,4 +4133,159 @@ static bool try_eval_double_v2(Node *n, double *out) {
     }
     return false;
   }
+}
+
+// gvar_subinit_recursive — write the initializer for a value of `ty`
+// into `buf` at `base_off`, threading relocations through `*rh_tail`.
+// Recurses through nested aggregates.  Returns the token after the
+// consumed initializer.
+//
+// Subset:
+//   - Empty `{}` → zero-init (already in buf).
+//   - char[] = "literal" or {char-array brace}.
+//   - char* = "literal" → anon gvar + relocation.
+//   - TY_STRUCT brace with optional .field designators.
+//   - TY_UNION brace with first-member or .field.
+//   - TY_ARRAY brace with element-wise recursion.
+//   - Scalar leaves: integer / pointer (with `&gvar` reloc) / flonum.
+static Token *gvar_subinit_recursive(Token *tok, Type *ty, char *buf,
+                                      long base_off, long buf_sz,
+                                      Relocation **rh_tail) {
+  if (equal(tok, "{") && equal(tok->next, "}")) {
+    return tok->next->next;
+  }
+
+  if (tok->kind == TK_STR && ty->kind == TY_ARRAY &&
+      ty->base->kind == TY_CHAR) {
+    long s = tok->ty->array_len;
+    long n = ty->array_len > 0 && ty->array_len < s ? ty->array_len : s;
+    for (long i = 0; i < n && (base_off + i) < buf_sz; i++)
+      buf[base_off + i] = tok->str[i];
+    return tok->next;
+  }
+
+  if (tok->kind == TK_STR && ty->kind == TY_PTR &&
+      ty->base->kind == TY_CHAR) {
+    Obj *anon = new_anon_gvar(tok->ty);
+    anon->init_data = tok->str;
+    anon->init_data_size = tok->ty->size;
+    Relocation *r = calloc_checked(1, sizeof(Relocation));
+    r->offset = (int)base_off;
+    r->label = &anon->name;
+    *rh_tail = (*rh_tail)->next = r;
+    return tok->next;
+  }
+
+  if (equal(tok, "{")) {
+    tok = tok->next;
+    if (ty->kind == TY_STRUCT) {
+      Member *m = ty->members;
+      bool first = true;
+      while (!equal(tok, "}")) {
+        if (!first) tok = skip(tok, ",");
+        first = false;
+        if (equal(tok, "}")) break;
+        if (equal(tok, ".")) {
+          tok = tok->next;
+          if (tok->kind != TK_IDENT)
+            error_tok(tok, "expected member name");
+          Member *target = find_member(ty, tok);
+          if (!target) error_tok(tok, "no such member");
+          tok = skip(tok->next, "=");
+          m = target;
+        }
+        if (!m)
+          error_tok(tok, "excess elements in struct initializer");
+        tok = gvar_subinit_recursive(tok, m->ty, buf,
+                                      base_off + m->offset, buf_sz, rh_tail);
+        m = m->next;
+      }
+      return skip(tok, "}");
+    }
+    if (ty->kind == TY_UNION) {
+      Member *m = ty->members;
+      if (equal(tok, ".")) {
+        tok = tok->next;
+        if (tok->kind != TK_IDENT)
+          error_tok(tok, "expected member name");
+        Member *target = find_member(ty, tok);
+        if (!target) error_tok(tok, "no such member");
+        tok = skip(tok->next, "=");
+        m = target;
+      }
+      if (m && !equal(tok, "}"))
+        tok = gvar_subinit_recursive(tok, m->ty, buf, base_off, buf_sz, rh_tail);
+      if (equal(tok, ",")) tok = tok->next;
+      return skip(tok, "}");
+    }
+    if (ty->kind == TY_ARRAY) {
+      long elem_sz = ty->base->size;
+      long count = 0;
+      bool first = true;
+      while (!equal(tok, "}")) {
+        if (!first) tok = skip(tok, ",");
+        first = false;
+        if (equal(tok, "}")) break;
+        if (ty->array_len > 0 && count >= ty->array_len)
+          break;
+        tok = gvar_subinit_recursive(tok, ty->base, buf,
+                                      base_off + count * elem_sz, buf_sz,
+                                      rh_tail);
+        count++;
+      }
+      return skip(tok, "}");
+    }
+    error_tok(tok, "parse_v2: brace init for non-aggregate type");
+  }
+
+  if (is_flonum(ty)) {
+    Node *e = assign(&tok, tok);
+    add_type(e);
+    double dv;
+    if (!try_eval_double_v2(e, &dv))
+      error_tok(tok, "parse_v2: gvar scalar float not const-foldable");
+    if (ty->kind == TY_FLOAT) {
+      float f = (float)dv;
+      memcpy(buf + base_off, &f, 4);
+    } else {
+      long sz = ty->size;
+      memcpy(buf + base_off, &dv, sz < 8 ? (size_t)sz : 8);
+    }
+    return tok;
+  }
+
+  if (ty->kind == TY_PTR) {
+    Token *probe = tok;
+    Node *e = assign(&probe, tok);
+    add_type(e);
+    if (e->kind == ND_ADDR && e->lhs && e->lhs->kind == ND_VAR &&
+        e->lhs->var && !e->lhs->var->is_local) {
+      Relocation *r = calloc_checked(1, sizeof(Relocation));
+      r->offset = (int)base_off;
+      r->label = &e->lhs->var->name;
+      r->addend = 0;
+      *rh_tail = (*rh_tail)->next = r;
+      return probe;
+    }
+    if (e->kind == ND_VAR && e->var && !e->var->is_local && e->var->ty &&
+        (e->var->ty->kind == TY_ARRAY || e->var->ty->kind == TY_FUNC)) {
+      Relocation *r = calloc_checked(1, sizeof(Relocation));
+      r->offset = (int)base_off;
+      r->label = &e->var->name;
+      r->addend = 0;
+      *rh_tail = (*rh_tail)->next = r;
+      return probe;
+    }
+    int64_t v = const_expr_val(&tok, tok);
+    long sz = ty->size;
+    for (long b = 0; b < sz && base_off + b < buf_sz; b++)
+      buf[base_off + b] = (v >> (b * 8)) & 0xff;
+    return tok;
+  }
+
+  int64_t v = const_expr_val(&tok, tok);
+  long sz = ty->size;
+  for (long b = 0; b < sz && base_off + b < buf_sz; b++)
+    buf[base_off + b] = (v >> (b * 8)) & 0xff;
+  return tok;
 }
