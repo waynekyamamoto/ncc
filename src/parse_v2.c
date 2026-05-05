@@ -106,6 +106,8 @@ static Node *declaration(Token **rest, Token *tok, Type *basety, VarAttr *attr);
 static Node *new_var_node(Obj *var, Token *tok);
 static Node *to_assign(Node *binary);
 static Node *new_inc_dec(Node *node, Token *tok, int addend);
+static Node *new_add(Node *lhs, Node *rhs, Token *tok);
+static Node *new_sub(Node *lhs, Node *rhs, Token *tok);
 static int64_t const_expr_val(Token **rest, Token *tok);
 static Type *typename_(Token **rest, Token *tok);
 static Node *expr(Token **rest, Token *tok);
@@ -1930,14 +1932,118 @@ static Node *declaration(Token **rest, Token *tok, Type *basety, VarAttr *attr) 
       var->align = attr->align;
 
     if (equal(tok, "=")) {
-      // Scalar initializer fast path: `T x = expr;` lowers to an
-      // ND_EXPR_STMT(ND_ASSIGN(var, expr)).  Brace-form, struct, and
-      // array initializers route through lvar_initializer (deferred).
-      if (equal(tok->next, "{"))
-        error_tok(tok, "parse_v2: brace initializer not yet implemented");
       Token *eq = tok;
+      tok = tok->next;
+
+      // String literal initializing a char array.  04d §F.
+      if (tok->kind == TK_STR && ty->kind == TY_ARRAY &&
+          ty->base->kind == TY_CHAR) {
+        // Memzero first (so trailing slots are zero per C11).
+        Node *memzero = new_node(ND_MEMZERO, eq);
+        memzero->var = var;
+        Node *chain = memzero;
+
+        // Resolve incomplete length from the string size (including NUL).
+        long s = tok->ty->array_len;
+        if (var->ty->array_len < 0) {
+          var->ty = array_of(var->ty->base, s);
+          ty = var->ty;
+        }
+        long n = ty->array_len < s ? ty->array_len : s;
+        for (long i = 0; i < n; i++) {
+          Node *vref = new_var_node(var, eq);
+          Node *sum = new_add(vref, new_num(i, eq), eq);
+          Node *deref = new_unary(ND_DEREF, sum, eq);
+          Node *val = new_num((unsigned char)tok->str[i], eq);
+          Node *as = new_binary(ND_ASSIGN, deref, val, eq);
+          chain = new_binary(ND_COMMA, chain, as, eq);
+        }
+        cur = cur->next = new_unary(ND_EXPR_STMT, chain, eq);
+        tok = tok->next;
+        continue;
+      }
+
+      // Brace initializer for arrays of scalars (and zero-init `{}`).
+      // Brace-elision and nested aggregates deferred — full
+      // lvar_initializer machinery lives in §G of 04d_init.md.
+      if (equal(tok, "{")) {
+        Node *memzero = new_node(ND_MEMZERO, eq);
+        memzero->var = var;
+        Node *chain = memzero;
+        tok = tok->next;
+
+        if (ty->kind == TY_ARRAY) {
+          long i = 0;
+          long cap = ty->array_len;  // -1 for incomplete
+          while (!equal(tok, "}")) {
+            if (i > 0) tok = skip(tok, ",");
+            if (equal(tok, "}")) break;
+            // Recursive brace forms not yet supported.
+            if (equal(tok, "{"))
+              error_tok(tok, "parse_v2: nested brace initializer not yet implemented");
+            Node *e = assign(&tok, tok);
+            add_type(e);
+            // For `int a[3] = {0}` we may have cap >=0 and i < cap.
+            // For incomplete arrays we accept arbitrary length.
+            Node *vref = new_var_node(var, eq);
+            Node *sum = new_add(vref, new_num(i, eq), eq);
+            Node *deref = new_unary(ND_DEREF, sum, eq);
+            Node *as = new_binary(ND_ASSIGN, deref, e, eq);
+            chain = new_binary(ND_COMMA, chain, as, eq);
+            i++;
+            if (cap >= 0 && i >= cap) {
+              // Excess elements would land here; consume up to `}`.
+              while (!equal(tok, "}") && !equal(tok, ",")) tok = tok->next;
+            }
+          }
+          tok = skip(tok, "}");
+          if (cap < 0) {
+            var->ty = array_of(ty->base, i);
+            ty = var->ty;
+          }
+        } else if (ty->kind == TY_STRUCT) {
+          // Struct brace init — member-by-member.
+          Member *m = ty->members;
+          bool first2 = true;
+          while (!equal(tok, "}")) {
+            if (!first2) tok = skip(tok, ",");
+            first2 = false;
+            if (equal(tok, "}")) break;
+            if (!m)
+              error_tok(tok, "excess elements in struct initializer");
+            if (equal(tok, "{"))
+              error_tok(tok, "parse_v2: nested brace initializer not yet implemented");
+            Node *e = assign(&tok, tok);
+            add_type(e);
+            Node *vref = new_var_node(var, eq);
+            Node *mn = new_unary(ND_MEMBER, vref, eq);
+            mn->member = m;
+            Node *as = new_binary(ND_ASSIGN, mn, e, eq);
+            chain = new_binary(ND_COMMA, chain, as, eq);
+            m = m->next;
+          }
+          tok = skip(tok, "}");
+        } else {
+          // `T x = {expr};` — single-expr brace form for scalars.
+          if (!equal(tok, "}")) {
+            Node *e = assign(&tok, tok);
+            Node *vref = new_var_node(var, eq);
+            // Add_type's ND_ASSIGN case injects the cast for non-aggregate types.
+            Node *as = new_binary(ND_ASSIGN, vref, e, eq);
+            chain = new_binary(ND_COMMA, chain, as, eq);
+            // Trailing comma allowed.
+            if (equal(tok, ",")) tok = tok->next;
+          }
+          tok = skip(tok, "}");
+        }
+        cur = cur->next = new_unary(ND_EXPR_STMT, chain, eq);
+        continue;
+      }
+
+      // Scalar initializer fast path: `T x = expr;` lowers to an
+      // ND_EXPR_STMT(ND_ASSIGN(var, expr)).
       Node *lhs = new_var_node(var, ty->name);
-      Node *rhs = assign(&tok, tok->next);
+      Node *rhs = assign(&tok, tok);
       Node *expr_ = new_binary(ND_ASSIGN, lhs, rhs, eq);
       cur = cur->next = new_unary(ND_EXPR_STMT, expr_, eq);
     }
