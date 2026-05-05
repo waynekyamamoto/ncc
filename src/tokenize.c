@@ -397,7 +397,7 @@ static Token *read_number(char *start) {
   if (is_fp) {
     // Floating-point
     Token *tok = new_token(TK_NUM, start, p);
-    tok->fval = strtold(start, NULL);
+    tok->fval = strtod(start, NULL);
 
     // Parse float/imaginary suffix in any order: f, F, l, L, i, fi, if, iL, Li, etc.
     Type *base_ty = ty_double;
@@ -456,7 +456,7 @@ static Token *read_number(char *start) {
     ty = ty_longlong;
 
   if (int_imag) {
-    tok->fval = (long double)val;
+    tok->fval = (double)val;
     tok->ty = complex_type(ty);
   } else {
     tok->ty = ty;

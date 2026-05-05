@@ -92,7 +92,7 @@ struct Token {
   TokenKind kind;
   Token *next;
   int64_t val;        // Integer value (for TK_NUM)
-  long double fval;   // Float value (for TK_NUM)
+  double fval;        // Float value (for TK_NUM)
   char *loc;          // Token start position in source
   int len;            // Token length
   Type *ty;           // Type (for TK_NUM and TK_STR)
@@ -276,7 +276,7 @@ struct Node {
 
   // Numeric literal
   int64_t val;
-  long double fval;
+  double fval;
 
   // Overflow builtins
   Type *overflow_ty;
@@ -348,6 +348,8 @@ struct Obj {
                        // adjusted for named-arg consumption)
   Obj *va_reg_save;    // 64-byte GP register save area (ELF/AAPCS64 only).
                        // Prologue saves x0..x7 here at function entry.
+  Obj *va_vr_save;     // 128-byte VR register save area (ELF/AAPCS64 only).
+                       // Prologue saves d0..d7 here (16-byte slots) at entry.
   Obj *va_stack_save;  // pointer to caller's stack overflow start (ELF only;
                        // captured at function entry to seed va_list.__stack)
   Obj *alloca_bottom;  // __alloca_bottom__
@@ -562,6 +564,7 @@ extern StringArray global_asm;  // file-scope __asm("...") directives
 extern bool opt_fpic;
 extern bool opt_fcommon;
 extern bool opt_elf;
+extern bool opt_no_fp_varargs;
 extern char *base_file;
 
 // Counter for unique labels

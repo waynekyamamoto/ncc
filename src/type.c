@@ -4,11 +4,16 @@
 // ARM64 macOS type sizes:
 // char=1, short=2, int=4, long=8, long long=8, pointer=8
 // float=4, double=8, long double=8 (not 16 on Apple ARM64)
+// On Linux AArch64 (AAPCS64), char is unsigned by default.
 
 Type *ty_void = &(Type){TY_VOID, 1, 1};
 Type *ty_bool = &(Type){TY_BOOL, 1, 1, .is_unsigned = true};
 
+#ifdef __APPLE__
 Type *ty_char = &(Type){TY_CHAR, 1, 1};
+#else
+Type *ty_char = &(Type){TY_CHAR, 1, 1, .is_unsigned = true};
+#endif
 Type *ty_short = &(Type){TY_SHORT, 2, 2};
 Type *ty_int = &(Type){TY_INT, 4, 4};
 Type *ty_long = &(Type){TY_LONG, 8, 8};

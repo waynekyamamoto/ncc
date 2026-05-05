@@ -5873,6 +5873,9 @@ static Token *function(Token *tok, Type *fn_ty, VarAttr *attr) {
       Type *reg_save_ty = array_of(ty_char, 64);
       fn->va_reg_save = new_lvar("__va_reg_save__", reg_save_ty);
       fn->va_reg_save->align = 8;
+      Type *vr_save_ty = array_of(ty_char, 128);
+      fn->va_vr_save = new_lvar("__va_vr_save__", vr_save_ty);
+      fn->va_vr_save->align = 16;
       fn->va_stack_save = new_lvar("__va_stack_save__", pointer_to(ty_char));
       fn->va_stack_save->align = 8;
     }

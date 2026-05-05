@@ -23,17 +23,22 @@ mkdir -p stage1 stage2
 
 rm -f stage1/*.o stage1/ncc stage2/*.o stage2/ncc
 
+TARGET_FLAG=""
+if [ "$(uname)" = "Linux" ]; then
+    TARGET_FLAG="-target elf"
+fi
+
 echo "stage1: building ncc with host ncc"
 for f in src/*.c; do
-    ./ncc -c -o "stage1/$(basename "${f%.c}").o" "$f" || { echo "stage1 compile failed on $f" >&2; exit 2; }
+    ./ncc $TARGET_FLAG -c -o "stage1/$(basename "${f%.c}").o" "$f" || { echo "stage1 compile failed on $f" >&2; exit 2; }
 done
-./ncc -o stage1/ncc stage1/*.o || { echo "stage1 link failed" >&2; exit 2; }
+./ncc $TARGET_FLAG -o stage1/ncc stage1/*.o || { echo "stage1 link failed" >&2; exit 2; }
 
 echo "stage2: building ncc with stage1/ncc"
 for f in src/*.c; do
-    stage1/ncc -c -o "stage2/$(basename "${f%.c}").o" "$f" || { echo "stage2 compile failed on $f" >&2; exit 2; }
+    stage1/ncc $TARGET_FLAG -c -o "stage2/$(basename "${f%.c}").o" "$f" || { echo "stage2 compile failed on $f" >&2; exit 2; }
 done
-stage1/ncc -o stage2/ncc stage2/*.o || { echo "stage2 link failed" >&2; exit 2; }
+stage1/ncc $TARGET_FLAG -o stage2/ncc stage2/*.o || { echo "stage2 link failed" >&2; exit 2; }
 
 ln -sf stage2/ncc ncc2
 

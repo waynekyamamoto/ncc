@@ -1,5 +1,27 @@
 # NetBSD/aarch64 ncc port — overnight status
 
+Last updated: 2026-05-05.
+
+## Current state (2026-05-05 session)
+
+**MILESTONE: ncc-built MINIMAL_VIRT64 kernel boots to `root device:` on Linux/QEMU. 6/6 boot checks pass.**
+
+Boot command (Linux):
+```bash
+qemu-system-aarch64 -M virt,gic-version=3 -cpu cortex-a72 -m 512 -smp 4 -nographic \
+  -kernel /home/yamamoto/netbsd/obj/sys/arch/evbarm/compile/MINIMAL_VIRT64/netbsd.img
+```
+
+### Session 5 findings (Linux port)
+
+- **Linux build infrastructure**: `tools/native-kernel-build.sh` replaces Docker for Linux hosts.
+- **va_list bug**: Old ncc2 binary allocated `va_list ap` as 8 bytes (void*) at x29-8. va_start then wrote 32 bytes, overflowing into saved x29/LR and causing a Data Abort in `prop_string_create_format` → `vsnprintf`. Current ncc2 (May 5 11:59) correctly allocates ap as 32 bytes.
+- **Stale .o files**: `native-kernel-build.sh` used `find . -maxdepth 1 -name '*.o' -delete`, missing `lib/kern/prop_string.o` in a subdirectory. Fixed to `find . -name '*.o' -delete` (recursive).
+- **Parallel build race**: `-j 2` caused `nbctfconvert` to fail with "Invalid argument" on files still being written. Fixed by changing to `-j 1`.
+- **NEON ChaCha self-test failure**: Expected — kernel compiled with +nofp+nosimd. Non-fatal warning.
+
+---
+
 Last updated: 2026-04-29 (in progress).
 
 ## What landed in ncc this session

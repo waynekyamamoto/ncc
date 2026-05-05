@@ -1493,19 +1493,40 @@ static void gen_expr(Node *node) {
     }
     println("str x9, [x0, #8]");
 
-    // __vr_top = 0 (FP variadic args not supported here)
-    println("str xzr, [x0, #16]");
+    // __vr_top = &__va_vr_save__[128]
+    // With -no-fp-varargs (bare-metal +nofp targets): zero out __vr_top so
+    // va_arg always falls through to the stack path (no FP instructions).
+    if (fn->va_vr_save && !opt_no_fp_varargs) {
+      int vr_off = fn->va_vr_save->offset + 128;
+      if (vr_off >= 0 && vr_off <= 4095) {
+        println("add x9, x29, #%d", vr_off);
+      } else if (vr_off < 0 && -vr_off <= 4095) {
+        println("sub x9, x29, #%d", -vr_off);
+      } else if (vr_off < 0) {
+        load_imm("x9", (uint64_t)(-vr_off));
+        println("sub x9, x29, x9");
+      } else {
+        load_imm("x9", (uint64_t)vr_off);
+        println("add x9, x29, x9");
+      }
+      println("str x9, [x0, #16]");
+    } else {
+      println("str xzr, [x0, #16]");
+    }
 
     // __gr_offs = -((8 - gp_named) * 8); 0 if all 8 GP slots consumed.
     // GP-passable named params: anything not flonum that fits in <= 16 bytes
     // for struct, else 1 GP slot. ncc-internal use cases (format, error, ...)
     // are pointer/int only, so a count-of-non-flonum-params works.
     int gp_named = 0;
+    int vr_named = 0;
     for (Obj *p = fn->params; p; p = p->next) {
       if (!p->ty) continue;
       if (p->ty->kind == TY_FLOAT || p->ty->kind == TY_DOUBLE
-          || p->ty->kind == TY_LDOUBLE)
+          || p->ty->kind == TY_LDOUBLE) {
+        if (vr_named < 8) vr_named++;
         continue;
+      }
       if (p->ty->kind == TY_STRUCT || p->ty->kind == TY_UNION) {
         if (p->ty->size > 16) { gp_named += 1; continue; }
         gp_named += (p->ty->size > 8) ? 2 : 1;
@@ -1518,63 +1539,83 @@ static void gen_expr(Node *node) {
     println("mov w9, #%d", gr_offs);
     println("str w9, [x0, #24]");
 
-    // __vr_offs = 0 — no FP register save area
-    println("str wzr, [x0, #28]");
+    // __vr_offs = -((8 - vr_named) * 16); 0 if all VR slots consumed.
+    // With -no-fp-varargs: 0 forces va_arg to always use the stack path.
+    int vr_offs = (opt_no_fp_varargs || vr_named >= 8) ? 0 : -(8 - vr_named) * 16;
+    println("mov w9, #%d", vr_offs);
+    println("str w9, [x0, #28]");
     return;
   }
 
   case ND_VA_ARG_ELF: {
-    // ap.__gr_offs < 0 ? read from gr_top+gr_offs / advance offs
-    //                  : read from stack       / advance stack
-    // Result is loaded into x0 with the type's storage size.
+    // For FP types (float/double): use VR register save area path.
+    // For integer types: use GP register save area path.
     Type *rty = node->ty;
+    bool is_fp = (rty->kind == TY_FLOAT || rty->kind == TY_DOUBLE
+                  || rty->kind == TY_LDOUBLE);
     int sz = rty->size;
-    if (sz < 8) sz = 8;          // 8-byte slots for int-class
-    if (sz > 8) {
-      // Larger types (long double, big structs) not handled yet — punt.
+    if (sz < 8) sz = 8;
+    if (!is_fp && sz > 8)
       error_tok(node->tok, "va_arg of type larger than 8 bytes not implemented for ELF");
-    }
     int c = label_cnt++;
 
     gen_addr(node->lhs);          // x0 = &ap
     println("mov x1, x0");        // x1 = &ap (preserve)
 
-    // gr_offs = ap.__gr_offs (signed 32-bit)
-    println("ldrsw x2, [x1, #24]");
-    println("cmp x2, #0");
-    println("b.ge Ltmp_va_stack.%d", c);
+    if (is_fp) {
+      // VR path: ap.__vr_offs < 0 ? read from vr_top+vr_offs / advance
+      //                            : read from stack / advance stack
+      println("ldrsw x2, [x1, #28]");       // x2 = __vr_offs (signed)
+      println("cmp x2, #0");
+      println("b.ge Ltmp_va_stack.%d", c);
 
-    // Register path: ptr = ap.__gr_top + gr_offs; ap.__gr_offs += 8
-    println("ldr x3, [x1, #8]");        // x3 = __gr_top
-    println("add x4, x3, x2");          // x4 = __gr_top + __gr_offs
-    println("add w2, w2, #8");
-    println("str w2, [x1, #24]");       // ap.__gr_offs += 8
-    println("b Ltmp_va_done.%d", c);
+      // VR register path: ptr = ap.__vr_top + vr_offs; vr_offs += 16
+      println("ldr x3, [x1, #16]");         // x3 = __vr_top
+      println("add x4, x3, x2");            // x4 = __vr_top + __vr_offs
+      println("add w2, w2, #16");
+      println("str w2, [x1, #28]");         // ap.__vr_offs += 16
+      println("b Ltmp_va_done.%d", c);
 
-    printlabel("Ltmp_va_stack.%d:", c);
-    // Stack path: ptr = ap.__stack; ap.__stack += 8
-    println("ldr x4, [x1, #0]");        // x4 = __stack
-    println("add x5, x4, #8");
-    println("str x5, [x1, #0]");        // ap.__stack += 8
+      printlabel("Ltmp_va_stack.%d:", c);
+      // Stack path: double on stack occupies 8 bytes
+      println("ldr x4, [x1, #0]");
+      println("add x5, x4, #8");
+      println("str x5, [x1, #0]");
 
-    printlabel("Ltmp_va_done.%d:", c);
-    // Load value at x4 into x0 with appropriate size.
-    if (rty->kind == TY_FLOAT || rty->kind == TY_DOUBLE
-        || rty->kind == TY_LDOUBLE) {
-      // FP variadic via GP path is wrong on AAPCS64, but for ncc's use
-      // cases we don't have FP varargs. Emit a load from x4 anyway.
+      printlabel("Ltmp_va_done.%d:", c);
       println("ldr d0, [x4]");
-    } else if (rty->size == 1) {
-      if (rty->is_unsigned) println("ldrb w0, [x4]");
-      else                  println("ldrsb w0, [x4]");
-    } else if (rty->size == 2) {
-      if (rty->is_unsigned) println("ldrh w0, [x4]");
-      else                  println("ldrsh w0, [x4]");
-    } else if (rty->size == 4) {
-      if (rty->is_unsigned) println("ldr w0, [x4]");
-      else                  println("ldrsw x0, [x4]");
     } else {
-      println("ldr x0, [x4]");
+      // GP path: ap.__gr_offs < 0 ? read from gr_top+gr_offs / advance offs
+      //                           : read from stack       / advance stack
+      println("ldrsw x2, [x1, #24]");
+      println("cmp x2, #0");
+      println("b.ge Ltmp_va_stack.%d", c);
+
+      // Register path: ptr = ap.__gr_top + gr_offs; ap.__gr_offs += 8
+      println("ldr x3, [x1, #8]");
+      println("add x4, x3, x2");
+      println("add w2, w2, #8");
+      println("str w2, [x1, #24]");
+      println("b Ltmp_va_done.%d", c);
+
+      printlabel("Ltmp_va_stack.%d:", c);
+      println("ldr x4, [x1, #0]");
+      println("add x5, x4, #8");
+      println("str x5, [x1, #0]");
+
+      printlabel("Ltmp_va_done.%d:", c);
+      if (rty->size == 1) {
+        if (rty->is_unsigned) println("ldrb w0, [x4]");
+        else                  println("ldrsb w0, [x4]");
+      } else if (rty->size == 2) {
+        if (rty->is_unsigned) println("ldrh w0, [x4]");
+        else                  println("ldrsh w0, [x4]");
+      } else if (rty->size == 4) {
+        if (rty->is_unsigned) println("ldr w0, [x4]");
+        else                  println("ldrsw x0, [x4]");
+      } else {
+        println("ldr x0, [x4]");
+      }
     }
     return;
   }
@@ -2807,6 +2848,28 @@ static void emit_text(Obj *prog) {
               println("add x9, x29, x9");
             }
             println("stp x%d, x%d, [x9]", j, j+1);
+          }
+        }
+        // Save d0..d7 to the VR register save area (128 bytes, 16-byte slots).
+        // Skipped when -no-fp-varargs: bare-metal targets with +nofp trap on FP insns.
+        if (fn->va_vr_save && !opt_no_fp_varargs) {
+          int vr_off = fn->va_vr_save->offset;
+          for (int j = 0; j < 8; j++) {
+            int slot = vr_off + j * 16;
+            if (slot >= -256 && slot <= 252) {
+              println("str d%d, [x29, #%d]", j, slot);
+            } else if (slot >= 0 && slot <= 4095) {
+              println("add x9, x29, #%d", slot);
+              println("str d%d, [x9]", j);
+            } else if (slot < 0 && -slot <= 4095) {
+              println("sub x9, x29, #%d", -slot);
+              println("str d%d, [x9]", j);
+            } else {
+              load_imm("x9", (uint64_t)(slot < 0 ? -slot : slot));
+              if (slot < 0) println("sub x9, x29, x9");
+              else          println("add x9, x29, x9");
+              println("str d%d, [x9]", j);
+            }
           }
         }
       }

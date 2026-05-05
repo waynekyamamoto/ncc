@@ -11,7 +11,21 @@
 // Global options
 bool opt_fpic = true;     // macOS always uses PIC
 bool opt_fcommon = true;
+// opt_elf: emit ELF assembly instead of Mach-O. On Linux this is always true;
+// on macOS it requires -target elf.
+#ifdef __APPLE__
 bool opt_elf = false;
+#else
+bool opt_elf = true;
+#endif
+// opt_cross_elf: set by explicit -target elf to request the cross-assembler
+// (aarch64-elf-as + -march=armv8.6-a+sve) for bare-metal targets like
+// NetBSD/xv6. On Linux without this flag, native `as` is used instead.
+static bool opt_cross_elf = false;
+// opt_no_fp_varargs: suppress VR register saves in variadic prologues.
+// Used for bare-metal targets (NetBSD kernel) compiled with +nofp, where
+// executing stur d0-d7 traps as undefined instruction.
+bool opt_no_fp_varargs = false;
 char *base_file;
 StringArray global_asm;
 
@@ -188,8 +202,11 @@ static char *filter_asm(char *input) {
 static void assemble(char *input, char *output) {
   char *filtered = filter_asm(input);
   StringArray cmd = {};
-  strarray_push(&cmd, opt_elf ? "aarch64-elf-as" : "as");
-  if (opt_elf) {
+  // opt_cross_elf: use the bare-metal cross-assembler (for NetBSD/xv6 builds,
+  // invoked via -target elf from macOS or explicitly on Linux).
+  // Otherwise use the native assembler: as(1) on both Linux and macOS.
+  strarray_push(&cmd, opt_cross_elf ? "aarch64-elf-as" : "as");
+  if (opt_cross_elf) {
     // NetBSD source uses ARMv8.1+ system registers (pan, pointer-auth, etc.)
     // and ARMv8.4-a is the highest level any AARCH64REG_*_INLINE in armreg.h
     // requires. Tell the assembler to accept the full instruction set.
@@ -310,6 +327,27 @@ int main(int argc, char **argv) {
   atexit(cleanup);
   init_macros();
 
+#ifndef __APPLE__
+  // On Linux the ELF ABI is the native target. Set up ELF/Linux macros that
+  // init_macros() leaves as Apple defaults. Mirrors what -target elf does on
+  // macOS, but uses Linux-appropriate predefines.
+  define_macro("__ELF__", "1");
+  define_macro("__linux__", "1");
+  define_macro("__linux", "1");
+  define_macro("__gnu_linux__", "1");
+  // AAPCS64 va_list is a 32-byte struct; Apple uses a plain pointer.
+  define_macro("__builtin_va_list",
+    "struct { void *__stack; void *__gr_top; void *__vr_top;"
+    " int __gr_offs; int __vr_offs; }");
+  define_macro("__gnuc_va_list", "__builtin_va_list");
+  undef_macro("__APPLE__");
+  undef_macro("__MACH__");
+  undef_macro("__DARWIN_C_LEVEL");
+  undef_macro("TARGET_OS_MAC");
+  undef_macro("TARGET_OS_OSX");
+  undef_macro("TARGET_RT_MAC_MACHO");
+#endif
+
   // Add compiler-provided headers first (stdarg.h, stddef.h, etc.)
   // These must come before user -I paths and system paths.
   {
@@ -408,7 +446,23 @@ int main(int argc, char **argv) {
       if (++i >= argc) usage(1);
       if (!strcmp(argv[i], "elf")) {
         opt_elf = true;
+        // opt_cross_elf: use the bare-metal cross-assembler (aarch64-elf-as).
+        // On macOS this is always the case when -target elf is given.
+        // On Linux it selects the cross-assembler instead of the native one,
+        // needed for NetBSD/xv6 kernel builds that require -march=armv8.6-a+sve.
+        opt_cross_elf = true;
         define_macro("__ELF__", "1");
+        // Override __builtin_va_list / __gnuc_va_list with the AAPCS64
+        // 32-byte struct.  init_macros() runs before flag parsing so it can
+        // only set them to void *; we correct them here after -target elf is
+        // confirmed.  System headers (NetBSD's <machine/ansi.h>, glibc's
+        // <bits/types.h>) typedef va_list from __builtin_va_list before any
+        // explicit <stdarg.h> is included, so they need the right size here.
+        // Layout matches the offsets hardcoded in ND_VA_START_ELF/ND_VA_ARG_ELF.
+        define_macro("__builtin_va_list",
+          "struct { void *__stack; void *__gr_top; void *__vr_top;"
+          " int __gr_offs; int __vr_offs; }");
+        define_macro("__gnuc_va_list", "__builtin_va_list");
         // Drop macOS-specific predefines — NetBSD/Linux source may take
         // wrong code paths if it sees __APPLE__ etc.
         undef_macro("__APPLE__");
@@ -417,6 +471,12 @@ int main(int argc, char **argv) {
         undef_macro("TARGET_OS_MAC");
         undef_macro("TARGET_OS_OSX");
         undef_macro("TARGET_RT_MAC_MACHO");
+        // Drop Linux-specific predefines — when cross-compiling for NetBSD
+        // (or any non-Linux ELF target), source must not see __linux.
+        // On Linux hosts, these were set in main() above before flag parsing.
+        undef_macro("__linux__");
+        undef_macro("__linux");
+        undef_macro("__gnu_linux__");
       }
       continue;
     }
@@ -440,6 +500,11 @@ int main(int argc, char **argv) {
         strarray_push(&ld_extra_flags, strdup(p));
         p = strtok(NULL, ",");
       }
+      continue;
+    }
+
+    if (!strcmp(argv[i], "-no-fp-varargs")) {
+      opt_no_fp_varargs = true;
       continue;
     }
 

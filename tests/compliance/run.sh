@@ -3,6 +3,15 @@
 # Usage: ./run.sh [test.c] or ./run.sh (runs all)
 
 NCC="${NCC:-../../ncc2}"
+# Use clang if available, fall back to gcc
+if command -v clang >/dev/null 2>&1; then
+    REF_CC=clang
+elif command -v gcc >/dev/null 2>&1; then
+    REF_CC=gcc
+else
+    echo "no reference compiler (clang or gcc) found" >&2
+    exit 1
+fi
 PASS=0
 FAIL=0
 ERRORS=""
@@ -11,9 +20,9 @@ run_test() {
   local src="$1"
   local name=$(basename "$src" .c)
 
-  # Compile with clang
-  if ! clang -o "/tmp/compliance_clang_${name}" "$src" 2>/dev/null; then
-    echo "SKIP: $name (clang compile failed)"
+  # Compile with reference compiler
+  if ! $REF_CC -o "/tmp/compliance_clang_${name}" "$src" 2>/dev/null; then
+    echo "SKIP: $name ($REF_CC compile failed)"
     return
   fi
 

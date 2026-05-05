@@ -27,17 +27,31 @@ done
 # ncc's link path is hard-coded for macOS Mach-O; in ELF/cross mode hand off
 # to the cross gcc which knows how to invoke the cross ld.
 HAS_C=0
+HAS_KERNEL=0
 for a in "$@"; do
-  case "$a" in -c) HAS_C=1; break ;; esac
+  case "$a" in
+    -c) HAS_C=1 ;;
+    -D_KERNEL) HAS_KERNEL=1 ;;
+  esac
 done
+NCC_REPO="$(cd "$(dirname "$0")/../../.." && pwd)"
+NCC="$NCC_REPO/ncc2"
+NETBSD_TOOLDIR="${NETBSD_DIR:-$HOME/netbsd}/tooldir"
+CROSS_GCC="$NETBSD_TOOLDIR/bin/aarch64--netbsd-gcc"
+STUBS="$NCC_REPO/tests/netbsd/stubs"
+# Kernel compiles with +nofp — suppress VR register saves to avoid
+# undefined-instruction traps when d0-d7 are saved in variadic prologues.
+NCC_EXTRA=""
+if [ "$HAS_KERNEL" -eq 1 ]; then NCC_EXTRA="-no-fp-varargs"; fi
+
 if [ "$HAS_C" -eq 0 ]; then
-  exec /netbsd/tooldir/bin/aarch64--netbsd-gcc "$@"
+  exec "$CROSS_GCC" "$@"
 fi
 
 # Assembly source goes to the cross-gcc.
 case "$SRC" in
   *.S)
-    exec /netbsd/tooldir/bin/aarch64--netbsd-gcc "$@"
+    exec "$CROSS_GCC" "$@"
     ;;
   */kern/kern_ksyms_buf.c)
     # SYMTAB_SPACE allocates a giant uninitialized array sized for the
@@ -48,7 +62,7 @@ case "$SRC" in
     # forced SYMTAB_SPACE=200000000, which inflated kernel `.data` by
     # ~200 MB and pushed globals (notably timehands `th0`) past the
     # early-MMU mapping window.
-    exec /netbsd/tooldir/bin/aarch64--netbsd-gcc "$@"
+    exec "$CROSS_GCC" "$@"
     ;;
 esac
 
@@ -57,9 +71,9 @@ case "$SRC" in
     # Substitute the combined NEON stub (defines all chacha+aes neon symbols).
     new_args=""
     for a in "$@"; do
-      if [ "$a" = "$SRC" ]; then new_args="$new_args /xv6/tests/netbsd/stubs/neon_stub.c"; else new_args="$new_args $a"; fi
+      if [ "$a" = "$SRC" ]; then new_args="$new_args $STUBS/neon_stub.c"; else new_args="$new_args $a"; fi
     done
-    exec /xv6/ncc -target elf -D__NetBSD__=1 $new_args
+    exec "$NCC" -target elf -D__NetBSD__=1 $NCC_EXTRA $new_args
     ;;
   */aes_neon_subr.c)
     # aes_neon_subr.c uses NEON intrinsics — stub it. The substituted file
@@ -67,9 +81,9 @@ case "$SRC" in
     # for SoC drivers excluded from compilation.
     new_args=""
     for a in "$@"; do
-      if [ "$a" = "$SRC" ]; then new_args="$new_args /xv6/tests/netbsd/stubs/cfattach_stubs.c"; else new_args="$new_args $a"; fi
+      if [ "$a" = "$SRC" ]; then new_args="$new_args $STUBS/cfattach_stubs.c"; else new_args="$new_args $a"; fi
     done
-    exec /xv6/ncc -target elf -D__NetBSD__=1 $new_args
+    exec "$NCC" -target elf -D__NetBSD__=1 $NCC_EXTRA $new_args
     ;;
   */aes_neon.c|\
   */aarch64/netbsd32_syscall.c|\
@@ -93,13 +107,13 @@ case "$SRC" in
     new_args=""
     for a in "$@"; do
       if [ "$a" = "$SRC" ]; then
-        new_args="$new_args /xv6/tests/netbsd/stubs/empty_stub.c"
+        new_args="$new_args $STUBS/empty_stub.c"
       else
         new_args="$new_args $a"
       fi
     done
-    exec /xv6/ncc -target elf -D__NetBSD__=1 $new_args
+    exec "$NCC" -target elf -D__NetBSD__=1 $NCC_EXTRA $new_args
     ;;
 esac
 
-exec /xv6/ncc -target elf -D__NetBSD__=1 "$@"
+exec "$NCC" -target elf -D__NetBSD__=1 $NCC_EXTRA "$@"

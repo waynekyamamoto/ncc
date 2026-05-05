@@ -1,5 +1,15 @@
-CC = clang
-CFLAGS = -Wall -Wextra -Werror -std=c11 -g -O2 -Wno-unused-parameter -Wno-switch -Wno-missing-field-initializers -Wno-sign-compare
+CC ?= clang
+UNAME := $(shell uname)
+ifeq ($(UNAME),Linux)
+CFLAGS = -Wall -Wextra -Werror -std=c11 -D_GNU_SOURCE -g -O2 \
+         -Wno-unused-parameter -Wno-switch -Wno-missing-field-initializers \
+         -Wno-sign-compare -Wno-format -Wno-empty-body \
+         -Wno-unused-but-set-variable
+else
+CFLAGS = -Wall -Wextra -Werror -std=c11 -g -O2 \
+         -Wno-unused-parameter -Wno-switch -Wno-missing-field-initializers \
+         -Wno-sign-compare
+endif
 LDFLAGS =
 
 SRCS = $(wildcard src/*.c)
