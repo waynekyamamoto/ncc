@@ -3039,6 +3039,71 @@ static Node *primary(Token **rest, Token *tok) {
       return new_num(0, bi);
     }
 
+    // __builtin_va_start(ap, last) — Apple ARM64: ap = __va_area__.
+    if (tok_name_eq(tok, "__builtin_va_start")) {
+      Token *bi = tok;
+      tok = skip(tok->next, "(");
+      Node *ap = assign(&tok, tok);
+      tok = skip(tok, ",");
+      assign(&tok, tok);  // last_named — discarded on ARM64
+      tok = skip(tok, ")");
+      *rest = tok;
+      if (!current_fn || !current_fn->va_area)
+        return new_num(0, bi);
+      return new_binary(ND_ASSIGN, ap,
+               new_cast(new_var_node(current_fn->va_area, bi),
+                        pointer_to(ty_void)), bi);
+    }
+
+    // __builtin_va_end(ap) — no-op.
+    if (tok_name_eq(tok, "__builtin_va_end")) {
+      Token *bi = tok;
+      tok = skip(tok->next, "(");
+      assign(&tok, tok);  // ap — evaluated and discarded
+      tok = skip(tok, ")");
+      *rest = tok;
+      return new_num(0, bi);
+    }
+
+    // __builtin_va_copy(d, s) — d = s.
+    if (tok_name_eq(tok, "__builtin_va_copy")) {
+      Token *bi = tok;
+      tok = skip(tok->next, "(");
+      Node *d = assign(&tok, tok);
+      tok = skip(tok, ",");
+      Node *s = assign(&tok, tok);
+      tok = skip(tok, ")");
+      *rest = tok;
+      return new_binary(ND_ASSIGN, d, s, bi);
+    }
+
+    // __builtin_va_arg(ap, T) — comma chain per 04b §M:
+    //   (tmp = (T*)ap, ap = (void*)((char*)ap + align(sizeof(T), 8)), *tmp)
+    if (tok_name_eq(tok, "__builtin_va_arg")) {
+      Token *bi = tok;
+      tok = skip(tok->next, "(");
+      Node *ap = assign(&tok, tok);
+      tok = skip(tok, ",");
+      Type *ty = typename_(&tok, tok);
+      tok = skip(tok, ")");
+      *rest = tok;
+      add_type(ap);
+
+      long sz = ty->size < 8 ? 8 : ty->size;
+      sz = (sz + 7) & ~7L;
+
+      Obj *tmp = new_lvar(new_unique_name(), pointer_to(ty));
+      Node *save = new_binary(ND_ASSIGN, new_var_node(tmp, bi),
+                              new_cast(ap, pointer_to(ty)), bi);
+      Node *ap_as_char = new_cast(ap, pointer_to(ty_char));
+      Node *bumped = new_binary(ND_ADD, ap_as_char, new_num(sz, bi), bi);
+      Node *advance = new_binary(ND_ASSIGN, ap,
+                       new_cast(bumped, pointer_to(ty_void)), bi);
+      Node *result = new_unary(ND_DEREF, new_var_node(tmp, bi), bi);
+      return new_binary(ND_COMMA, save,
+               new_binary(ND_COMMA, advance, result, bi), bi);
+    }
+
     VarScope *vs = find_var(tok);
     if (!vs || (!vs->var && !vs->enum_ty)) {
       // Implicit-function declaration (04b §H.5): if next is `(`,
