@@ -2655,6 +2655,41 @@ static Node *primary(Token **rest, Token *tok) {
     return node;
   }
 
+  // _Generic ( expr, T1: a1, T2: a2, ..., default: ad )
+  // 04b §H.4 step 4.  Match by type-kind + size; the controlling
+  // expression's value is not evaluated — only its type is used.
+  if (equal(tok, "_Generic")) {
+    Token *gen = tok;
+    tok = skip(tok->next, "(");
+    Node *ctrl = assign(&tok, tok);
+    add_type(ctrl);
+    Type *cty = ctrl->ty;
+    Node *match = NULL;
+    Node *default_n = NULL;
+    while (equal(tok, ",")) {
+      tok = tok->next;
+      if (equal(tok, "default")) {
+        tok = skip(tok->next, ":");
+        Node *e = assign(&tok, tok);
+        default_n = e;
+      } else {
+        Type *t = typename_(&tok, tok);
+        tok = skip(tok, ":");
+        Node *e = assign(&tok, tok);
+        if (!match && cty &&
+            t->kind == cty->kind && t->size == cty->size &&
+            t->is_unsigned == cty->is_unsigned)
+          match = e;
+      }
+    }
+    tok = skip(tok, ")");
+    if (!match) match = default_n;
+    if (!match)
+      error_tok(gen, "no matching _Generic association");
+    *rest = tok;
+    return match;
+  }
+
   // Identifier — first dispatch known builtins, then fall through
   // to var/enum/implicit-call lookup.
   if (tok->kind == TK_IDENT) {
