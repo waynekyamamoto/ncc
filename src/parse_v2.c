@@ -737,8 +737,8 @@ static Type *type_suffix(Token **rest, Token *tok, Type *ty) {
   return ty;
 }
 
-// func_params — partial impl per §E.1 (empty `()`) and §E.2 (`(void)`).
-// Normal parameter lists are deferred until expr/stmt zone fills land.
+// func_params — `(` already consumed; parses the parameter list and
+// the closing `)`.  Returns a TY_FUNC.
 static Type *func_params(Token **rest, Token *tok, Type *ty) {
   // §E.1 — empty `()`.  Treated as variadic for K&R compatibility.
   if (equal(tok, ")")) {
@@ -754,7 +754,71 @@ static Type *func_params(Token **rest, Token *tok, Type *ty) {
     return func_type(ty);
   }
 
-  error_tok(tok, "parse_v2: function parameter list not yet implemented");
+  // §E.3 — normal parameter list.  Push a scope so VLA dimensions in
+  // later parameters can reference earlier names.
+  enter_scope();
+  Type head = {0};
+  Type *cur = &head;
+  bool is_variadic = false;
+  bool first = true;
+
+  while (!equal(tok, ")")) {
+    if (!first)
+      tok = skip(tok, ",");
+    first = false;
+
+    // Variadic terminator.
+    if (equal(tok, "...")) {
+      is_variadic = true;
+      tok = tok->next;
+      break;
+    }
+
+    Type *basety = declspec(&tok, tok, NULL);
+    Type *param_ty = declarator(&tok, tok, basety);
+
+    // Trailing __attribute__((...)) on this parameter.
+    if (equal(tok, "__attribute__"))
+      tok = attribute_list(tok->next, param_ty, NULL);
+
+    // Bind name into parameter scope so subsequent parameters'
+    // VLA dimensions can reference it.
+    if (param_ty->name) {
+      char *pname = strndup_checked(param_ty->name->loc, param_ty->name->len);
+      // Lightweight bind: a VarScope entry with no Obj — find_var
+      // will return it for typename probes; full Obj attach happens
+      // in `function` when the body scope is built.
+      push_scope(pname);
+    }
+
+    // §E.4 — parameter type adjustments.
+    if (param_ty->kind == TY_ARRAY || param_ty->kind == TY_VLA) {
+      Token *vla_tok = (param_ty->kind == TY_VLA) ? param_ty->vla_dim_tok : NULL;
+      Token *name_tok = param_ty->name;
+      param_ty = pointer_to(param_ty->base);
+      param_ty->name = name_tok;
+      param_ty->vla_dim_tok = vla_tok;
+    } else if (param_ty->kind == TY_FUNC) {
+      Token *name_tok = param_ty->name;
+      param_ty = pointer_to(param_ty);
+      param_ty->name = name_tok;
+    }
+
+    cur = cur->next = copy_type(param_ty);
+  }
+
+  // §E.3 — empty observed loop body (only `...` or weird empty)
+  // makes the function variadic.
+  if (cur == &head)
+    is_variadic = true;
+
+  leave_scope();
+
+  Type *fn = func_type(ty);
+  fn->params = head.next;
+  fn->is_variadic = is_variadic;
+  *rest = skip(tok, ")");
+  return fn;
 }
 
 // array_dimensions — stub.  §D detail (constant vs VLA, leading
