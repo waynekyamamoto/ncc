@@ -670,14 +670,164 @@ static Type *declspec(Token **rest, Token *tok, VarAttr *attr) {
 // declspec deep-dependency stubs.
 //
 
+// struct_members — `{` already consumed.  Comma-separated decls
+// terminated by `}`.  Bitfield, anonymous-member, flexible-array,
+// per-member-attribute, and in-body _Static_assert paths deferred.
+static Member *struct_members(Token **rest, Token *tok) {
+  Member head = {0};
+  Member *cur = &head;
+  int idx = 0;
+  while (!equal(tok, "}")) {
+    VarAttr attr = {0};
+    Type *basety = declspec(&tok, tok, &attr);
+    bool first = true;
+    while (!equal(tok, ";")) {
+      if (!first) tok = skip(tok, ",");
+      first = false;
+      Type *ty = declarator(&tok, tok, basety);
+      if (!ty->name)
+        error_tok(tok, "struct member requires a name");
+      if (equal(tok, ":"))
+        error_tok(tok, "parse_v2: bitfields not yet implemented");
+      if (equal(tok, "__attribute__"))
+        tok = attribute_list(tok->next, ty, &attr);
+
+      Member *m = calloc_checked(1, sizeof(Member));
+      m->ty = ty;
+      m->name = ty->name;
+      m->tok = ty->name;
+      m->idx = idx++;
+      m->align = attr.align ? attr.align : ty->align;
+      cur = cur->next = m;
+    }
+    tok = skip(tok, ";");
+  }
+  *rest = skip(tok, "}");
+  return head.next;
+}
+
+// struct_layout — assign offsets and compute size + align.  No
+// packed / bitfield support yet.
+static void struct_layout(Type *ty) {
+  long offset = 0;
+  int max_align = 1;
+  for (Member *m = ty->members; m; m = m->next) {
+    int al = m->align ? m->align : m->ty->align;
+    if (al < 1) al = 1;
+    offset = align_to(offset, al);
+    m->offset = offset;
+    offset += m->ty->size;
+    if (al > max_align) max_align = al;
+  }
+  ty->align = max_align;
+  ty->size = align_to(offset, max_align);
+}
+
+// union_layout — all members at offset 0, size = max member size,
+// align = max member align.
+static void union_layout(Type *ty) {
+  long size = 0;
+  int max_align = 1;
+  for (Member *m = ty->members; m; m = m->next) {
+    int al = m->align ? m->align : m->ty->align;
+    if (al < 1) al = 1;
+    m->offset = 0;
+    if (m->ty->size > size) size = m->ty->size;
+    if (al > max_align) max_align = al;
+  }
+  ty->align = max_align;
+  ty->size = align_to(size, max_align);
+}
+
+// struct_decl / union_decl share shape (04a §F.2).  Subset:
+// optional tag, optional body.  Forward refs return / create
+// incomplete types in the tag namespace.  Pre-tag and post-tag
+// __attribute__ blobs are consumed-and-ignored for now (real
+// honoring lands with attribute_list).
+static Type *struct_or_union(Token **rest, Token *tok, bool is_union) {
+  Token *tag = NULL;
+  if (tok->kind == TK_IDENT) {
+    tag = tok;
+    tok = tok->next;
+  }
+
+  // Forward reference / lookup.
+  if (tag && !equal(tok, "{")) {
+    TagScope *ts = find_tag(tag);
+    if (ts) {
+      *rest = tok;
+      return ts->ty;
+    }
+    Type *ty = struct_type();
+    ty->kind = is_union ? TY_UNION : TY_STRUCT;
+    ty->size = -1;  // incomplete
+    push_tag_scope(tag, ty);
+    *rest = tok;
+    return ty;
+  }
+
+  tok = skip(tok, "{");
+
+  // Reuse incomplete tag if present.
+  Type *ty = NULL;
+  if (tag) {
+    TagScope *ts = find_tag(tag);
+    if (ts && ts->ty->size < 0)
+      ty = ts->ty;
+  }
+  if (!ty) {
+    ty = struct_type();
+    ty->kind = is_union ? TY_UNION : TY_STRUCT;
+  }
+  ty->members = struct_members(&tok, tok);
+  if (is_union)
+    union_layout(ty);
+  else
+    struct_layout(ty);
+
+  if (tag) {
+    // Push only if not already in scope (avoid duplicate entries
+    // when reusing an incomplete forward declaration).
+    TagScope *ts = find_tag(tag);
+    if (!ts)
+      push_tag_scope(tag, ty);
+  }
+
+  *rest = tok;
+  return ty;
+}
+
 static Type *struct_decl(Token **rest, Token *tok) {
-  (void)rest;
-  error_tok(tok, "parse_v2: struct_decl not yet implemented");
+  return struct_or_union(rest, tok, false);
 }
 
 static Type *union_decl(Token **rest, Token *tok) {
-  (void)rest;
-  error_tok(tok, "parse_v2: union_decl not yet implemented");
+  return struct_or_union(rest, tok, true);
+}
+
+// find_member — direct linear search; anonymous-member recursion
+// deferred until anonymous-member support lands.
+static Member *find_member(Type *ty, Token *name) {
+  for (Member *m = ty->members; m; m = m->next) {
+    if (m->name && name->len == m->name->len &&
+        !strncmp(m->name->loc, name->loc, name->len))
+      return m;
+  }
+  return NULL;
+}
+
+// struct_ref — wrap node in ND_MEMBER for `node . name`.  Caller
+// must have applied ND_DEREF for `->`.
+static Node *struct_ref(Node *node, Token *name) {
+  add_type(node);
+  if (node->ty->kind != TY_STRUCT && node->ty->kind != TY_UNION)
+    error_tok(node->tok, "not a struct or union");
+  Member *m = find_member(node->ty, name);
+  if (!m)
+    error_tok(name, "no such member");
+  Node *n = new_unary(ND_MEMBER, node, name);
+  n->member = m;
+  return n;
 }
 
 // enum_specifier — `enum` already consumed.  04a §F.7 subset:
@@ -2099,6 +2249,26 @@ static Node *postfix(Token **rest, Token *tok) {
       Node *sum = new_add(node, idx, op);
       node = new_unary(ND_DEREF, sum, op);
       add_type(node);
+      continue;
+    }
+
+    // . ident — direct member access.
+    if (equal(tok, ".")) {
+      if (tok->next->kind != TK_IDENT)
+        error_tok(tok->next, "expected identifier after `.`");
+      node = struct_ref(node, tok->next);
+      tok = tok->next->next;
+      continue;
+    }
+
+    // -> ident — pointer member access.  Implicit deref then `.`.
+    if (equal(tok, "->")) {
+      if (tok->next->kind != TK_IDENT)
+        error_tok(tok->next, "expected identifier after `->`");
+      Token *arrow = tok;
+      Node *deref = new_unary(ND_DEREF, node, arrow);
+      node = struct_ref(deref, tok->next);
+      tok = tok->next->next;
       continue;
     }
 
