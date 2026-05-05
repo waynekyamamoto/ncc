@@ -953,9 +953,24 @@ static Type *atomic_specifier(Token **rest, Token *tok) {
   error_tok(tok, "parse_v2: _Atomic(type-name) not yet implemented");
 }
 
+// _Alignas — `_Alignas` keyword is `tok`.  04a §B.6.
+//   _Alignas ( const-expr )    → attr->align
+//   _Alignas ( type-name )     → attr->align = ty->align
 static Token *parse_alignas(Token *tok, VarAttr *attr) {
-  (void)attr;
-  error_tok(tok, "parse_v2: _Alignas not yet implemented");
+  if (!attr)
+    error_tok(tok, "_Alignas is not allowed here");
+  tok = tok->next;  // consume keyword
+  tok = skip(tok, "(");
+  int al;
+  if (is_typename(tok)) {
+    Type *ty = typename_(&tok, tok);
+    al = ty->align;
+  } else {
+    al = (int)const_expr_val(&tok, tok);
+  }
+  tok = skip(tok, ")");
+  if (al > attr->align) attr->align = al;
+  return tok;
 }
 
 // attribute_list — 04a §G subset.  Caller has consumed the
@@ -2374,6 +2389,22 @@ static Node *unary(Token **rest, Token *tok) {
     Node *delta = new_num(addend, op);
     Node *sum = new_add(operand, delta, op);
     return to_assign(sum);
+  }
+
+  // §G.11 — _Alignof / __alignof__ / __alignof.
+  if (equal(tok, "_Alignof") || equal(tok, "__alignof__") || equal(tok, "__alignof")) {
+    Token *op = tok;
+    if (equal(tok->next, "(") && is_typename(tok->next->next)) {
+      Type *ty = typename_(&tok, tok->next->next);
+      *rest = skip(tok, ")");
+      return new_ulong((uint64_t)ty->align, op);
+    }
+    Node *operand = unary(rest, tok->next);
+    add_type(operand);
+    int al = operand->ty->align;
+    if (operand->kind == ND_VAR && operand->var && operand->var->align > al)
+      al = operand->var->align;
+    return new_ulong((uint64_t)al, op);
   }
 
   // §G.10 — sizeof.  Both forms.
