@@ -707,10 +707,18 @@ static Member *struct_members(Token **rest, Token *tok) {
       if (!first) tok = skip(tok, ",");
       first = false;
       Type *ty = declarator(&tok, tok, basety);
-      if (!ty->name)
+
+      // Anonymous bitfield (zero-width or named placeholder):
+      // `int : 0;` aligns the next bitfield; `int : 4;` reserves
+      // bits without a name.  Skip name requirement when bitfield.
+      bool is_bitfield = false;
+      int bit_width = 0;
+      if (equal(tok, ":")) {
+        is_bitfield = true;
+        bit_width = (int)const_expr_val(&tok, tok->next);
+      } else if (!ty->name) {
         error_tok(tok, "struct member requires a name");
-      if (equal(tok, ":"))
-        error_tok(tok, "parse_v2: bitfields not yet implemented");
+      }
       if (equal(tok, "__attribute__"))
         tok = attribute_list(tok->next, ty, &attr);
 
@@ -720,6 +728,8 @@ static Member *struct_members(Token **rest, Token *tok) {
       m->tok = ty->name;
       m->idx = idx++;
       m->align = attr.align ? attr.align : ty->align;
+      m->is_bitfield = is_bitfield;
+      m->bit_width = bit_width;
       cur = cur->next = m;
     }
     tok = skip(tok, ";");
@@ -729,14 +739,52 @@ static Member *struct_members(Token **rest, Token *tok) {
 }
 
 // struct_layout — assign offsets and compute size + align.
-// Packed: skip per-member alignment and final round-up.  Bitfield
-// support not yet implemented.
+// Bitfield handling per 04a §F.5: bitfields pack into storage units
+// of their declared type's size, with a running bit counter that
+// resyncs from `offset * 8` when transitioning from non-bitfield to
+// bitfield.  Zero-width bitfields force the running counter to the
+// next storage-unit boundary without allocating a slot.
 static void struct_layout(Type *ty) {
   long offset = 0;
+  long bits = 0;
+  bool in_bf = false;
   int max_align = 1;
   for (Member *m = ty->members; m; m = m->next) {
     int al = m->align ? m->align : m->ty->align;
     if (al < 1) al = 1;
+    if (m->is_bitfield) {
+      int unit = (int)m->ty->size;
+      if (!in_bf) {
+        bits = offset * 8;
+        in_bf = true;
+      }
+      if (m->bit_width == 0) {
+        // Align bits up to next storage-unit boundary.
+        long unit_bits = (long)unit * 8;
+        bits = (bits + unit_bits - 1) / unit_bits * unit_bits;
+        m->offset = bits / 8;
+        m->bit_offset = 0;
+        // No slot allocated.
+      } else {
+        long unit_bits = (long)unit * 8;
+        long start = bits;
+        long start_unit = start / unit_bits;
+        long end_unit = (start + m->bit_width - 1) / unit_bits;
+        if (start_unit != end_unit) {
+          // Doesn't fit in current unit — advance to next.
+          bits = end_unit * unit_bits;
+        }
+        m->offset = (bits / unit_bits) * unit;
+        m->bit_offset = (int)(bits - (m->offset * 8));
+        bits += m->bit_width;
+      }
+      offset = (bits + 7) / 8;
+      if (al > max_align) max_align = al;
+      continue;
+    }
+    // Non-bitfield: re-sync.
+    in_bf = false;
+    bits = 0;
     if (!ty->is_packed)
       offset = align_to(offset, al);
     m->offset = offset;
