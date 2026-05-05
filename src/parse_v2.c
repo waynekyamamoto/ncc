@@ -161,6 +161,9 @@ static bool try_eval_double_v2(Node *n, double *out);
 static Token *gvar_subinit_recursive(Token *tok, Type *ty, char *buf,
                                       long base_off, long buf_sz,
                                       Relocation **rh_tail);
+static Node *lvar_init_at_offset(Token **rest, Token *tok, Type *ty,
+                                  Obj *var, long base_off, Node *chain,
+                                  Token *eq);
 static Type *typename_(Token **rest, Token *tok);
 static Node *expr(Token **rest, Token *tok);
 static Node *assign(Token **rest, Token *tok);
@@ -2642,9 +2645,19 @@ static Node *declaration(Token **rest, Token *tok, Type *basety, VarAttr *attr) 
           while (!equal(tok, "}")) {
             if (i > 0) tok = skip(tok, ",");
             if (equal(tok, "}")) break;
-            // Recursive brace forms not yet supported.
-            if (equal(tok, "{"))
-              error_tok(tok, "parse_v2: nested brace initializer not yet implemented");
+            // Nested brace, struct, or array element — recurse via the
+            // offset-based helper.  (The simple-scalar fast path
+            // remains below.)
+            if (equal(tok, "{") || ty->base->kind == TY_STRUCT ||
+                ty->base->kind == TY_UNION || ty->base->kind == TY_ARRAY) {
+              chain = lvar_init_at_offset(&tok, tok, ty->base, var,
+                                           i * ty->base->size, chain, eq);
+              i++;
+              if (cap >= 0 && i >= cap) {
+                while (!equal(tok, "}") && !equal(tok, ",")) tok = tok->next;
+              }
+              continue;
+            }
             Node *e = assign(&tok, tok);
             add_type(e);
             // For `int a[3] = {0}` we may have cap >=0 and i < cap.
@@ -2686,8 +2699,14 @@ static Node *declaration(Token **rest, Token *tok, Type *basety, VarAttr *attr) 
             }
             if (!m)
               error_tok(tok, "excess elements in struct initializer");
-            if (equal(tok, "{"))
-              error_tok(tok, "parse_v2: nested brace initializer not yet implemented");
+            // Nested aggregate field — recurse via offset-based helper.
+            if (equal(tok, "{") || m->ty->kind == TY_STRUCT ||
+                m->ty->kind == TY_UNION || m->ty->kind == TY_ARRAY) {
+              chain = lvar_init_at_offset(&tok, tok, m->ty, var,
+                                           m->offset, chain, eq);
+              m = m->next;
+              continue;
+            }
             Node *e = assign(&tok, tok);
             add_type(e);
             Node *vref = new_var_node(var, eq);
@@ -4288,4 +4307,141 @@ static Token *gvar_subinit_recursive(Token *tok, Type *ty, char *buf,
   for (long b = 0; b < sz && base_off + b < buf_sz; b++)
     buf[base_off + b] = (v >> (b * 8)) & 0xff;
   return tok;
+}
+
+// make_offset_lval — build a fresh lvalue Node for `var` at byte
+// `base_off`, with type `ty`.  Expands to `*(ty *)((char *)&var + off)`.
+// Used by lvar_init_at_offset to avoid sharing AST subtrees across
+// multiple assignments.
+static Node *make_offset_lval(Obj *var, long base_off, Type *ty, Token *tok) {
+  Node *vref = new_var_node(var, tok);
+  Node *addr = new_unary(ND_ADDR, vref, tok);
+  Node *cast_char = new_cast(addr, pointer_to(ty_char));
+  Node *sum = new_add(cast_char, new_num(base_off, tok), tok);
+  Node *cast_ty = new_cast(sum, pointer_to(ty));
+  Node *deref = new_unary(ND_DEREF, cast_ty, tok);
+  add_type(deref);
+  return deref;
+}
+
+// lvar_init_at_offset — recursive local-variable initializer.
+// Emits ND_ASSIGN/COMMA chain that initializes the region of `var`
+// at `base_off` of type `ty` from the initializer at `tok`.  Returns
+// the new chain head.  Advances *rest.
+//
+// Caller is expected to have prepended an ND_MEMZERO to clear the
+// whole storage so omitted elements / brace gaps remain zero.
+//
+// Subset:
+//   - Empty `{}` → no-op (memzero already covers it).
+//   - char[] = "literal" → byte-by-byte assignment.
+//   - TY_STRUCT brace with optional `.field` designators.
+//   - TY_UNION brace with first-member or `.field`.
+//   - TY_ARRAY brace, element-wise recursion.
+//   - Scalar leaves (int / ptr / flonum) → `lval = expr`.
+static Node *lvar_init_at_offset(Token **rest, Token *tok, Type *ty,
+                                  Obj *var, long base_off, Node *chain,
+                                  Token *eq) {
+  // Empty brace → no-op (ND_MEMZERO already cleared).
+  if (equal(tok, "{") && equal(tok->next, "}")) {
+    *rest = tok->next->next;
+    return chain;
+  }
+
+  // String literal → char-array byte-by-byte init.
+  if (tok->kind == TK_STR && ty->kind == TY_ARRAY &&
+      ty->base->kind == TY_CHAR) {
+    long s = tok->ty->array_len;
+    long n = ty->array_len > 0 && ty->array_len < s ? ty->array_len : s;
+    for (long i = 0; i < n; i++) {
+      Node *lv = make_offset_lval(var, base_off + i, ty_char, eq);
+      Node *val = new_num((unsigned char)tok->str[i], eq);
+      Node *as = new_binary(ND_ASSIGN, lv, val, eq);
+      chain = new_binary(ND_COMMA, chain, as, eq);
+    }
+    *rest = tok->next;
+    return chain;
+  }
+
+  // Brace-init aggregate.
+  if (equal(tok, "{")) {
+    tok = tok->next;
+    if (ty->kind == TY_STRUCT) {
+      Member *m = ty->members;
+      bool first = true;
+      while (!equal(tok, "}")) {
+        if (!first) tok = skip(tok, ",");
+        first = false;
+        if (equal(tok, "}")) break;
+        if (equal(tok, ".")) {
+          tok = tok->next;
+          if (tok->kind != TK_IDENT)
+            error_tok(tok, "expected member name");
+          Member *target = find_member(ty, tok);
+          if (!target) error_tok(tok, "no such member");
+          tok = skip(tok->next, "=");
+          m = target;
+        }
+        if (!m) error_tok(tok, "excess elements in struct initializer");
+        chain = lvar_init_at_offset(&tok, tok, m->ty, var,
+                                     base_off + m->offset, chain, eq);
+        m = m->next;
+      }
+      *rest = skip(tok, "}");
+      return chain;
+    }
+    if (ty->kind == TY_UNION) {
+      Member *m = ty->members;
+      if (equal(tok, ".")) {
+        tok = tok->next;
+        if (tok->kind != TK_IDENT)
+          error_tok(tok, "expected member name");
+        Member *target = find_member(ty, tok);
+        if (!target) error_tok(tok, "no such member");
+        tok = skip(tok->next, "=");
+        m = target;
+      }
+      if (m && !equal(tok, "}"))
+        chain = lvar_init_at_offset(&tok, tok, m->ty, var,
+                                     base_off + m->offset, chain, eq);
+      if (equal(tok, ",")) tok = tok->next;
+      *rest = skip(tok, "}");
+      return chain;
+    }
+    if (ty->kind == TY_ARRAY) {
+      long elem_sz = ty->base->size;
+      long count = 0;
+      bool first = true;
+      while (!equal(tok, "}")) {
+        if (!first) tok = skip(tok, ",");
+        first = false;
+        if (equal(tok, "}")) break;
+        if (ty->array_len > 0 && count >= ty->array_len)
+          break;
+        chain = lvar_init_at_offset(&tok, tok, ty->base, var,
+                                     base_off + count * elem_sz, chain, eq);
+        count++;
+      }
+      *rest = skip(tok, "}");
+      return chain;
+    }
+    // Brace around a scalar — `T x = { expr };`.
+    Node *e = assign(&tok, tok);
+    add_type(e);
+    Node *lv = make_offset_lval(var, base_off, ty, eq);
+    Node *as = new_binary(ND_ASSIGN, lv, e, eq);
+    chain = new_binary(ND_COMMA, chain, as, eq);
+    if (equal(tok, ",")) tok = tok->next;
+    *rest = skip(tok, "}");
+    return chain;
+  }
+
+  // Plain scalar = expr.
+  Node *e = assign(&tok, tok);
+  add_type(e);
+  Node *lv = make_offset_lval(var, base_off, ty, eq);
+  Node *as = new_binary(ND_ASSIGN, lv, e, eq);
+  chain = new_binary(ND_COMMA, chain, as, eq);
+  *rest = tok;
+  return chain;
 }
