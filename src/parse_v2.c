@@ -1322,6 +1322,36 @@ static Token *function(Token *tok, Type *basety, Type *ty, VarAttr *attr) {
   }
   fn->alloca_bottom = new_lvar("__alloca_bottom__", pointer_to(ty_char));
 
+  // §F.3 — K&R-style parameter declarations (between `)` and `{`).
+  // For each declaration, look up the parameter name in fn->params
+  // and update its type / align.  Excess K&R declarators (no
+  // matching parameter) are an error per the spec.
+  while (!equal(tok, "{")) {
+    VarAttr kr_attr = {0};
+    Type *kr_basety = declspec(&tok, tok, &kr_attr);
+    bool first = true;
+    while (!equal(tok, ";")) {
+      if (!first) tok = skip(tok, ",");
+      first = false;
+      Type *kr_ty = declarator(&tok, tok, kr_basety);
+      if (!kr_ty->name)
+        error_tok(tok, "K&R declarator requires a name");
+      // Look up matching param.
+      bool found = false;
+      for (Obj *p = fn->params; p; p = p->next) {
+        if (!strcmp(p->name, strndup_checked(kr_ty->name->loc, kr_ty->name->len))) {
+          p->ty = kr_ty;
+          if (kr_attr.align) p->align = kr_attr.align;
+          found = true;
+          break;
+        }
+      }
+      if (!found)
+        error_tok(kr_ty->name, "parameter name not in K&R parameter list");
+    }
+    tok = skip(tok, ";");
+  }
+
   // §F.5 — body.
   tok = skip(tok, "{");
   Node *body = compound_stmt(&tok, tok);
