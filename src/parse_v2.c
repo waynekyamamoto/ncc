@@ -1577,6 +1577,14 @@ static Node *compound_stmt(Token **rest, Token *tok) {
 
   enter_scope();
   while (!equal(tok, "}")) {
+    // Block-scope _Static_assert (04c §B.3 step 2).  Spec says the
+    // in-block form silently succeeds; we route through the same
+    // skip_static_assert as file scope so failures still error.
+    if (equal(tok, "_Static_assert") || equal(tok, "static_assert")) {
+      tok = skip_static_assert(tok);
+      continue;
+    }
+
     // Declaration: is_typename and the next token isn't `:` (which
     // would make it a labeled statement using a typedef name).
     if (is_typename(tok) && !equal(tok->next, ":")) {
