@@ -1616,6 +1616,73 @@ static Token *global_variable(Token *tok, Type *basety, Type *first_ty,
         var->init_data_size = var->ty->size;
         tok = tok->next;
       }
+      // Brace init for array-of-pointer (typically string literals
+      // and NULLs).  Each non-string-literal element folds via
+      // const_expr_val.  String literals create anon gvars and
+      // emit relocations.
+      else if (equal(tok, "{") && var->ty->kind == TY_ARRAY &&
+               var->ty->base->kind == TY_PTR) {
+        tok = tok->next;
+        long elem_sz = var->ty->base->size;
+        long count = 0;
+        bool first2 = true;
+        Relocation rel_head = {0};
+        Relocation *rcur = &rel_head;
+        // First pass — collect raw values and possibly relocations.
+        long max_elems = 4096;
+        int64_t *vals = calloc_checked(max_elems, sizeof(int64_t));
+        char **rels = calloc_checked(max_elems, sizeof(char *));
+        while (!equal(tok, "}")) {
+          if (!first2) tok = skip(tok, ",");
+          first2 = false;
+          if (equal(tok, "}")) break;
+          if (count >= max_elems)
+            error_tok(tok, "too many initializer elements");
+          if (tok->kind == TK_STR) {
+            Obj *anon = new_anon_gvar(tok->ty);
+            anon->init_data = tok->str;
+            anon->init_data_size = tok->ty->size;
+            rels[count] = anon->name;
+            tok = tok->next;
+          } else {
+            int64_t v = const_expr_val(&tok, tok);
+            vals[count] = v;
+          }
+          count++;
+        }
+        tok = skip(tok, "}");
+        if (var->ty->array_len < 0) {
+          var->ty = array_of(var->ty->base, count);
+          var->align = var->ty->align;
+        }
+        long sz = var->ty->size;
+        char *buf = calloc_checked(1, sz);
+        for (long i = 0; i < count && i * elem_sz < sz; i++) {
+          if (rels[i]) {
+            Relocation *r = calloc_checked(1, sizeof(Relocation));
+            r->offset = (int)(i * elem_sz);
+            // We need a *pointer to* the name pointer.  The anon
+            // gvar's name field is stable; address-of it is the
+            // recorded slot.
+            // Find the matching Obj from globals (its name slot is
+            // what we want a pointer to).
+            for (Obj *o = globals; o; o = o->next) {
+              if (!strcmp(o->name, rels[i])) {
+                r->label = &o->name;
+                break;
+              }
+            }
+            rcur = rcur->next = r;
+          } else {
+            int64_t v = vals[i];
+            for (int b = 0; b < elem_sz; b++)
+              buf[i * elem_sz + b] = (v >> (b * 8)) & 0xff;
+          }
+        }
+        var->init_data = buf;
+        var->init_data_size = sz;
+        var->rel = rel_head.next;
+      }
       // Brace init for arrays of scalar constants — fold each
       // expression and pack into init_data.
       else if (equal(tok, "{") && var->ty->kind == TY_ARRAY &&
@@ -3028,6 +3095,27 @@ static Node *primary(Token **rest, Token *tok) {
       error_tok(gen, "no matching _Generic association");
     *rest = tok;
     return match;
+  }
+
+  // __func__ / __FUNCTION__ / __PRETTY_FUNCTION__ — predefined
+  // identifier expanding to a string literal containing the
+  // current function's name (04b §H.4 step 7).
+  if (tok->kind == TK_IDENT &&
+      (tok_name_eq(tok, "__func__") ||
+       tok_name_eq(tok, "__FUNCTION__") ||
+       tok_name_eq(tok, "__PRETTY_FUNCTION__"))) {
+    const char *fn_name = current_fn ? current_fn->name : "";
+    size_t n = strlen(fn_name);
+    Type *aty = array_of(ty_char, (long)n + 1);
+    Obj *anon = new_anon_gvar(aty);
+    char *buf = calloc_checked(1, n + 1);
+    memcpy(buf, fn_name, n);
+    anon->init_data = buf;
+    anon->init_data_size = (int)(n + 1);
+    Node *node = new_var_node(anon, tok);
+    node->ty = aty;
+    *rest = tok->next;
+    return node;
   }
 
   // Identifier — first dispatch known builtins, then fall through
