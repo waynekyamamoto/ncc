@@ -1813,6 +1813,7 @@ static Type *typename_(Token **rest, Token *tok) {
   return ty;
 }
 
+
 // cast — 04b §F.  Disambiguate `( typename )`:
 //   - followed by `{` → compound literal (deferred).
 //   - otherwise → cast: parse cast operand, wrap in ND_CAST.
@@ -2085,13 +2086,116 @@ Node *new_cast(Node *expr, Type *ty) {
   return node;
 }
 
-int64_t eval_node(Node *node) {
-  (void)node;
-  return 0;
+// try_eval_node — non-fatal integer constant folder per 04b §K.1.
+// Handles the integer-only operator set; returns false on anything
+// not in the switch.  Float / pointer-relocation / builtin folds
+// are eval2's job (deferred until the public eval_node grows).
+bool try_eval_node(Node *node, int64_t *out) {
+  if (!node) return false;
+  int64_t lv, rv;
+  switch (node->kind) {
+  case ND_NUM:    *out = node->val; return true;
+  case ND_NEG:
+    if (!try_eval_node(node->lhs, &lv)) return false;
+    *out = -lv; return true;
+  case ND_NOT:
+    if (!try_eval_node(node->lhs, &lv)) return false;
+    *out = !lv; return true;
+  case ND_BITNOT:
+    if (!try_eval_node(node->lhs, &lv)) return false;
+    *out = ~lv; return true;
+  case ND_CAST: {
+    if (!try_eval_node(node->lhs, &lv)) return false;
+    if (!node->ty) { *out = lv; return true; }
+    if (is_integer(node->ty)) {
+      switch (node->ty->size) {
+      case 1: *out = node->ty->is_unsigned ? (uint8_t)lv  : (int8_t)lv;  return true;
+      case 2: *out = node->ty->is_unsigned ? (uint16_t)lv : (int16_t)lv; return true;
+      case 4: *out = node->ty->is_unsigned ? (uint32_t)lv : (int32_t)lv; return true;
+      default: *out = lv; return true;
+      }
+    }
+    return false;
+  }
+  case ND_ADD:
+    if (!try_eval_node(node->lhs, &lv) || !try_eval_node(node->rhs, &rv)) return false;
+    *out = lv + rv; return true;
+  case ND_SUB:
+    if (!try_eval_node(node->lhs, &lv) || !try_eval_node(node->rhs, &rv)) return false;
+    *out = lv - rv; return true;
+  case ND_MUL:
+    if (!try_eval_node(node->lhs, &lv) || !try_eval_node(node->rhs, &rv)) return false;
+    *out = lv * rv; return true;
+  case ND_DIV:
+    if (!try_eval_node(node->lhs, &lv) || !try_eval_node(node->rhs, &rv)) return false;
+    if (rv == 0) return false;
+    *out = lv / rv; return true;
+  case ND_MOD:
+    if (!try_eval_node(node->lhs, &lv) || !try_eval_node(node->rhs, &rv)) return false;
+    if (rv == 0) return false;
+    *out = lv % rv; return true;
+  case ND_BITAND:
+    if (!try_eval_node(node->lhs, &lv) || !try_eval_node(node->rhs, &rv)) return false;
+    *out = lv & rv; return true;
+  case ND_BITOR:
+    if (!try_eval_node(node->lhs, &lv) || !try_eval_node(node->rhs, &rv)) return false;
+    *out = lv | rv; return true;
+  case ND_BITXOR:
+    if (!try_eval_node(node->lhs, &lv) || !try_eval_node(node->rhs, &rv)) return false;
+    *out = lv ^ rv; return true;
+  case ND_SHL:
+    if (!try_eval_node(node->lhs, &lv) || !try_eval_node(node->rhs, &rv)) return false;
+    *out = lv << rv; return true;
+  case ND_SHR:
+    if (!try_eval_node(node->lhs, &lv) || !try_eval_node(node->rhs, &rv)) return false;
+    if (node->lhs->ty && node->lhs->ty->is_unsigned)
+      *out = (int64_t)((uint64_t)lv >> rv);
+    else
+      *out = lv >> rv;
+    return true;
+  case ND_EQ:
+    if (!try_eval_node(node->lhs, &lv) || !try_eval_node(node->rhs, &rv)) return false;
+    *out = (lv == rv); return true;
+  case ND_NE:
+    if (!try_eval_node(node->lhs, &lv) || !try_eval_node(node->rhs, &rv)) return false;
+    *out = (lv != rv); return true;
+  case ND_LT:
+    if (!try_eval_node(node->lhs, &lv) || !try_eval_node(node->rhs, &rv)) return false;
+    if (node->lhs->ty && node->lhs->ty->is_unsigned)
+      *out = ((uint64_t)lv < (uint64_t)rv);
+    else
+      *out = (lv < rv);
+    return true;
+  case ND_LE:
+    if (!try_eval_node(node->lhs, &lv) || !try_eval_node(node->rhs, &rv)) return false;
+    if (node->lhs->ty && node->lhs->ty->is_unsigned)
+      *out = ((uint64_t)lv <= (uint64_t)rv);
+    else
+      *out = (lv <= rv);
+    return true;
+  case ND_LOGAND:
+    if (!try_eval_node(node->lhs, &lv)) return false;
+    if (!lv) { *out = 0; return true; }
+    if (!try_eval_node(node->rhs, &rv)) return false;
+    *out = (rv != 0); return true;
+  case ND_LOGOR:
+    if (!try_eval_node(node->lhs, &lv)) return false;
+    if (lv) { *out = 1; return true; }
+    if (!try_eval_node(node->rhs, &rv)) return false;
+    *out = (rv != 0); return true;
+  case ND_COND: {
+    int64_t c;
+    if (!try_eval_node(node->cond, &c)) return false;
+    return try_eval_node(c ? node->then : node->els, out);
+  }
+  default:
+    return false;
+  }
 }
 
-bool try_eval_node(Node *node, int64_t *out) {
-  (void)node;
-  (void)out;
-  return false;
+int64_t eval_node(Node *node) {
+  int64_t v;
+  if (!try_eval_node(node, &v))
+    error_tok(node ? node->tok : NULL, "not a compile-time constant");
+  return v;
 }
