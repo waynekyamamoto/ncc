@@ -1679,6 +1679,37 @@ static Token *parse_gvar_initializer(Token *tok, Obj *var) {
     return tok;
   }
   if (is_integer(var->ty) || var->ty->kind == TY_PTR) {
+    // Pointer special path: detect `&gvar` (ND_ADDR of ND_VAR
+    // where the var is a global) and emit a Relocation rather
+    // than trying to fold an address as an integer.
+    if (var->ty->kind == TY_PTR) {
+      Token *probe = tok;
+      Node *e = assign(&probe, tok);
+      add_type(e);
+      if (e->kind == ND_ADDR && e->lhs && e->lhs->kind == ND_VAR &&
+          e->lhs->var && !e->lhs->var->is_local) {
+        Relocation *r = calloc_checked(1, sizeof(Relocation));
+        r->offset = 0;
+        r->label = &e->lhs->var->name;
+        r->addend = 0;
+        var->rel = r;
+        var->init_data = calloc_checked(1, var->ty->size);
+        var->init_data_size = var->ty->size;
+        return probe;
+      }
+      // ND_VAR of array decays to pointer: also a relocation.
+      if (e->kind == ND_VAR && e->var && !e->var->is_local &&
+          e->var->ty && e->var->ty->kind == TY_ARRAY) {
+        Relocation *r = calloc_checked(1, sizeof(Relocation));
+        r->offset = 0;
+        r->label = &e->var->name;
+        r->addend = 0;
+        var->rel = r;
+        var->init_data = calloc_checked(1, var->ty->size);
+        var->init_data_size = var->ty->size;
+        return probe;
+      }
+    }
     int64_t v = const_expr_val(&tok, tok);
     long sz = var->ty->size;
     char *buf = calloc_checked(1, sz);
@@ -2989,7 +3020,63 @@ static Node *postfix(Token **rest, Token *tok) {
         Node *vref = new_var_node(anon, tok);
         node = new_binary(ND_COMMA, chain, vref, tok);
       } else {
-        error_tok(tok, "parse_v2: file-scope compound literal not yet implemented");
+        // File-scope: anon gvar holding the laid-out struct/array
+        // bytes.  Subset: struct of integer/pointer scalars with no
+        // bit-fields, and arrays of integer scalars.  Field values
+        // fold via const_expr_val.
+        Obj *anon = new_anon_gvar(cl_ty);
+        anon->is_static = true;
+        long sz = cl_ty->size;
+        char *buf = calloc_checked(1, sz);
+        Token *open = tok;
+        tok = skip(tok, "{");
+        if (cl_ty->kind == TY_STRUCT) {
+          Member *m = cl_ty->members;
+          bool first = true;
+          while (!equal(tok, "}")) {
+            if (!first) tok = skip(tok, ",");
+            first = false;
+            if (equal(tok, "}")) break;
+            // Designator: `.name = expr` repositions to the named member.
+            if (equal(tok, ".")) {
+              tok = tok->next;
+              if (tok->kind != TK_IDENT)
+                error_tok(tok, "expected member name after `.`");
+              Member *target = find_member(cl_ty, tok);
+              if (!target)
+                error_tok(tok, "no such member");
+              tok = skip(tok->next, "=");
+              m = target;
+            }
+            if (!m) error_tok(tok, "excess elements in struct compound literal");
+            int64_t v = const_expr_val(&tok, tok);
+            for (int b = 0; b < (int)m->ty->size; b++)
+              buf[m->offset + b] = (v >> (b * 8)) & 0xff;
+            m = m->next;
+          }
+          tok = skip(tok, "}");
+        } else if (cl_ty->kind == TY_ARRAY && is_integer(cl_ty->base)) {
+          long elem_sz = cl_ty->base->size;
+          long i = 0;
+          bool first = true;
+          while (!equal(tok, "}")) {
+            if (!first) tok = skip(tok, ",");
+            first = false;
+            if (equal(tok, "}")) break;
+            int64_t v = const_expr_val(&tok, tok);
+            if ((i + 1) * elem_sz <= sz) {
+              for (int b = 0; b < (int)elem_sz; b++)
+                buf[i * elem_sz + b] = (v >> (b * 8)) & 0xff;
+            }
+            i++;
+          }
+          tok = skip(tok, "}");
+        } else {
+          error_tok(open, "parse_v2: this file-scope compound literal type not supported");
+        }
+        anon->init_data = buf;
+        anon->init_data_size = sz;
+        node = new_var_node(anon, open);
       }
     }
   }
