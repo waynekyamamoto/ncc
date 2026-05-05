@@ -1876,6 +1876,51 @@ static Node *stmt(Token **rest, Token *tok) {
     return node;
   }
 
+  // asm / __asm__ / __asm  ( template [: outputs : inputs : clobbers : labels] ) ;
+  // 04c §E.6 minimal skeleton: capture the (optionally adjacent-
+  // concatenated) string template, brace-balanced-skip everything
+  // else, emit ND_ASM with no operands.  Files with operand-bearing
+  // inline asm will fail at the assembler step — this is a known
+  // gap until we wire the full operand machinery.
+  if (equal(tok, "asm") || equal(tok, "__asm__") || equal(tok, "__asm")) {
+    Token *asm_tok = tok;
+    tok = tok->next;
+    while (equal(tok, "volatile") || equal(tok, "__volatile__") ||
+           equal(tok, "inline") || equal(tok, "goto"))
+      tok = tok->next;
+    tok = skip(tok, "(");
+
+    char *tmpl = "";
+    if (tok->kind == TK_STR) {
+      tmpl = tok->str;
+      tok = tok->next;
+      while (tok->kind == TK_STR) {
+        size_t la = strlen(tmpl);
+        size_t lb = strlen(tok->str);
+        char *cat = calloc_checked(1, la + lb + 1);
+        memcpy(cat, tmpl, la);
+        memcpy(cat + la, tok->str, lb);
+        tmpl = cat;
+        tok = tok->next;
+      }
+    }
+
+    // Skip the rest of the parenthesized body brace-balanced.
+    int depth = 1;
+    while (depth > 0 && tok->kind != TK_EOF) {
+      if (equal(tok, "(")) depth++;
+      else if (equal(tok, ")")) { depth--; if (depth == 0) break; }
+      tok = tok->next;
+    }
+    tok = skip(tok, ")");
+    tok = skip(tok, ";");
+
+    Node *node = new_node(ND_ASM, asm_tok);
+    node->asm_str = tmpl;
+    *rest = tok;
+    return node;
+  }
+
   // switch (cond) stmt (04c §C.2).
   if (equal(tok, "switch")) {
     Token *sw_tok = tok;
