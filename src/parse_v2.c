@@ -1162,16 +1162,79 @@ static Node *assign(Token **rest, Token *tok) {
   return primary(rest, tok);
 }
 
-// primary — vertical-slice subset: TK_NUM only.
+// new_var_node — wrap an Obj into an ND_VAR node.
+static Node *new_var_node(Obj *var, Token *tok) {
+  Node *node = new_node(ND_VAR, tok);
+  node->var = var;
+  return node;
+}
+
+// new_string_literal — anon global containing the string bytes.
+// 04b §H.4 step 5: adjacent literals are already concatenated by
+// the tokenizer (per the convert pass), so a single TK_STR fully
+// describes the string.
+static Obj *new_anon_gvar(Type *ty) {
+  Obj *var = new_gvar(new_unique_name(), ty);
+  var->is_static = true;
+  var->is_definition = true;
+  return var;
+}
+
+// primary — 04b §H.4 dispatch.  Vertical-slice subset:
+//   3. ( expr )
+//   5. TK_STR
+//   6. TK_NUM
+//   8. IDENT (variable / enum constant; calls handled later via postfix)
 static Node *primary(Token **rest, Token *tok) {
-  if (tok->kind == TK_NUM) {
-    Node *node = new_num(tok->val, tok);
-    if (tok->ty)
-      node->ty = tok->ty;
+  // ( expr )
+  if (equal(tok, "(")) {
+    Node *node = expr(&tok, tok->next);
+    *rest = skip(tok, ")");
+    return node;
+  }
+
+  // String literal.
+  if (tok->kind == TK_STR) {
+    Obj *var = new_anon_gvar(tok->ty);
+    var->init_data = tok->str;
+    var->init_data_size = tok->ty->size;
+    Node *node = new_var_node(var, tok);
+    node->ty = tok->ty;
     *rest = tok->next;
     return node;
   }
-  error_tok(tok, "parse_v2: unsupported primary expression (slice incomplete)");
+
+  // Numeric literal.
+  if (tok->kind == TK_NUM) {
+    Node *node;
+    if (tok->ty && is_flonum(tok->ty)) {
+      node = new_node(ND_NUM, tok);
+      node->fval = tok->fval;
+      node->ty = tok->ty;
+    } else {
+      node = new_num(tok->val, tok);
+      if (tok->ty)
+        node->ty = tok->ty;
+    }
+    *rest = tok->next;
+    return node;
+  }
+
+  // Identifier — variable reference or enum constant.
+  if (tok->kind == TK_IDENT) {
+    VarScope *vs = find_var(tok);
+    if (!vs || (!vs->var && !vs->enum_ty))
+      error_tok(tok, "undefined variable");
+    Node *node;
+    if (vs->var)
+      node = new_var_node(vs->var, tok);
+    else
+      node = new_num(vs->enum_val, tok);
+    *rest = tok->next;
+    return node;
+  }
+
+  error_tok(tok, "parse_v2: expected an expression");
 }
 
 //
