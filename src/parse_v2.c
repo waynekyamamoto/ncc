@@ -3039,6 +3039,42 @@ static Node *primary(Token **rest, Token *tok) {
       return new_num(0, bi);
     }
 
+    // Bit-manipulation builtins.  Each is a single-argument node;
+    // codegen lowers via the matching ND_BUILTIN_* case (04b §K.2
+    // float branch / direct codegen).  The `node->val` field is set
+    // to the operand width (32 vs 64) per spec note.
+    static const struct { const char *name; NodeKind kind; bool is64; } bi_unary[] = {
+      {"__builtin_clz",         ND_BUILTIN_CLZ,        false},
+      {"__builtin_clzl",        ND_BUILTIN_CLZ,        true },
+      {"__builtin_clzll",       ND_BUILTIN_CLZ,        true },
+      {"__builtin_ctz",         ND_BUILTIN_CTZ,        false},
+      {"__builtin_ctzl",        ND_BUILTIN_CTZ,        true },
+      {"__builtin_ctzll",       ND_BUILTIN_CTZ,        true },
+      {"__builtin_ffs",         ND_BUILTIN_FFS,        false},
+      {"__builtin_ffsl",        ND_BUILTIN_FFS,        true },
+      {"__builtin_ffsll",       ND_BUILTIN_FFS,        true },
+      {"__builtin_popcount",    ND_BUILTIN_POPCOUNT,   false},
+      {"__builtin_popcountl",   ND_BUILTIN_POPCOUNT,   true },
+      {"__builtin_popcountll",  ND_BUILTIN_POPCOUNT,   true },
+      {"__builtin_parity",      ND_BUILTIN_PARITY,     false},
+      {"__builtin_clrsb",       ND_BUILTIN_CLRSB,      false},
+      {"__builtin_bswap32",     ND_BUILTIN_BSWAP32,    false},
+      {"__builtin_bswap64",     ND_BUILTIN_BSWAP64,    true },
+    };
+    for (size_t i = 0; i < sizeof(bi_unary)/sizeof(*bi_unary); i++) {
+      if (!tok_name_eq(tok, bi_unary[i].name)) continue;
+      Token *bi = tok;
+      tok = skip(tok->next, "(");
+      Node *arg = assign(&tok, tok);
+      tok = skip(tok, ")");
+      *rest = tok;
+      Node *node = new_unary(bi_unary[i].kind, arg, bi);
+      node->ty = ty_int;
+      // Codegen reads `val` as a boolean: nonzero → 64-bit dispatch.
+      node->val = bi_unary[i].is64 ? 1 : 0;
+      return node;
+    }
+
     // __builtin_va_start(ap, last) — Apple ARM64: ap = __va_area__.
     if (tok_name_eq(tok, "__builtin_va_start")) {
       Token *bi = tok;
