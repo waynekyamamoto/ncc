@@ -63,14 +63,18 @@ struct Scope {
 };
 
 // VarAttr: storage-class & alignment attributes accumulated by
-// declspec (04a_decl.md §B.3, §B.6, §G).
+// declspec (04a_decl.md §B.3, §B.6, §G).  mode_kind / vector_size
+// are populated by attribute_list (§G) and applied post-loop (§B.12).
 typedef struct {
   bool is_typedef;
   bool is_static;
   bool is_extern;
   bool is_inline;
+  bool is_noreturn;
   bool is_tls;
   int align;
+  int mode_kind;     // 0 / 1 / 2 / 4 / 8 — set by __attribute__((mode(X)))
+  int vector_size;   // bytes — set by __attribute__((vector_size(N)))
 } VarAttr;
 
 //
@@ -237,12 +241,317 @@ Obj *parse(Token *tok) {
 }
 
 //
-// Stubs.  Each errors out so spine misuse is loud, not silent.
+// declspec — declaration specifiers (04a_decl.md §B).
+//
+// Bitmask state machine: each primitive contributes a unique
+// increment that, when summed, encodes the full type.  Duplicate
+// `int` etc. overflow into invalid counter space and trigger the
+// switch's default error arm.  LONG is intentionally additive (two
+// allowed: `long long`).  Storage class, qualifiers, and attributes
+// run alongside.
+//
+// Stubs (deep dependencies not yet implemented):
+//   - struct_decl / union_decl / enum_specifier (§F)
+//   - typeof family (§B.7)
+//   - _Atomic ( type-name ) (§B.5 paren form; bare qualifier works)
+//   - _Alignas (§B.6)
+//   - attribute_list (§G)
 //
 
+static Type *struct_decl(Token **rest, Token *tok);
+static Type *union_decl(Token **rest, Token *tok);
+static Type *enum_specifier(Token **rest, Token *tok);
+static Type *typeof_specifier(Token **rest, Token *tok);
+static Type *atomic_specifier(Token **rest, Token *tok);
+static Token *parse_alignas(Token *tok, VarAttr *attr);
+static Token *attribute_list(Token *tok, Type *ty, VarAttr *attr);
+
 static Type *declspec(Token **rest, Token *tok, VarAttr *attr) {
-  (void)rest; (void)attr;
-  error_tok(tok, "parse_v2: declspec not yet implemented");
+  enum {
+    VOID     = 1 << 0,
+    BOOL     = 1 << 2,
+    CHAR     = 1 << 4,
+    SHORT    = 1 << 6,
+    INT      = 1 << 8,
+    LONG     = 1 << 10,
+    FLOAT    = 1 << 12,
+    DOUBLE   = 1 << 14,
+    OTHER    = 1 << 16,
+    SIGNED   = 1 << 17,
+    UNSIGNED = 1 << 18,
+    COMPLEX  = 1 << 19,
+  };
+
+  Type *ty = ty_int;       // C default-int rule (§B.2 footnote).
+  int counter = 0;
+  bool is_const = false, is_volatile = false, is_atomic = false;
+
+  while (is_typename(tok)) {
+    // Storage class (§B.3) — consumed; flags only when attr non-NULL.
+    if (equal(tok, "typedef") || equal(tok, "static") ||
+        equal(tok, "extern") || equal(tok, "inline") ||
+        equal(tok, "_Noreturn") || equal(tok, "_Thread_local") ||
+        equal(tok, "__thread") || equal(tok, "register") ||
+        equal(tok, "auto")) {
+      if (attr) {
+        if (equal(tok, "typedef"))                            attr->is_typedef = true;
+        else if (equal(tok, "static"))                        attr->is_static = true;
+        else if (equal(tok, "extern"))                        attr->is_extern = true;
+        else if (equal(tok, "inline"))                        attr->is_inline = true;
+        else if (equal(tok, "_Noreturn"))                     attr->is_noreturn = true;
+        else if (equal(tok, "_Thread_local") || equal(tok, "__thread"))
+          attr->is_tls = true;
+        // register / auto: consumed without flag.
+      }
+      tok = tok->next;
+      continue;
+    }
+
+    // Qualifiers (§B.4).
+    if (equal(tok, "const"))    { is_const    = true; tok = tok->next; continue; }
+    if (equal(tok, "volatile")) { is_volatile = true; tok = tok->next; continue; }
+    if (equal(tok, "restrict") || equal(tok, "__restrict") ||
+        equal(tok, "__restrict__")) {
+      tok = tok->next; continue;
+    }
+
+    // _Atomic (§B.5) — bare qualifier; paren form recurses via typename_.
+    if (equal(tok, "_Atomic")) {
+      if (equal(tok->next, "(")) {
+        ty = atomic_specifier(&tok, tok);
+        is_atomic = true;
+        counter += OTHER;
+        continue;
+      }
+      is_atomic = true;
+      tok = tok->next;
+      continue;
+    }
+
+    // _Alignas (§B.6).
+    if (equal(tok, "_Alignas")) {
+      tok = parse_alignas(tok, attr);
+      continue;
+    }
+
+    // __extension__ (§B.11) — silent no-op.
+    if (equal(tok, "__extension__")) {
+      tok = tok->next;
+      continue;
+    }
+
+    // __attribute__ (§B.10).
+    if (equal(tok, "__attribute__")) {
+      // Per §B.10: copy_type the current ty (if not a tag type) so
+      // attribute mutations don't corrupt shared singletons.  Tag
+      // types share identity with the tag table and must not be
+      // copied.
+      if (ty->kind != TY_STRUCT && ty->kind != TY_UNION)
+        ty = copy_type(ty);
+      tok = attribute_list(tok->next, ty, attr);
+      continue;
+    }
+
+    // typeof family (§B.7).
+    if (equal(tok, "typeof") || equal(tok, "__typeof") ||
+        equal(tok, "__typeof__")) {
+      ty = typeof_specifier(&tok, tok);
+      counter += OTHER;
+      continue;
+    }
+
+    // Tag specifiers (§B.9 first half).
+    if (equal(tok, "struct")) { ty = struct_decl(&tok, tok->next); counter += OTHER; continue; }
+    if (equal(tok, "union"))  { ty = union_decl(&tok, tok->next);  counter += OTHER; continue; }
+    if (equal(tok, "enum"))   { ty = enum_specifier(&tok, tok->next); counter += OTHER; continue; }
+
+    // __builtin_va_list (§B.8) — pointer to void at the C type level.
+    if (equal(tok, "__builtin_va_list")) {
+      ty = pointer_to(ty_void);
+      counter += OTHER;
+      tok = tok->next;
+      continue;
+    }
+
+    // Typedef-name resolution (§B.9 second half).  Guarded by
+    // counter == 0 so `int x` doesn't try to interpret `x` as a
+    // typedef.  Once a primitive specifier is in, an identifier
+    // here is the declarator name and we must terminate.
+    if (tok->kind == TK_IDENT) {
+      if (counter != 0) break;
+      VarScope *vs = find_var(tok);
+      if (!vs || !vs->type_def) break;   // is_typename was true → must be typedef
+      ty = vs->type_def;
+      counter += OTHER;
+      tok = tok->next;
+      continue;
+    }
+
+    // Primitives — accumulate into counter, then evaluate.
+    if      (equal(tok, "void"))                                counter += VOID;
+    else if (equal(tok, "_Bool"))                               counter += BOOL;
+    else if (equal(tok, "char"))                                counter += CHAR;
+    else if (equal(tok, "short"))                               counter += SHORT;
+    else if (equal(tok, "int"))                                 counter += INT;
+    else if (equal(tok, "long"))                                counter += LONG;
+    else if (equal(tok, "float"))                               counter += FLOAT;
+    else if (equal(tok, "double"))                              counter += DOUBLE;
+    else if (equal(tok, "signed"))                              counter += SIGNED;
+    else if (equal(tok, "unsigned"))                            counter += UNSIGNED;
+    else if (equal(tok, "_Complex") || equal(tok, "__complex__")) counter += COMPLEX;
+    else error_tok(tok, "parse_v2: declspec: unhandled type specifier");
+
+    // Canonical-type switch (§B.2).  Order does not matter
+    // normatively; arms grouped for readability.
+    switch (counter) {
+    case VOID:                                                          ty = ty_void;       break;
+    case BOOL:                                                          ty = ty_bool;       break;
+
+    case CHAR:
+    case SIGNED + CHAR:                                                 ty = ty_char;       break;
+    case UNSIGNED + CHAR:                                               ty = ty_uchar;      break;
+
+    case SHORT:
+    case SHORT + INT:
+    case SIGNED + SHORT:
+    case SIGNED + SHORT + INT:                                          ty = ty_short;      break;
+    case UNSIGNED + SHORT:
+    case UNSIGNED + SHORT + INT:                                        ty = ty_ushort;     break;
+
+    case INT:
+    case SIGNED:
+    case SIGNED + INT:                                                  ty = ty_int;        break;
+    case UNSIGNED:
+    case UNSIGNED + INT:                                                ty = ty_uint;       break;
+
+    case LONG:
+    case LONG + INT:
+    case SIGNED + LONG:
+    case SIGNED + LONG + INT:                                           ty = ty_long;       break;
+    case UNSIGNED + LONG:
+    case UNSIGNED + LONG + INT:                                         ty = ty_ulong;      break;
+
+    case LONG + LONG:
+    case LONG + LONG + INT:
+    case SIGNED + LONG + LONG:
+    case SIGNED + LONG + LONG + INT:                                    ty = ty_longlong;   break;
+    case UNSIGNED + LONG + LONG:
+    case UNSIGNED + LONG + LONG + INT:                                  ty = ty_ulonglong;  break;
+
+    case FLOAT:                                                         ty = ty_float;      break;
+    case DOUBLE:                                                        ty = ty_double;     break;
+    case LONG + DOUBLE:                                                 ty = ty_ldouble;    break;
+
+    case COMPLEX:
+    case COMPLEX + DOUBLE:                                              ty = complex_type(ty_double);     break;
+    case COMPLEX + FLOAT:                                               ty = complex_type(ty_float);      break;
+    case COMPLEX + LONG + DOUBLE:                                       ty = complex_type(ty_ldouble);    break;
+
+    case COMPLEX + INT:
+    case COMPLEX + SIGNED:
+    case COMPLEX + SIGNED + INT:                                        ty = complex_type(ty_int);        break;
+    case COMPLEX + UNSIGNED:
+    case COMPLEX + UNSIGNED + INT:                                      ty = complex_type(ty_uint);       break;
+
+    case COMPLEX + LONG:
+    case COMPLEX + LONG + INT:
+    case COMPLEX + SIGNED + LONG:
+    case COMPLEX + SIGNED + LONG + INT:                                 ty = complex_type(ty_long);       break;
+    case COMPLEX + UNSIGNED + LONG:
+    case COMPLEX + UNSIGNED + LONG + INT:                               ty = complex_type(ty_ulong);      break;
+
+    case COMPLEX + LONG + LONG:
+    case COMPLEX + LONG + LONG + INT:
+    case COMPLEX + SIGNED + LONG + LONG:
+    case COMPLEX + SIGNED + LONG + LONG + INT:                          ty = complex_type(ty_longlong);   break;
+    case COMPLEX + UNSIGNED + LONG + LONG:
+    case COMPLEX + UNSIGNED + LONG + LONG + INT:                        ty = complex_type(ty_ulonglong);  break;
+
+    case COMPLEX + SHORT:
+    case COMPLEX + SHORT + INT:
+    case COMPLEX + SIGNED + SHORT:
+    case COMPLEX + SIGNED + SHORT + INT:                                ty = complex_type(ty_short);      break;
+    case COMPLEX + UNSIGNED + SHORT:
+    case COMPLEX + UNSIGNED + SHORT + INT:                              ty = complex_type(ty_ushort);     break;
+
+    case COMPLEX + CHAR:
+    case COMPLEX + SIGNED + CHAR:                                       ty = complex_type(ty_char);       break;
+    case COMPLEX + UNSIGNED + CHAR:                                     ty = complex_type(ty_uchar);      break;
+
+    default:
+      error_tok(tok, "parse_v2: declspec: invalid type");
+    }
+
+    tok = tok->next;
+  }
+
+  // §B.12 post-loop processing.
+  if (is_const || is_volatile || is_atomic) {
+    ty = copy_type(ty);
+    ty->is_const    = is_const;
+    ty->is_volatile = is_volatile;
+    ty->is_atomic   = is_atomic;
+  }
+
+  // mode_kind and vector_size are populated by attribute_list, which
+  // is currently stubbed; the bodies below are unreachable until §G
+  // lands but match the spec contract.
+  if (attr && attr->mode_kind) {
+    bool unsigned_ = ty->is_unsigned || (counter & UNSIGNED);
+    Type *new_ty = NULL;
+    switch (attr->mode_kind) {
+    case 1: new_ty = unsigned_ ? ty_uchar  : ty_char;  break;
+    case 2: new_ty = unsigned_ ? ty_ushort : ty_short; break;
+    case 4: new_ty = unsigned_ ? ty_uint   : ty_int;   break;
+    case 8: new_ty = unsigned_ ? ty_ulong  : ty_long;  break;
+    }
+    if (new_ty) ty = copy_type(new_ty);
+  }
+
+  if (attr && attr->vector_size && !is_vector(ty) && ty->size > 0)
+    ty = vector_of(copy_type(ty), attr->vector_size);
+
+  *rest = tok;
+  return ty;
+}
+
+//
+// declspec deep-dependency stubs.
+//
+
+static Type *struct_decl(Token **rest, Token *tok) {
+  (void)rest;
+  error_tok(tok, "parse_v2: struct_decl not yet implemented");
+}
+
+static Type *union_decl(Token **rest, Token *tok) {
+  (void)rest;
+  error_tok(tok, "parse_v2: union_decl not yet implemented");
+}
+
+static Type *enum_specifier(Token **rest, Token *tok) {
+  (void)rest;
+  error_tok(tok, "parse_v2: enum_specifier not yet implemented");
+}
+
+static Type *typeof_specifier(Token **rest, Token *tok) {
+  (void)rest;
+  error_tok(tok, "parse_v2: typeof not yet implemented");
+}
+
+static Type *atomic_specifier(Token **rest, Token *tok) {
+  (void)rest;
+  error_tok(tok, "parse_v2: _Atomic(type-name) not yet implemented");
+}
+
+static Token *parse_alignas(Token *tok, VarAttr *attr) {
+  (void)attr;
+  error_tok(tok, "parse_v2: _Alignas not yet implemented");
+}
+
+static Token *attribute_list(Token *tok, Type *ty, VarAttr *attr) {
+  (void)ty; (void)attr;
+  error_tok(tok, "parse_v2: attribute_list not yet implemented");
 }
 
 static Token *parse_typedef(Token *tok, Type *basety) {
