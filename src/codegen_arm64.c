@@ -1282,36 +1282,26 @@ static void gen_expr(Node *node) {
     return;
 
   case ND_RETURN_ADDR: {
-    // __builtin_return_address(level)
+    // __builtin_return_address(level) — level is in node->val (a
+    // compile-time constant per parse.c).
     // Level 0: return address of current function = [x29, #8]
     // Level N: follow frame pointer chain N times, then read [fp, #8]
-    gen_expr(node->lhs);
-    int c = label_cnt++;
+    int level = (int)node->val;
     println("mov x1, x29"); // start from current frame
-    println("cbz x0, Ltmp_ra.done.%d", c);
-    printlabel("Ltmp_ra.loop.%d:", c);
-    println("ldr x1, [x1]"); // follow frame pointer chain
-    println("sub x0, x0, #1");
-    println("cbnz x0, Ltmp_ra.loop.%d", c);
-    printlabel("Ltmp_ra.done.%d:", c);
-    println("ldr x0, [x1, #8]"); // return address is at fp+8
+    for (int i = 0; i < level; i++)
+      println("ldr x1, [x1]"); // follow FP chain
+    println("ldr x0, [x1, #8]"); // return address at fp+8
     return;
   }
 
   case ND_BUILTIN_FRAME_ADDR: {
-    // __builtin_frame_address(level)
+    // __builtin_frame_address(level) — level is in node->val.
     // Level 0: x29
     // Level N: follow frame pointer chain N times
-    gen_expr(node->lhs);
-    int c = label_cnt++;
-    println("mov x1, x29");
-    println("cbz x0, Ltmp_fa.done.%d", c);
-    printlabel("Ltmp_fa.loop.%d:", c);
-    println("ldr x1, [x1]"); // follow frame pointer chain
-    println("sub x0, x0, #1");
-    println("cbnz x0, Ltmp_fa.loop.%d", c);
-    printlabel("Ltmp_fa.done.%d:", c);
-    println("mov x0, x1");
+    int level = (int)node->val;
+    println("mov x0, x29");
+    for (int i = 0; i < level; i++)
+      println("ldr x0, [x0]"); // follow FP chain
     return;
   }
 
