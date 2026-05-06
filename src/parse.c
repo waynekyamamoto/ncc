@@ -1934,6 +1934,12 @@ static Token *parse_gvar_initializer(Token *tok, Obj *var) {
         if (!target) error_tok(tok, "no such member");
         tok = skip(tok->next, "=");
         m = target;
+      } else if (tok->kind == TK_IDENT && equal(tok->next, ":")) {
+        // Pre-C99 `name: value` designator form.
+        Member *target = find_member(ty, tok);
+        if (!target) error_tok(tok, "no such member");
+        tok = skip(tok->next, ":");
+        m = target;
       }
       if (!m) error_tok(tok, "excess elements in struct initializer");
       concat_adjacent_strings(tok);
@@ -1980,8 +1986,26 @@ static Token *parse_gvar_initializer(Token *tok, Obj *var) {
     Type *ty = var->ty;
     long sz = ty->size;
     char *buf = calloc_checked(1, sz);
+    Relocation rh = {0};
+    Relocation *rcur = &rh;
     tok = tok->next;
     Member *m = ty->members;
+    // Designator: `.name = expr` or pre-C99 `name: expr` repositions
+    // to the named member (anonymous union accepts only the first
+    // member by default).
+    if (equal(tok, ".")) {
+      tok = tok->next;
+      if (tok->kind != TK_IDENT) error_tok(tok, "expected member name");
+      Member *target = find_member(ty, tok);
+      if (!target) error_tok(tok, "no such member");
+      tok = skip(tok->next, "=");
+      m = target;
+    } else if (tok->kind == TK_IDENT && equal(tok->next, ":")) {
+      Member *target = find_member(ty, tok);
+      if (!target) error_tok(tok, "no such member");
+      tok = skip(tok->next, ":");
+      m = target;
+    }
     if (!equal(tok, "}") && m) {
       concat_adjacent_strings(tok);
       if (m->ty->kind == TY_PTR && tok->kind == TK_STR) {
@@ -1993,12 +2017,18 @@ static Token *parse_gvar_initializer(Token *tok, Obj *var) {
         r->label = &anon->name;
         var->rel = r;
         tok = tok->next;
+      } else if (equal(tok, "{") || m->ty->kind == TY_STRUCT ||
+                 m->ty->kind == TY_UNION || m->ty->kind == TY_ARRAY ||
+                 m->ty->kind == TY_PTR ||
+                 is_flonum(m->ty)) {
+        tok = gvar_subinit_recursive(tok, m->ty, buf, 0, sz, &rcur);
       } else {
         int64_t v = const_expr_val(&tok, tok);
         for (int b = 0; b < (int)m->ty->size && b < (int)sz; b++)
           buf[b] = (v >> (b * 8)) & 0xff;
       }
     }
+    if (rh.next && !var->rel) var->rel = rh.next;
     // Trailing comma allowed.
     if (equal(tok, ",")) tok = tok->next;
     tok = skip(tok, "}");
@@ -2886,6 +2916,12 @@ static Node *declaration(Token **rest, Token *tok, Type *basety, VarAttr *attr) 
                 error_tok(tok, "no such member");
               tok = skip(tok->next, "=");
               m = target;
+            } else if (tok->kind == TK_IDENT && equal(tok->next, ":")) {
+              // Pre-C99 `name: value` designator form.
+              Member *target = find_member(ty, tok);
+              if (!target) error_tok(tok, "no such member");
+              tok = skip(tok->next, ":");
+              m = target;
             }
             if (!m)
               error_tok(tok, "excess elements in struct initializer");
@@ -2906,6 +2942,36 @@ static Node *declaration(Token **rest, Token *tok, Type *basety, VarAttr *attr) 
             chain = new_binary(ND_COMMA, chain, as, eq);
             m = m->next;
           }
+          tok = skip(tok, "}");
+        } else if (ty->kind == TY_UNION) {
+          // Local union brace-init — single-member, with optional
+          // designator (both `.name = expr` and pre-C99 `name: expr`
+          // forms).  Defaults to first member when no designator.
+          Member *m = ty->members;
+          if (equal(tok, ".")) {
+            tok = tok->next;
+            if (tok->kind != TK_IDENT)
+              error_tok(tok, "expected member name");
+            Member *target = find_member(ty, tok);
+            if (!target) error_tok(tok, "no such member");
+            tok = skip(tok->next, "=");
+            m = target;
+          } else if (tok->kind == TK_IDENT && equal(tok->next, ":")) {
+            Member *target = find_member(ty, tok);
+            if (!target) error_tok(tok, "no such member");
+            tok = skip(tok->next, ":");
+            m = target;
+          }
+          if (m && !equal(tok, "}")) {
+            Node *e = assign(&tok, tok);
+            add_type(e);
+            Node *vref = new_var_node(var, eq);
+            Node *mn = new_unary(ND_MEMBER, vref, eq);
+            mn->member = m;
+            Node *as = new_binary(ND_ASSIGN, mn, e, eq);
+            chain = new_binary(ND_COMMA, chain, as, eq);
+          }
+          if (equal(tok, ",")) tok = tok->next;
           tok = skip(tok, "}");
         } else {
           // `T x = {expr};` — single-expr brace form for scalars.
@@ -3537,6 +3603,21 @@ static Node *init_compound_literal(Token **rest, Token *tok, Obj *var) {
       if (!first) tok = skip(tok, ",");
       first = false;
       if (equal(tok, "}")) break;
+      // Designator: `.name = expr` or pre-C99 `name: expr`.
+      if (equal(tok, ".")) {
+        tok = tok->next;
+        if (tok->kind != TK_IDENT)
+          error_tok(tok, "expected member name after `.`");
+        Member *target = find_member(ty, tok);
+        if (!target) error_tok(tok, "no such member");
+        tok = skip(tok->next, "=");
+        m = target;
+      } else if (tok->kind == TK_IDENT && equal(tok->next, ":")) {
+        Member *target = find_member(ty, tok);
+        if (!target) error_tok(tok, "no such member");
+        tok = skip(tok->next, ":");
+        m = target;
+      }
       if (!m)
         error_tok(tok, "excess elements in struct compound literal");
       if (equal(tok, "{"))
@@ -3612,6 +3693,12 @@ static Node *postfix(Token **rest, Token *tok) {
               if (!target)
                 error_tok(tok, "no such member");
               tok = skip(tok->next, "=");
+              m = target;
+            } else if (tok->kind == TK_IDENT && equal(tok->next, ":")) {
+              // Pre-C99 `name: value` designator form.
+              Member *target = find_member(cl_ty, tok);
+              if (!target) error_tok(tok, "no such member");
+              tok = skip(tok->next, ":");
               m = target;
             }
             if (!m) error_tok(tok, "excess elements in struct compound literal");
@@ -4700,6 +4787,12 @@ static Token *gvar_subinit_recursive(Token *tok, Type *ty, char *buf,
           if (!target) error_tok(tok, "no such member");
           tok = skip(tok->next, "=");
           m = target;
+        } else if (tok->kind == TK_IDENT && equal(tok->next, ":")) {
+          // Pre-C99 `name: value` designator form.
+          Member *target = find_member(ty, tok);
+          if (!target) error_tok(tok, "no such member");
+          tok = skip(tok->next, ":");
+          m = target;
         }
         if (!m)
           error_tok(tok, "excess elements in struct initializer");
@@ -4718,6 +4811,12 @@ static Token *gvar_subinit_recursive(Token *tok, Type *ty, char *buf,
         Member *target = find_member(ty, tok);
         if (!target) error_tok(tok, "no such member");
         tok = skip(tok->next, "=");
+        m = target;
+      } else if (tok->kind == TK_IDENT && equal(tok->next, ":")) {
+        // Pre-C99 `name: value` designator form.
+        Member *target = find_member(ty, tok);
+        if (!target) error_tok(tok, "no such member");
+        tok = skip(tok->next, ":");
         m = target;
       }
       if (m && !equal(tok, "}"))
@@ -4868,6 +4967,12 @@ static Node *lvar_init_at_offset(Token **rest, Token *tok, Type *ty,
           if (!target) error_tok(tok, "no such member");
           tok = skip(tok->next, "=");
           m = target;
+        } else if (tok->kind == TK_IDENT && equal(tok->next, ":")) {
+          // Pre-C99 `name: value` designator form.
+          Member *target = find_member(ty, tok);
+          if (!target) error_tok(tok, "no such member");
+          tok = skip(tok->next, ":");
+          m = target;
         }
         if (!m) error_tok(tok, "excess elements in struct initializer");
         chain = lvar_init_at_offset(&tok, tok, m->ty, var,
@@ -4886,6 +4991,12 @@ static Node *lvar_init_at_offset(Token **rest, Token *tok, Type *ty,
         Member *target = find_member(ty, tok);
         if (!target) error_tok(tok, "no such member");
         tok = skip(tok->next, "=");
+        m = target;
+      } else if (tok->kind == TK_IDENT && equal(tok->next, ":")) {
+        // Pre-C99 `name: value` designator form.
+        Member *target = find_member(ty, tok);
+        if (!target) error_tok(tok, "no such member");
+        tok = skip(tok->next, ":");
         m = target;
       }
       if (m && !equal(tok, "}"))
