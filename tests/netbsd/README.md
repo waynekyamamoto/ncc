@@ -124,6 +124,7 @@ bash tests/netbsd/tools/ncc-kern.sh -c $HOME/netbsd/src/sys/kern/foo.c -o /tmp/f
 - `Dockerfile` — Ubuntu 22.04 build image (used on macOS only)
 - `stubs/` — empty `.o`s for SoC drivers and NEON crypto exports
 - `build-rootfs.sh` — provisions the 4 GB FFS root disk (orthogonal to `make netbsd`)
+- `CHECKPOINT-2026-05-06.md` — current state at the login-prompt milestone
 - `STATUS.md`, `reference-boot.log` — running progress log + reference boot
 
 ## License
