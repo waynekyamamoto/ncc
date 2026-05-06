@@ -1,7 +1,12 @@
-CC ?= clang
+CC ?= cc
 UNAME := $(shell uname)
 ifeq ($(UNAME),Linux)
 CFLAGS = -Wall -Wextra -Werror -std=c11 -D_GNU_SOURCE -g -O2 \
+         -Wno-unused-parameter -Wno-switch -Wno-missing-field-initializers \
+         -Wno-sign-compare -Wno-format -Wno-empty-body \
+         -Wno-unused-but-set-variable
+else ifeq ($(UNAME),NetBSD)
+CFLAGS = -Wall -Wextra -Werror -std=c11 -D_NETBSD_SOURCE -g -O2 \
          -Wno-unused-parameter -Wno-switch -Wno-missing-field-initializers \
          -Wno-sign-compare -Wno-format -Wno-empty-body \
          -Wno-unused-but-set-variable

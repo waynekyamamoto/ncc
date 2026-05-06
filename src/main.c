@@ -358,6 +358,11 @@ int main(int argc, char **argv) {
     uint32_t size = sizeof(exe_path);
     if (_NSGetExecutablePath(exe_path, &size) == 0)
       got_path = true;
+#elif defined(__NetBSD__)
+    // NetBSD has no /proc/self/exe; argv[0] is a full path when invoked via
+    // an absolute path or shell PATH lookup, so realpath handles both cases.
+    if (realpath(argv[0], exe_path) != NULL)
+      got_path = true;
 #else
     ssize_t n = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
     if (n > 0) {
@@ -451,7 +456,11 @@ int main(int argc, char **argv) {
         // On macOS this is always the case when -target elf is given.
         // On Linux it selects the cross-assembler instead of the native one,
         // needed for NetBSD/xv6 kernel builds that require -march=armv8.6-a+sve.
+        // Use the cross-assembler (aarch64-elf-as) only on macOS and Linux.
+        // On native NetBSD the system `as` already targets aarch64 ELF.
+#if defined(__APPLE__) || defined(__linux__)
         opt_cross_elf = true;
+#endif
         define_macro("__ELF__", "1");
         // Override __builtin_va_list / __gnuc_va_list with the AAPCS64
         // 32-byte struct.  init_macros() runs before flag parsing so it can
@@ -558,14 +567,18 @@ int main(int argc, char **argv) {
   // This is standard GCC/Clang behavior: user -I paths shadow system paths.
 #ifdef __APPLE__
   add_include_path("/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include");
+#elif defined(__NetBSD__)
+  // NetBSD: pkgsrc headers first, then base system headers.
+  add_include_path("/usr/pkg/include");
+  add_include_path("/usr/include");
 #else
   // Debian/Ubuntu multiarch: glibc bits/ headers live under the triple-named
   // subdirectory. Without this, e.g. <stdio.h> -> <bits/wordsize.h> fails to
   // resolve when ncc is bootstrapping itself on Linux.
   add_include_path("/usr/include/aarch64-linux-gnu");
-#endif
   add_include_path("/usr/local/include");
   add_include_path("/usr/include");
+#endif
 
   if (input_files_list.len == 0)
     error("no input files");
