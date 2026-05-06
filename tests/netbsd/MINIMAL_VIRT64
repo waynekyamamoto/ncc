@@ -94,8 +94,15 @@ gicvthree*	at fdt? pass 1
 # Console — QEMU virt UART is a PL011.
 plcom*		at fdt? pass 4
 
-# Virtio (over MMIO under QEMU virt; over PCI if we add a virtio-pci controller)
+# PCIe — QEMU virt exposes a generic PCIe host; virtio-net-pci attaches here.
+pcihost*	at fdt?
+pci*		at pcibus?
+ppb*		at pci? dev ? function ?
+pci*		at ppb?
+
+# Virtio over MMIO (block, rng) and over PCI (net)
 virtio* 	at fdt?
+virtio*		at pci? dev ? function ?
 ld*		at virtio?
 vioif*		at virtio?
 viornd* 	at virtio?
@@ -121,3 +128,4 @@ pseudo-device	clockctl
 pseudo-device	putter
 pseudo-device	drvctl
 pseudo-device	fss
+pseudo-device	bpfilter
