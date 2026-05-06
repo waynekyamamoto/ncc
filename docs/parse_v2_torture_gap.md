@@ -1,14 +1,18 @@
 # parse_v2 torture gap
 
-ncc-v2 currently passes 835/995 GCC torture tests; canonical ncc passes 964/995.
-This doc enumerates the 129-test gap as known feature debt, grouped by the
+ncc-v2 currently passes 849/995 GCC torture tests; canonical ncc passes 964/995.
+This doc enumerates the 115-test gap as known feature debt, grouped by the
 underlying C/GCC feature that would unblock the bucket.  Each entry is tagged
 (C) compile-fail or (R) runtime-fail.
 
 When a fix lands, tick off the entries it covers.  When the doc reaches zero
 entries, ncc-v2 == canonical at the torture level (modulo skipped tests).
 
-Generated 2026-05-06 against commit 42fd9a7 (`9cbf8ec` + log).
+Last refreshed 2026-05-06 against `f7d0e6e` (offsetof const-fold;
+SQLite 20/20).  14 tests closed since first generation at `42fd9a7`:
+20010325-1, 20071120-1, 20090113-2, 20090113-3, 921019-1, 921113-1,
+980223, alias-1, alias-access-path-1, align-2, lto-tbaa-1, memchr-1,
+packed-aligned, pr10352-1.
 
 ## nested function (10)
 
@@ -95,7 +99,6 @@ list params followed by declarations before `{`.
 - 20000808-1 (R) — `f(p0, p1, p2, p3, p4, p5) Point p0,...;` 6-`Point` K&R.
 - 920501-9 (R) — default-int `print_longlong(x,buf) long long x; char *buf; {…}`.
 - 921112-1 (R) — `f(x,v) union u *x, v;`.
-- 921113-1 (R) — `gitter(...)` w/ K&R-ish default-int decls + large stack array.
 - 921124-1 (R) — `f(x,d1,d2,d3) double d1,d2,d3;`.
 - 930603-1 (R) — `float fx(x) float x;` + default-int `f(){}`.
 - 931005-1 (R) — `T f(s1) T s1;` returning struct.
@@ -104,7 +107,7 @@ list params followed by declarations before `{`.
 - cmpdi-1 (R) — `feq(x,y) long long int x, y;` etc., default-int returns.
 - conversion (R) — large K&R-defined conversion table; primary blocker is K&R def + unsigned-to-float corner cases.
 
-## nested aggregate gvar/lvar init (10)
+## nested aggregate gvar/lvar init (9)
 
 After the recent fix some forms still break: flat-init of struct-containing-
 array, designated init for unions, nested compound literals, struct-with-
@@ -119,23 +122,18 @@ initializer parser to accept the remaining ISO/GNU forms.
 - pr108498-2 (C) — `p->d = (struct U) { "abcdefghijklmno" };` struct-of-char-array assigned by compound literal.
 - 991201-1 (C) — `struct vc vc_cons[63] = { &a_con };` — initializer is a scalar where struct expected; needs implicit brace.
 - 20180131-1 (C) — `U u = { .ss = -1 };` designated init of a union member.
-- memchr-1 (C) — `static const char s4_2[2][4] = { "1234", "5678" };` array-of-char-array string init (parse_v2: "this global initializer form not yet implemented").
 - 20071029-1 (C) — `t = (T) { { ++i, 0,... } };` lvalue compound literal of union containing struct.
 - 20010924-1 (R) — flexible-array-member init from string-literal `struct{char a3c; char a3p[];} a3 = {'o',"wx"};`.
 
-## &gvar in const-init (8)
+## &gvar in const-init (2)
 
 Static-init context refusing `&gvar`, `(cast)&gvar`, `&array[k]`, `array+k`.
 Unblock: in const-eval, allow address arithmetic on gvar with constant offset
-to reduce to `<sym> + N` relocation.
+to reduce to `<sym> + N` relocation.  Most of this bucket was closed by the
+SQLite-driven `try_eval_addr_v2` fix in `29f2bdc` — only the deep-nested and
+compound-literal-address cases remain.
 
-- alias-1 (C) — `float *ptr2 = (float *) &val;` plus `__attribute__((optimize(...)))`.
-- 921019-1 (C) — `void *foo[]={(void *)&("X"[0])};` — addr of indexed string literal.
-- 980223 (C) — `object cons1[2] = { {(char *) &nil, 0}, ... };` — cast gvar addr in nested struct init.
 - const-addr-expr-1 (C) — `(int *) &((Upgrade_items + 1)->uaattrid)` — pointer-arith on gvar addr.
-- lto-tbaa-1 (C) — `struct b b={&e};` then `struct b b3;` etc., chained gvar-addr inits.
-- pr10352-1 (C) — `int *c = (int *)&b, d;` — bitfield-struct addr cast in init.
-- 20071120-1 (C) — `const struct ggc_root_tab gt[] = { { &deferred_access_no_check } };` static-storage gvar addr in nested struct.
 - 20050929-1 (C) — `struct C e = { &(struct B){...}, &(struct A){...} };` — addr-of compound literal in static init.
 
 ## vector type (7) (C)
@@ -178,7 +176,7 @@ Plus one compile-fail (param array w/ side-effecting size expression).
 - 20221006-1 (R) — multidim `int M1[len][len], M2[len][len];` VLA init/access.
 - 970217-1 (C) — `int sub(int i, int array[i++])` — VLA in parameter array bound, side-effecting size expression (parses as undefined `i`).
 
-## alias attribute (5) (C)
+## alias attribute (3) (C)
 
 `__attribute__((alias("symbol")))` on extern decls.  Unblock: emit
 `.set b,a` or equivalent Mach-O `.alt_entry`/symbol-alias directive in
@@ -187,9 +185,6 @@ codegen for `alias` attr; treat `optimize` attr as no-op.
 - alias-2 (C) — `extern int b[10] __attribute__((alias("a")));`.
 - alias-3 (C) — `extern int b __attribute__((alias("a")));` on static.
 - alias-4 (C) — two aliases sharing storage with their targets.
-- alias-access-path-1 (C) — type-pun via `(struct c *)&val`, also const-init `&val`.
-
-(alias-1 listed under &gvar in const-init bucket; that fires first.)
 
 ## builtin: __builtin_return_address / __builtin_frame_address (4) (C)
 
@@ -229,12 +224,11 @@ accept `IDENT ':'` as a designator alias for `'.' IDENT '='`.
 - 991228-1 (C) — `__extension__ union { double d; int i[2]; } u = { d: -0.25 };`.
 - compndlit-1 (C) — `(struct S){b:0, a:0, c:({...})}` — combined w/ statement-expression and bit-field.
 
-## packed/aligned attr (3) (R)
+## packed/aligned attr (2) (R)
 
 Runtime ABI for packed-and-aligned struct passed by value, plus alignment
 attribute on functions, plus VLA-in-packed-struct sizeof.
 
-- packed-aligned (R) — `struct c { double a; } __attribute((packed)) __attribute((aligned));` passed by value.
 - 20041218-2 (R) — `struct s { char b[n]; } __attribute__((packed));` VLA-in-packed-struct sizeof.
 - align-3 (R) — `__attribute__((aligned(256)))` on a function, then `__alignof__(func)` runtime-checked.
 
@@ -263,17 +257,6 @@ matching integer type.
 - memclr (C) — `typedef unsigned int __attribute__((mode(QI))) int08_t;` etc., then macro-expanded `MEMCLR_DEFINE_ONE` whose body fails to parse without `mode`.
 - misalign (C) — same pattern, plus `__attribute__((packed))` struct nested in union.
 
-## incomplete-struct tag completion (2) (C)
-
-`struct foo;` declared as incomplete, then later `typedef struct foo {...} bar;`
-with the same tag.  parse_v2 fails to look up the completed members through
-either name and reports `no such member`.  Unblock: when a `struct foo` typedef
-later defines members, splice them onto the prior incomplete tag in the type
-table.
-
-- 20090113-2 (C) — `struct bitmap_head_def;` then later `typedef struct bitmap_head_def {...} bitmap_head;` — `map->first` not found.
-- 20090113-3 (C) — same pattern, smaller bitmap layout.
-
 ## builtin: __builtin_setjmp / __builtin_longjmp (1) (C)
 
 Unblock: lower to `setjmp`/`longjmp` calls (or implement as inline asm-block
@@ -287,12 +270,6 @@ Unblock: add to builtins table; can lower as widening multiply + truncation
 compare.
 
 - pr105984 (C) — `__builtin_mul_overflow_p(4, (unsigned char)~c, 0)` — currently links to undefined symbol.
-
-## wide string concat (1) (C)
-
-Unblock: in tokenizer/parser, allow `L"a" "b"` to combine into a wide string.
-
-- 20010325-1 (C) — `if (L"a" "b"[1] != L'b')`.
 
 ## builtin: __builtin_constant_p (1) (R)
 
@@ -317,10 +294,6 @@ returning 0/1 from type AST compare.
 ## builtin: llabs (1) (R)
 
 - 20021127-1 (R) — `llabs(-1)` should call user-defined `llabs`, currently apparently inlined wrongly.
-
-## 16-byte struct passing ABI (1) (R)
-
-- align-2 (R) — many small struct types `{char c; T t;}` passed/inited; runtime compares miscompare due to alignment / passing ABI.
 
 ## other — chained const pointer (1) (R)
 
