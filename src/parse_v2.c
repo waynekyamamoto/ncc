@@ -806,6 +806,13 @@ static Member *struct_members(Token **rest, Token *tok) {
     }
     tok = skip(tok, ";");
   }
+  // Flexible array member (last member with incomplete array type):
+  // normalize array_len to 0 so struct_layout treats it as zero-size
+  // and the surrounding struct's size accounts only for the declared
+  // members.  Mirrors canonical parse.c §1.6 (line 1325-1329).
+  if (cur != &head && cur->ty->kind == TY_ARRAY && cur->ty->array_len < 0) {
+    cur->ty = array_of(cur->ty->base, 0);
+  }
   *rest = skip(tok, "}");
   return head.next;
 }
