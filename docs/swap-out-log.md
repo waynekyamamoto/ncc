@@ -433,3 +433,83 @@ preserved at `ef9e8d896f7affbc971bd9820af41124` throughout.
 
 Session checkpoint commit: `9c5cdaa`.
 
+---
+
+## Phase 4 autonomous session — 2026-05-05/06
+
+Working session on `swap-out` branch.  8 commits.  Focus: close
+the gap between ncc-v2 and canonical ncc on the GCC torture suite,
+not surface-area additions.
+
+**State on session start** (`9da1e97`):
+- Bootstrap stage1==stage2 fixed point already held.  The previous
+  session's "stage-2 SIGBUSes inside `scan_pp_num_v2`" claim
+  no longer reproduced — that bug had been fixed in one of the late
+  prior commits but the log entry pre-dated it.
+- Torture: ncc-v2 687/995 (69.0%).  Canonical: 964/995 (96.9%).
+  Gap: 277 tests.
+
+**State on session end** (`9cbf8ec`):
+- Torture: ncc-v2 **835/995 (83.9%)**.  Gap to canonical: 129 tests.
+- Bootstrap fixed point preserved at every commit (md5 changed each
+  time the canonical source did).
+
+**Bug class breakdown** (in commit order):
+
+1. `cd1fdca` — **Float gvar init.**  17 compile-fails came from
+    `parse_v2: this global initializer form not yet implemented`
+    on float scalars and float arrays.  Added `try_eval_double_v2`
+    (literal / neg / +-*/ / ND_CAST / ND_COND / fall-back to
+    integer fold).  +10 PASS.
+2. `8c83755` — **Recursive gvar sub-initializer.**  7 compile-fails
+    on `nested aggregate gvar init not yet implemented` in the struct
+    handler.  Added `gvar_subinit_recursive` covering struct / union /
+    array / scalar leaves with relocations.  +5 PASS.
+3. `2ee3a2d` — **Nested brace lvar init via offset-based helper.**
+    7 compile-fails on `nested brace initializer not yet implemented`
+    in array and struct local init.  Added `make_offset_lval` +
+    `lvar_init_at_offset` to emit `*(ty *)((char *)&var + off) = expr`
+    chains for arbitrarily nested aggregates.  +6 PASS.
+4. `c8970bf` — **64-bit ptr-arith scale (new_add / new_sub).**
+    Element-size scale was an `ND_NUM` with `ty_int`, so codegen
+    emitted `mul w0, w0, w1` (w-register, 32-bit truncating).  Any
+    `ptr +/- int` on a stack/heap address went wild.  Added `new_long`
+    and used it for the scale, mirroring canonical at parse.c:144.
+    +6 PASS.
+5. `8f44e21` — **Implicit-decl variadic flag.**  HUGE.  Implicit
+    function declarations were unconditionally setting `is_variadic`,
+    so calls to undeclared `memcpy` / `memset` / `strcmp` etc. went
+    through the Apple ARM64 variadic ABI (all args on stack), but the
+    callee expects them in `x0`/`x1`/`x2`.  Restricted variadic to
+    the printf family with synthesized named char* params, mirroring
+    canonical parse.c:3919.  **+115 PASS** in one commit (714 → 829).
+6. `c12d29c` — **Flex-array member normalization.**  `struct_members`
+    didn't rewrite a trailing incomplete-array member to length 0, so
+    `array_of(base, -1)`'s negative size collapsed the surrounding
+    struct's size in `struct_layout`.  +1 PASS.
+7. `9cbf8ec` — **`to_assign` double-scaling for ptr ND_ADD / ND_SUB.**
+    `to_assign` re-routed the inner op through `new_add` / `new_sub`,
+    which re-applied the pointer scale → offset got squared (e.g.
+    `--q` on `struct S*` decremented by `sizeof(struct S)^2` bytes).
+    Switched to `new_binary` direct, mirroring canonical
+    parse.c:2294.  +5 PASS.
+
+**Validation pyramid (current)**:
+
+| Check | Result |
+|---|---|
+| `NCC=./ncc-v2 scripts/bootstrap_validate.sh` | FIXED POINT (md5 `12de412e5d99d14afd7eb3c176a52385`) |
+| `tests/torture/run.sh` (`NCC=./ncc-v2`) | 835/995 PASS (84%, canonical 964/995) |
+| Canonical `scripts/bootstrap_validate.sh` | FIXED POINT (md5 `ef9e8d896f7affbc971bd9820af41124`, untouched) |
+
+Remaining **47 runtime fails** are mostly: bitfields, `_Complex` /
+`__complex__`, K&R + struct passing, VLA + goto-back-across-decl,
+GCC builtins (`__builtin_bswap`, `__builtin_constant_p`,
+`__builtin_types_compatible_p`), and inline asm.  Each is a
+distinct, deeper feature — the easy bug-class wins are mostly
+done.  **82 compile-fails** are dominated by GCC extensions
+(`&&label` const-expr, `_Complex` literals, vector compound
+literals, nested function definitions).
+
+Session checkpoint commit: `9cbf8ec`.
+
