@@ -276,6 +276,16 @@ static Node *new_num(int64_t val, Token *tok) {
   return node;
 }
 
+// 64-bit num — used for pointer-arithmetic scale factors so the
+// generated MUL stays in 64-bit registers (otherwise high bits get
+// truncated and pointer arithmetic on stack addresses goes wild).
+static Node *new_long(int64_t val, Token *tok) {
+  Node *node = new_node(ND_NUM, tok);
+  node->val = val;
+  node->ty = ty_long;
+  return node;
+}
+
 // Spec 04c §A.5 prescribes `.L..%d`, but Mach-O treats `.L`-prefixed
 // labels as external — only labels starting with capital `L` are
 // local in Mach-O.  We use `Ltmp_%d` to match the canonical ncc and
@@ -2775,9 +2785,12 @@ static Node *new_add(Node *lhs, Node *rhs, Token *tok) {
     Node *t = lhs; lhs = rhs; rhs = t;
   }
 
-  // ptr + int — scale by element size.
+  // ptr + int — scale by element size.  Use new_long so the MUL
+  // is computed in 64-bit (otherwise w-register truncation breaks
+  // pointer arithmetic on real-world stack/heap addresses).
   long elem_size = lhs->ty->base->size;
-  rhs = new_binary(ND_MUL, rhs, new_num(elem_size, tok), tok);
+  if (!elem_size) elem_size = 1;
+  rhs = new_binary(ND_MUL, rhs, new_long(elem_size, tok), tok);
   return new_binary(ND_ADD, lhs, rhs, tok);
 }
 
@@ -2792,10 +2805,11 @@ static Node *new_sub(Node *lhs, Node *rhs, Token *tok) {
   if (is_numeric(lhs->ty) && is_numeric(rhs->ty))
     return new_binary(ND_SUB, lhs, rhs, tok);
 
-  // ptr - int.
+  // ptr - int.  Force 64-bit scale (see new_add comment).
   if (lhs->ty->base && is_integer(rhs->ty)) {
     long elem_size = lhs->ty->base->size;
-    rhs = new_binary(ND_MUL, rhs, new_num(elem_size, tok), tok);
+    if (!elem_size) elem_size = 1;
+    rhs = new_binary(ND_MUL, rhs, new_long(elem_size, tok), tok);
     add_type(rhs);
     Node *node = new_binary(ND_SUB, lhs, rhs, tok);
     node->ty = lhs->ty;
@@ -2805,9 +2819,10 @@ static Node *new_sub(Node *lhs, Node *rhs, Token *tok) {
   // ptr - ptr.
   if (lhs->ty->base && rhs->ty->base) {
     long elem_size = lhs->ty->base->size;
+    if (!elem_size) elem_size = 1;
     Node *node = new_binary(ND_SUB, lhs, rhs, tok);
     node->ty = ty_long;
-    return new_binary(ND_DIV, node, new_num(elem_size, tok), tok);
+    return new_binary(ND_DIV, node, new_long(elem_size, tok), tok);
   }
 
   error_tok(tok, "invalid operands");
