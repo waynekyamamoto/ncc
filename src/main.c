@@ -36,6 +36,7 @@ static char *opt_o;
 static bool opt_S;  // Output assembly only
 static bool opt_c;  // Compile only, don't link
 static bool opt_E;  // Preprocess only
+static bool opt_x_asm;  // -x assembler-with-cpp or -x assembler
 
 static void usage(int status) {
   fprintf(stderr, "Usage: ncc [options] <file...>\n");
@@ -508,6 +509,14 @@ int main(int argc, char **argv) {
       continue;
     }
 
+    if (!strcmp(argv[i], "-x")) {
+      if (++i < argc) {
+        if (!strcmp(argv[i], "assembler-with-cpp") || !strcmp(argv[i], "assembler"))
+          opt_x_asm = true;
+      }
+      continue;
+    }
+
     // Ignore common flags we don't support
     if (!strcmp(argv[i], "-w") || !strcmp(argv[i], "-g") ||
         !strcmp(argv[i], "-O0") || !strcmp(argv[i], "-O1") ||
@@ -581,6 +590,27 @@ int main(int argc, char **argv) {
     if ((len > 2 && !strcmp(input + len - 2, ".o")) ||
         (len > 2 && !strcmp(input + len - 2, ".a"))) {
       strarray_push(&obj_files, input);
+      continue;
+    }
+
+    // .S / -x assembler-with-cpp: C-preprocessed assembly. Run ncc's
+    // preprocessor then hand the result to the assembler.
+    // gcc auto-defines __ASSEMBLER__=1 for .S files so that headers emit
+    // asm-safe code (no C inline functions, no C-only typedefs, etc.).
+    if ((len > 2 && !strcmp(input + len - 2, ".S")) || opt_x_asm) {
+      char *pp_file = create_tmpfile();
+      bool save_E = opt_E; opt_E = true;
+      define_macro("__ASSEMBLER__", "1");
+      compile(input, pp_file);
+      undef_macro("__ASSEMBLER__");
+      opt_E = save_E;
+      if (!opt_S) {
+        char *output = opt_c ? (opt_o ? opt_o : replace_ext(input, ".o"))
+                             : create_tmpfile();
+        assemble(pp_file, output);
+        if (!opt_c)
+          strarray_push(&obj_files, output);
+      }
       continue;
     }
 

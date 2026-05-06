@@ -48,11 +48,15 @@ if [ "$HAS_C" -eq 0 ]; then
   exec "$CROSS_GCC" "$@"
 fi
 
-# Assembly source goes to the cross-gcc.
+# Preprocessed assembly (.S) files: the kernel's lib/kern atomics use
+# #include "__aarch64_lse.S" which relies on nbmake's VPATH to find the
+# source file — ncc's preprocessor doesn't have that context.  The
+# cross-gcc handles these correctly, so route all .S through it.
 case "$SRC" in
-  *.S)
-    exec "$CROSS_GCC" "$@"
-    ;;
+  *.S) exec "$CROSS_GCC" "$@" ;;
+esac
+
+case "$SRC" in
   */kern/kern_ksyms_buf.c)
     # SYMTAB_SPACE allocates a giant uninitialized array sized for the
     # kernel's debug-symbol table; ncc OOMs on the resulting big static
@@ -65,22 +69,21 @@ case "$SRC" in
     exec "$CROSS_GCC" "$@"
     ;;
   */chacha_ref.c|\
+  */chacha_impl.c|\
   */chacha_selftest.c)
-    # ncc miscompiles chacha_ref.c (likely bit-rotation issue), causing the
-    # chacha self-test to fail and flood the console with hexdumps for minutes.
-    # Route to gcc until the ncc bug is diagnosed and fixed.
+    # ncc miscompiles chacha (bit-rotation/XOR codegen bug).
+    # Route all three to gcc to avoid flooding boot with hexdumps.
     exec "$CROSS_GCC" "$@"
     ;;
 esac
 
 case "$SRC" in
   */chacha_neon.c)
-    # Substitute the combined NEON stub (defines all chacha+aes neon symbols).
-    new_args=""
-    for a in "$@"; do
-      if [ "$a" = "$SRC" ]; then new_args="$new_args $STUBS/neon_stub.c"; else new_args="$new_args $a"; fi
-    done
-    exec "$NCC" -target elf -D__NetBSD__=1 $NCC_EXTRA $new_args
+    # chacha_neon.c uses ARM NEON intrinsics — ncc can't compile them.
+    # Route to cross-gcc which handles the intrinsics correctly.  The kernel
+    # build system passes -march=armv8-a (last of three -march flags) to
+    # override the global +nofp+nosimd, giving the NEON code its needed ISA.
+    exec "$CROSS_GCC" "$@"
     ;;
   */aes_neon_subr.c)
     # aes_neon_subr.c uses NEON intrinsics — stub it. The substituted file
