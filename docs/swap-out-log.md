@@ -513,3 +513,94 @@ literals, nested function definitions).
 
 Session checkpoint commit: `9cbf8ec`.
 
+---
+
+## Phase 4 closed — 2026-05-06 (`phase-4-closed` at `a414daf`)
+
+After the autonomous session above wrapped at 835 PASS, a follow-up
+session (same day) drove ncc-v2 the rest of the way through the
+real-world validation suite, then performed the swap-in.
+
+**Follow-up bug fixes** (commits `29f2bdc`, `727e69a`, `f7d0e6e`):
+- `concat_adjacent_strings` — `"foo" "bar"` token merge at every
+  TK_STR site (gvar/lvar/primary).  Mirrors canonical parse.c:3790.
+- `try_eval_addr_v2` — fold `&gvar`, `&arr[N]`, `arr+k`,
+  `(T*)&gvar`, `(T*)"literal"` into (label, addend) for static
+  init.  Replaces narrow ND_ADDR/ND_VAR pattern matches scattered
+  in gvar handlers.  Mirrors canonical eval2 (parse.c:1870).
+- Route TY_PTR / aggregate / flonum struct fields through
+  `gvar_subinit_recursive` in struct + array-of-struct gvar
+  handlers (was const_expr_val'ing pointer fields).
+- Origin-chain walk in `struct_ref` — `const struct B *p` declared
+  before B's body becomes a copy_type'd Type *; chase ty->origin to
+  the completed type.  Mirrors canonical struct_ref (parse.c:2911).
+- Lift integer-array gvar init's hardcoded 1024-element cap to a
+  doubling realloc — SQLite has tables with >1024 entries.
+- Generic aggregate fallback in parse_gvar_initializer — multi-dim
+  arrays (`u8 trans[8][8]`) and any other unmatched aggregate
+  brace-init now route through gvar_subinit_recursive.
+- `__builtin_bswap16` — table can't carry the result-type/val=16
+  convention; inline special-case before the generic table.
+- Float-to-int cast fold in try_eval_node's ND_CAST — for
+  `(int)(-.867 * R)` style static initializers (doom).
+- **offsetof const-fold** — `offsetof(T,m)` (defined in stddef.h
+  as `((size_t)&((T*)0)->m)`) wasn't folding at compile time, so
+  any sizeof-of-array-dimension referencing offsetof — most notably
+  SQLite's `char saveBuf[PARSE_TAIL_SZ]` where `PARSE_TAIL_SZ =
+  sizeof(Parse) - offsetof(Parse, sLastToken)` — got the wrong
+  size.  Stack frame collapsed → memcpy crash.  Added ND_ADDR +
+  ND_MEMBER cases that walk the `&((T*)0)->m1.m2.m3` chain.
+
+**Validation pyramid post-swap (canonical ncc, no `-v2`)**:
+
+| Check | Result |
+|---|---|
+| `scripts/bootstrap_validate.sh` | FIXED POINT (md5 `154536038f7a206073c36a0c189ab112`) |
+| `tests/torture/run.sh` | 849/995 PASS (CF=71, RT=44, SKIP=31) |
+| `tests/sqlite/build.sh` | 20/20 SQL tests PASS end-to-end |
+| `build_doom_ncc2.sh` | 83/83 C files compile + link |
+| `tests/cpython/build.sh` | deferred (Python source absent on this machine) |
+
+**Source-base state at this tag** (`phase-4-closed`):
+- 4 of 6 phases done: 1 (tokenize), 2 (preprocess), 3 (type), 4 (parse).
+- Spec-derived: tokenize.c (679) + preprocess.c (1817) + type.c (499)
+  + parse.c (~4400) = ~7400 lines of pure C11 (53% of src/).
+- Remaining chibicc-lineage: codegen_arm64.c (2829), main.c (547),
+  cc.h (567), alloc.c (37), unicode.c (84), hashmap.c (105) =
+  ~4170 lines.
+
+**Decisions baked in (Phase 4)**:
+- Implicit-decl: NOT variadic by default; only `printf` family marked
+  variadic with synthesized named char* params (matches canonical's
+  hardcoded list).  Was the single biggest source of runtime
+  failures — fixed `memcpy`/`memset`/`strcmp`/etc. ABI breakage.
+- 64-bit pointer-arith scale: `new_long` for the element-size
+  multiplier, so `mul x0,x0,x1` not `mul w0,w0,w1`.
+- `to_assign` does NOT re-route through `new_add`/`new_sub`; uses
+  `new_binary` direct on already-scaled rhs (avoids double-scaling).
+- Struct member origin walk in `struct_ref` for forward-declared
+  struct const-qualified copies.
+- offsetof folds at compile time via ND_ADDR + ND_MEMBER chain walk
+  in try_eval_node.
+- Trailing flex-array struct member rewritten to `array_of(base, 0)`
+  in `struct_members` so `struct_layout` doesn't get a negative size.
+
+**Open** (post-Phase-4, documented in `docs/parse_v2_torture_gap.md`):
+- 115 torture failures grouped by feature class.  Top buckets:
+  nested function (10), &&label / computed-goto (10+3),
+  _Complex (10+3), bitfield runtime (10), K&R def (10),
+  nested-aggregate init (9).
+- Phase 5 (codegen_arm64.c, 2829 lines) is the natural next phase.
+  Inventory not yet started.
+
+**Closing commits on `swap-out`**:
+- `f7d0e6e` — offsetof const-fold; SQLite 20/20 PASS
+- `8a329dc` — docs/parse_v2_torture_gap refresh — 14 closed, 115 remaining
+- `a414daf` — Phase 4 swap-in: spec-derived parser becomes canonical
+- Tag `phase-4-closed` pushed.
+
+**No deliberate divergences** from the pre-swap ncc-v2 behavior.
+Provenance: chibicc/parse.c → ncc/src/parse.c → docs/specs/04*.md →
+new src/parse.c.  Same pattern as Phases 1/2/3.  Bytes from
+chibicc/parse.c no longer remain in `src/`.
+
