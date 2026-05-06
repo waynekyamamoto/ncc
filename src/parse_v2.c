@@ -1027,8 +1027,16 @@ static Node *struct_ref(Node *node, Token *name) {
   if (node->ty->kind != TY_STRUCT && node->ty->kind != TY_UNION)
     error_tok(node->tok, "not a struct or union");
 
+  // Follow origin chain to the completed type with members — covers
+  // forward decls of `const struct B *` where the const-qualified copy
+  // was made before B's body was parsed.  Mirrors canonical struct_ref.
+  Type *cty = node->ty;
+  while (cty->origin && !cty->members &&
+         (cty->kind == TY_STRUCT || cty->kind == TY_UNION))
+    cty = cty->origin;
+
   // Direct hit.
-  Member *m = find_member(node->ty, name);
+  Member *m = find_member(cty, name);
   if (m) {
     Node *n = new_unary(ND_MEMBER, node, name);
     n->member = m;
@@ -1036,7 +1044,7 @@ static Node *struct_ref(Node *node, Token *name) {
   }
 
   // Walk anonymous members: each anon hop adds an ND_MEMBER node.
-  for (Member *am = node->ty->members; am; am = am->next) {
+  for (Member *am = cty->members; am; am = am->next) {
     if (am->name) continue;
     if (am->ty->kind != TY_STRUCT && am->ty->kind != TY_UNION) continue;
     if (!has_member_named(am->ty, name)) continue;
@@ -1664,6 +1672,126 @@ static Type *array_dimensions(Token **rest, Token *tok, Type *ty) {
 // `int x = 5;` will hit the error_tok arm.
 //
 
+// try_eval_addr_v2 — fold a compile-time pointer-typed expression
+// to a (label, addend) pair so it can become a relocation in static
+// init.  Subset modeled after canonical eval2 (parse.c:1870), enough
+// for the patterns real-world headers / sqlite / linux use:
+//
+//   &gvar                    -> &gvar.name + 0
+//   &gvar->field   /  &gvar.field
+//                            -> &gvar.name + member offset
+//   &arr[N]   /  arr+N   /  arr-N   (arr is a global array)
+//                            -> &arr.name + N*sizeof(*arr)
+//   func                     -> &func.name + 0   (function decay)
+//   ND_CAST(inner)           -> recurse, ignore the cast
+//   ND_ADD(addr, const_int)  -> addr.label, addr.addend + const
+//   ND_SUB(addr, const_int)  -> addr.label, addr.addend - const
+//
+// Returns true and writes *out_label / *out_addend on success.
+// Returns false otherwise; caller falls back to integer fold.
+static bool try_eval_addr_v2(Node *e, char **out_label, int64_t *out_addend) {
+  if (!e) return false;
+  add_type(e);
+  switch (e->kind) {
+  case ND_ADDR: {
+    Node *inner = e->lhs;
+    if (!inner) return false;
+    if (inner->kind == ND_VAR && inner->var && !inner->var->is_local) {
+      *out_label = inner->var->name;
+      *out_addend = 0;
+      return true;
+    }
+    if (inner->kind == ND_DEREF) {
+      // &*x == x
+      return try_eval_addr_v2(inner->lhs, out_label, out_addend);
+    }
+    if (inner->kind == ND_MEMBER && inner->member &&
+        inner->lhs && inner->lhs->kind == ND_VAR && inner->lhs->var &&
+        !inner->lhs->var->is_local) {
+      *out_label = inner->lhs->var->name;
+      *out_addend = inner->member->offset;
+      return true;
+    }
+    return false;
+  }
+  case ND_VAR:
+    // Function or array decays to pointer.  For other gvars, taking
+    // the rvalue isn't a static-init address.
+    if (e->var && !e->var->is_local && e->var->ty &&
+        (e->var->ty->kind == TY_FUNC || e->var->ty->kind == TY_ARRAY)) {
+      *out_label = e->var->name;
+      *out_addend = 0;
+      return true;
+    }
+    return false;
+  case ND_CAST:
+    return try_eval_addr_v2(e->lhs, out_label, out_addend);
+  case ND_ADD: {
+    char *lbl = NULL;
+    int64_t a = 0;
+    int64_t k;
+    if (try_eval_addr_v2(e->lhs, &lbl, &a) && try_eval_node(e->rhs, &k)) {
+      *out_label = lbl;
+      *out_addend = a + k;
+      return true;
+    }
+    if (try_eval_addr_v2(e->rhs, &lbl, &a) && try_eval_node(e->lhs, &k)) {
+      *out_label = lbl;
+      *out_addend = a + k;
+      return true;
+    }
+    return false;
+  }
+  case ND_SUB: {
+    char *lbl = NULL;
+    int64_t a = 0;
+    int64_t k;
+    if (try_eval_addr_v2(e->lhs, &lbl, &a) && try_eval_node(e->rhs, &k)) {
+      *out_label = lbl;
+      *out_addend = a - k;
+      return true;
+    }
+    return false;
+  }
+  case ND_COMMA:
+    return try_eval_addr_v2(e->rhs, out_label, out_addend);
+  default:
+    return false;
+  }
+}
+
+// concat_adjacent_strings — if `tok` is TK_STR followed by another
+// TK_STR (and so on), merge the chain into a single TK_STR token in
+// place: tok takes the merged bytes + type, and tok->next jumps past
+// the trailing string in the chain.  Returns true if any merge
+// happened.  Mirrors canonical parse.c:3790.
+//
+// Used by the gvar / lvar initializer paths that consume a single
+// TK_STR — without this they choke on `char *p = "foo" "bar";` and
+// every adjacent-string init in real-world headers.
+static bool concat_adjacent_strings(Token *tok) {
+  if (tok->kind != TK_STR || tok->next->kind != TK_STR)
+    return false;
+  int total_len = 0;
+  for (Token *t = tok; t->kind == TK_STR; t = t->next)
+    total_len += t->ty->array_len - 1;
+  total_len++;  // final NUL
+  char *buf = calloc_checked(1, total_len);
+  int offset = 0;
+  Token *t = tok;
+  while (t->kind == TK_STR) {
+    int len = t->ty->array_len - 1;
+    memcpy(buf + offset, t->str, len);
+    offset += len;
+    t = t->next;
+  }
+  buf[offset] = '\0';
+  tok->ty = array_of(ty_char, total_len);
+  tok->str = buf;
+  tok->next = t;
+  return true;
+}
+
 // parse_gvar_initializer — consumes `= initializer` for an Obj that
 // already lives in the globals chain.  Subset (matches the spec's
 // gvar paths in 04d):
@@ -1679,6 +1807,7 @@ static Token *parse_gvar_initializer(Token *tok, Obj *var) {
   Token *eq = tok;
   tok = tok->next;
 
+  concat_adjacent_strings(tok);
   if (tok->kind == TK_STR && var->ty->kind == TY_ARRAY &&
       var->ty->base->kind == TY_CHAR) {
     long s = tok->ty->array_len;
@@ -1720,6 +1849,7 @@ static Token *parse_gvar_initializer(Token *tok, Obj *var) {
       first2 = false;
       if (equal(tok, "}")) break;
       if (count >= max_elems) error_tok(tok, "too many initializer elements");
+      concat_adjacent_strings(tok);
       if (tok->kind == TK_STR) {
         Obj *anon = new_anon_gvar(tok->ty);
         anon->init_data = tok->str;
@@ -1727,20 +1857,23 @@ static Token *parse_gvar_initializer(Token *tok, Obj *var) {
         rels[count] = anon->name;
         tok = tok->next;
       } else {
-        // Try parsing as an expression first to detect address-
-        // taken globals and function references, then fall back to
-        // const_expr_val for plain integers.
+        // Try parsing as an expression first.  Detect any
+        // static-address-of pattern (`&gvar`, `arr+k`, `(T*)&gvar`,
+        // `(T*)"literal"`, etc.) via try_eval_addr_v2 so the relocation
+        // captures the gvar + offset.  Fall back to const_expr_val for
+        // plain integer pointer values.
         Token *probe = tok;
         Node *e = assign(&probe, tok);
         add_type(e);
-        if (e->kind == ND_ADDR && e->lhs && e->lhs->kind == ND_VAR &&
-            e->lhs->var && !e->lhs->var->is_local) {
-          rels[count] = e->lhs->var->name;
-          tok = probe;
-        } else if (e->kind == ND_VAR && e->var && !e->var->is_local &&
-                   e->var->ty && (e->var->ty->kind == TY_FUNC ||
-                                   e->var->ty->kind == TY_ARRAY)) {
-          rels[count] = e->var->name;
+        char *lbl = NULL;
+        int64_t addend = 0;
+        if (try_eval_addr_v2(e, &lbl, &addend)) {
+          rels[count] = lbl;
+          // We can't represent a non-zero addend in this lightweight
+          // (rels[] + vals[]) ladder; use vals[count] for the addend
+          // bytes that get OR'd in below.  Most real-world cases have
+          // addend == 0 (plain pointer to a gvar / string literal).
+          vals[count] = addend;
           tok = probe;
         } else {
           vals[count] = const_expr_val(&tok, tok);
@@ -1761,6 +1894,7 @@ static Token *parse_gvar_initializer(Token *tok, Obj *var) {
       if (rels[i]) {
         Relocation *r = calloc_checked(1, sizeof(Relocation));
         r->offset = (int)(i * elem_sz);
+        r->addend = vals[i];
         for (Obj *o = globals; o; o = o->next) {
           if (!strcmp(o->name, rels[i])) { r->label = &o->name; break; }
         }
@@ -1802,6 +1936,7 @@ static Token *parse_gvar_initializer(Token *tok, Obj *var) {
         m = target;
       }
       if (!m) error_tok(tok, "excess elements in struct initializer");
+      concat_adjacent_strings(tok);
       if (m->ty->kind == TY_PTR && tok->kind == TK_STR) {
         Obj *anon = new_anon_gvar(tok->ty);
         anon->init_data = tok->str;
@@ -1819,8 +1954,11 @@ static Token *parse_gvar_initializer(Token *tok, Obj *var) {
         for (long i = 0; i < n && (m->offset + i) < sz; i++)
           buf[m->offset + i] = tok->str[i];
         tok = tok->next;
-      } else if (equal(tok, "{")) {
-        // Nested aggregate field — recurse.
+      } else if (equal(tok, "{") || m->ty->kind == TY_STRUCT ||
+                 m->ty->kind == TY_UNION || m->ty->kind == TY_ARRAY ||
+                 m->ty->kind == TY_PTR ||
+                 is_flonum(m->ty)) {
+        // Nested aggregate / pointer / float field — recurse.
         tok = gvar_subinit_recursive(tok, m->ty, buf, m->offset, sz, &rcur);
       } else {
         int64_t v = const_expr_val(&tok, tok);
@@ -1845,6 +1983,7 @@ static Token *parse_gvar_initializer(Token *tok, Obj *var) {
     tok = tok->next;
     Member *m = ty->members;
     if (!equal(tok, "}") && m) {
+      concat_adjacent_strings(tok);
       if (m->ty->kind == TY_PTR && tok->kind == TK_STR) {
         Obj *anon = new_anon_gvar(tok->ty);
         anon->init_data = tok->str;
@@ -1909,6 +2048,7 @@ static Token *parse_gvar_initializer(Token *tok, Obj *var) {
         if (equal(tok, "}")) break;
         if (!m) error_tok(tok, "excess elements in struct initializer");
         long base_off = count * elem_sz + m->offset;
+        concat_adjacent_strings(tok);
         if (m->ty->kind == TY_PTR && tok->kind == TK_STR) {
           // Anon gvar + relocation.
           Obj *anon = new_anon_gvar(tok->ty);
@@ -1919,6 +2059,15 @@ static Token *parse_gvar_initializer(Token *tok, Obj *var) {
           r->offset = (int)base_off;
           r->label = &anon->name;
           rcur = rcur->next = r;
+        } else if (equal(tok, "{") || m->ty->kind == TY_STRUCT ||
+                   m->ty->kind == TY_UNION || m->ty->kind == TY_ARRAY ||
+                   m->ty->kind == TY_PTR ||
+                   is_flonum(m->ty)) {
+          // Aggregate / pointer / float member -> route via the recursive
+          // helper (it handles relocations, flonum, char-array, nested
+          // braces, &gvar/&arr[N]/etc. via try_eval_addr_v2).
+          tok = gvar_subinit_recursive(tok, m->ty, buf, base_off,
+                                        alloc_sz, &rcur);
         } else {
           int64_t v = const_expr_val(&tok, tok);
           for (int b = 0; b < (int)m->ty->size; b++)
@@ -1950,13 +2099,20 @@ static Token *parse_gvar_initializer(Token *tok, Obj *var) {
     tok = tok->next;
     long elem_sz = var->ty->base->size;
     long count = 0;
-    int64_t vals[1024];
+    long cap = 1024;
+    int64_t *vals = calloc_checked(cap, sizeof(int64_t));
     bool first2 = true;
     while (!equal(tok, "}")) {
       if (!first2) tok = skip(tok, ",");
       first2 = false;
       if (equal(tok, "}")) break;
-      if (count >= 1024) error_tok(tok, "too many initializer elements (cap 1024)");
+      if (count >= cap) {
+        long new_cap = cap * 2;
+        int64_t *nvals = calloc_checked(new_cap, sizeof(int64_t));
+        for (long i = 0; i < cap; i++) nvals[i] = vals[i];
+        vals = nvals;
+        cap = new_cap;
+      }
       vals[count++] = const_expr_val(&tok, tok);
     }
     tok = skip(tok, "}");
@@ -2043,28 +2199,27 @@ static Token *parse_gvar_initializer(Token *tok, Obj *var) {
       Token *probe = tok;
       Node *e = assign(&probe, tok);
       add_type(e);
-      if (e->kind == ND_ADDR && e->lhs && e->lhs->kind == ND_VAR &&
-          e->lhs->var && !e->lhs->var->is_local) {
+      char *lbl = NULL;
+      int64_t addend = 0;
+      if (try_eval_addr_v2(e, &lbl, &addend)) {
         Relocation *r = calloc_checked(1, sizeof(Relocation));
         r->offset = 0;
-        r->label = &e->lhs->var->name;
-        r->addend = 0;
-        var->rel = r;
-        var->init_data = calloc_checked(1, var->ty->size);
-        var->init_data_size = var->ty->size;
-        return probe;
-      }
-      // ND_VAR of array decays to pointer: also a relocation.
-      if (e->kind == ND_VAR && e->var && !e->var->is_local &&
-          e->var->ty && e->var->ty->kind == TY_ARRAY) {
-        Relocation *r = calloc_checked(1, sizeof(Relocation));
-        r->offset = 0;
-        r->label = &e->var->name;
-        r->addend = 0;
-        var->rel = r;
-        var->init_data = calloc_checked(1, var->ty->size);
-        var->init_data_size = var->ty->size;
-        return probe;
+        // Find the gvar by name to alias its name pointer (the Relocation
+        // emitter dereferences `r->label`, so it must outlive this call).
+        for (Obj *o = globals; o; o = o->next) {
+          if (!strcmp(o->name, lbl)) { r->label = &o->name; break; }
+        }
+        if (!r->label) {
+          // Fall through to integer fold; the relocation target wasn't
+          // a known global (could be a forward decl that hasn't been
+          // declared yet — rare; const_expr_val will then error cleanly).
+        } else {
+          r->addend = addend;
+          var->rel = r;
+          var->init_data = calloc_checked(1, var->ty->size);
+          var->init_data_size = var->ty->size;
+          return probe;
+        }
       }
     }
     int64_t v = const_expr_val(&tok, tok);
@@ -2075,6 +2230,23 @@ static Token *parse_gvar_initializer(Token *tok, Obj *var) {
     var->init_data = buf;
     var->init_data_size = sz;
     return tok;
+  }
+  // Generic aggregate fallback — multi-dim arrays, deeply nested
+  // structs, anything not matched by the specialized arms above.
+  // Route through gvar_subinit_recursive.
+  if (equal(tok, "{") &&
+      (var->ty->kind == TY_ARRAY || var->ty->kind == TY_STRUCT ||
+       var->ty->kind == TY_UNION)) {
+    long sz = var->ty->size;
+    if (sz < 0) sz = 0;
+    char *buf = calloc_checked(1, sz > 0 ? sz : 1);
+    Relocation rh = {0};
+    Relocation *rcur = &rh;
+    Token *after = gvar_subinit_recursive(tok, var->ty, buf, 0, sz, &rcur);
+    var->init_data = buf;
+    var->init_data_size = sz;
+    var->rel = rh.next;
+    return after;
   }
   error_tok(eq, "parse_v2: this global initializer form not yet implemented");
 }
@@ -2619,6 +2791,7 @@ static Node *declaration(Token **rest, Token *tok, Type *basety, VarAttr *attr) 
       Token *eq = tok;
       tok = tok->next;
 
+      concat_adjacent_strings(tok);
       // String literal initializing a char array.  04d §F.
       if (tok->kind == TK_STR && ty->kind == TY_ARRAY &&
           ty->base->kind == TY_CHAR) {
@@ -3615,8 +3788,34 @@ static Node *primary(Token **rest, Token *tok) {
     return node;
   }
 
-  // String literal.
+  // String literal.  Adjacent string literals concatenate per C11
+  // 5.1.1.2 phase 6 (e.g. `"foo" "bar"` -> `"foobar"`); since the
+  // tokenizer keeps them as separate tokens, do the merge here.
+  // Mirrors canonical parse.c:3790.
   if (tok->kind == TK_STR) {
+    if (tok->next->kind == TK_STR) {
+      int total_len = 0;
+      for (Token *t = tok; t->kind == TK_STR; t = t->next)
+        total_len += t->ty->array_len - 1;  // -1 to drop NUL
+      total_len++;  // final NUL
+      char *buf = calloc_checked(1, total_len);
+      int offset = 0;
+      Token *first = tok;
+      for (; tok->kind == TK_STR; tok = tok->next) {
+        int len = tok->ty->array_len - 1;
+        memcpy(buf + offset, tok->str, len);
+        offset += len;
+      }
+      buf[offset] = '\0';
+      Type *cat_ty = array_of(ty_char, total_len);
+      Obj *var = new_anon_gvar(cat_ty);
+      var->init_data = buf;
+      var->init_data_size = cat_ty->size;
+      Node *node = new_var_node(var, first);
+      node->ty = cat_ty;
+      *rest = tok;
+      return node;
+    }
     Obj *var = new_anon_gvar(tok->ty);
     var->init_data = tok->str;
     var->init_data_size = tok->ty->size;
@@ -3753,6 +3952,21 @@ static Node *primary(Token **rest, Token *tok) {
       tok = skip(tok, ")");
       *rest = tok;
       return new_num(0, bi);
+    }
+
+    // __builtin_bswap16(x) — table can't represent its
+    // result-type/val convention (uses BSWAP32 with val=16 to flag
+    // 16-bit truncation in codegen).  Mirrors canonical parse.c:3437.
+    if (tok_name_eq(tok, "__builtin_bswap16")) {
+      Token *bi = tok;
+      tok = skip(tok->next, "(");
+      Node *arg = assign(&tok, tok);
+      tok = skip(tok, ")");
+      *rest = tok;
+      Node *node = new_unary(ND_BUILTIN_BSWAP32, arg, bi);
+      node->ty = ty_ushort;
+      node->val = 16;
+      return node;
     }
 
     // Bit-manipulation builtins (table at file scope).  Each is a
@@ -4225,6 +4439,7 @@ static Token *gvar_subinit_recursive(Token *tok, Type *ty, char *buf,
     return tok->next->next;
   }
 
+  concat_adjacent_strings(tok);
   if (tok->kind == TK_STR && ty->kind == TY_ARRAY &&
       ty->base->kind == TY_CHAR) {
     long s = tok->ty->array_len;
@@ -4328,23 +4543,21 @@ static Token *gvar_subinit_recursive(Token *tok, Type *ty, char *buf,
     Token *probe = tok;
     Node *e = assign(&probe, tok);
     add_type(e);
-    if (e->kind == ND_ADDR && e->lhs && e->lhs->kind == ND_VAR &&
-        e->lhs->var && !e->lhs->var->is_local) {
+    char *lbl = NULL;
+    int64_t addend = 0;
+    if (try_eval_addr_v2(e, &lbl, &addend)) {
       Relocation *r = calloc_checked(1, sizeof(Relocation));
       r->offset = (int)base_off;
-      r->label = &e->lhs->var->name;
-      r->addend = 0;
-      *rh_tail = (*rh_tail)->next = r;
-      return probe;
-    }
-    if (e->kind == ND_VAR && e->var && !e->var->is_local && e->var->ty &&
-        (e->var->ty->kind == TY_ARRAY || e->var->ty->kind == TY_FUNC)) {
-      Relocation *r = calloc_checked(1, sizeof(Relocation));
-      r->offset = (int)base_off;
-      r->label = &e->var->name;
-      r->addend = 0;
-      *rh_tail = (*rh_tail)->next = r;
-      return probe;
+      r->addend = addend;
+      // Resolve to the gvar's name pointer so the relocation lives.
+      for (Obj *o = globals; o; o = o->next) {
+        if (!strcmp(o->name, lbl)) { r->label = &o->name; break; }
+      }
+      if (r->label) {
+        *rh_tail = (*rh_tail)->next = r;
+        return probe;
+      }
+      // Couldn't resolve the label (forward decl etc.) — fall through.
     }
     int64_t v = const_expr_val(&tok, tok);
     long sz = ty->size;
@@ -4399,6 +4612,7 @@ static Node *lvar_init_at_offset(Token **rest, Token *tok, Type *ty,
     return chain;
   }
 
+  concat_adjacent_strings(tok);
   // String literal → char-array byte-by-byte init.
   if (tok->kind == TK_STR && ty->kind == TY_ARRAY &&
       ty->base->kind == TY_CHAR) {
