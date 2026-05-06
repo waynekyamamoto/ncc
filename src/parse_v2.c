@@ -3942,12 +3942,43 @@ static Node *primary(Token **rest, Token *tok) {
     VarScope *vs = find_var(tok);
     if (!vs || (!vs->var && !vs->enum_ty)) {
       // Implicit-function declaration (04b §H.5): if next is `(`,
-      // synthesize a variadic int-returning function so the funcall
-      // path in postfix can take it.
+      // synthesize an int-returning function.  Only mark variadic for
+      // the known printf-family names — Apple ARM64's variadic ABI
+      // forces stack passing, which breaks regular ABI calls to
+      // memcpy/memset/etc. otherwise (mirrors canonical parse.c §5.10
+      // implicit-decl branch).
       if (equal(tok->next, "(")) {
         char *name = strndup_checked(tok->loc, tok->len);
+        bool known_variadic = !strcmp(name, "printf") ||
+                              !strcmp(name, "fprintf") ||
+                              !strcmp(name, "sprintf") ||
+                              !strcmp(name, "snprintf") ||
+                              !strcmp(name, "scanf") ||
+                              !strcmp(name, "sscanf");
         Type *fn_ty = func_type(ty_int);
-        fn_ty->is_variadic = true;
+        if (known_variadic) {
+          fn_ty->is_variadic = true;
+          // Synthesize one named (char *) param so the variadic
+          // ABI counts the format-string slot correctly.
+          bool two_named = !strcmp(name, "fprintf") ||
+                           !strcmp(name, "sprintf") ||
+                           !strcmp(name, "sscanf");
+          bool three_named = !strcmp(name, "snprintf");
+          Type *p1 = copy_type(pointer_to(ty_char));
+          p1->next = NULL;
+          fn_ty->params = p1;
+          if (two_named) {
+            Type *p2 = copy_type(pointer_to(ty_char));
+            p2->next = NULL;
+            p1->next = p2;
+          } else if (three_named) {
+            Type *p2 = copy_type(pointer_to(ty_char));
+            Type *p3 = copy_type(pointer_to(ty_char));
+            p2->next = p3;
+            p3->next = NULL;
+            p1->next = p2;
+          }
+        }
         Obj *fn = new_gvar(name, fn_ty);
         fn->is_function = true;
         fn->is_definition = false;
