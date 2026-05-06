@@ -4252,6 +4252,19 @@ bool try_eval_node(Node *node, int64_t *out) {
     if (!try_eval_node(node->lhs, &lv)) return false;
     *out = ~lv; return true;
   case ND_CAST: {
+    // If the source is float-typed, fold the float and truncate to int.
+    if (node->lhs && node->lhs->ty && is_flonum(node->lhs->ty) &&
+        is_integer(node->ty)) {
+      double dv;
+      if (!try_eval_double_v2(node->lhs, &dv)) return false;
+      int64_t iv = (int64_t)dv;
+      switch (node->ty->size) {
+      case 1: *out = node->ty->is_unsigned ? (uint8_t)iv  : (int8_t)iv;  return true;
+      case 2: *out = node->ty->is_unsigned ? (uint16_t)iv : (int16_t)iv; return true;
+      case 4: *out = node->ty->is_unsigned ? (uint32_t)iv : (int32_t)iv; return true;
+      default: *out = iv; return true;
+      }
+    }
     if (!try_eval_node(node->lhs, &lv)) return false;
     if (!node->ty) { *out = lv; return true; }
     if (is_integer(node->ty)) {
