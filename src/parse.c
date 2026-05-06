@@ -75,6 +75,7 @@ typedef struct {
   int align;
   int mode_kind;     // 0 / 1 / 2 / 4 / 8 — set by __attribute__((mode(X)))
   int vector_size;   // bytes — set by __attribute__((vector_size(N)))
+  char *alias_target; // set by __attribute__((alias("name")))
 } VarAttr;
 
 //
@@ -1234,14 +1235,11 @@ static Token *attribute_list(Token *tok, Type *ty, VarAttr *attr) {
         if (attr) attr->mode_kind = kind;
       } else if (tok_name_eq(name_tok, "alias") || tok_name_eq(name_tok, "__alias__")) {
         if (has_args) {
-          // brace-balanced skip; honoring would set attr->alias_target,
-          // but the field doesn't live on VarAttr currently.  Recorded
-          // as parsed-and-ignored for now.
-          tok = tok->next;
-          int depth = 1;
-          while (depth > 0 && tok->kind != TK_EOF) {
-            if (equal(tok, "(")) depth++;
-            else if (equal(tok, ")")) { depth--; if (depth == 0) break; }
+          tok = skip(tok, "(");
+          if (tok->kind == TK_STR) {
+            // Strip the trailing NUL from the string literal.
+            char *target = strndup_checked(tok->str, tok->ty->array_len - 1);
+            if (attr) attr->alias_target = target;
             tok = tok->next;
           }
           tok = skip(tok, ")");
@@ -2306,6 +2304,15 @@ static Token *global_variable(Token *tok, Type *basety, Type *first_ty,
     tok = skip_asm_label(tok);
     if (equal(tok, "__attribute__"))
       tok = attribute_list(tok->next, var->ty, attr);
+
+    if (attr->alias_target) {
+      // GCC alias attribute: `b` shares storage with `target`.  The
+      // gvar emits as a Mach-O `.set _b, _<target>` directive in
+      // codegen — the var has no init data of its own and isn't a
+      // separate definition.
+      var->alias_target = attr->alias_target;
+      var->is_definition = true;
+    }
 
     if (equal(tok, "=")) {
       tok = parse_gvar_initializer(tok, var);
