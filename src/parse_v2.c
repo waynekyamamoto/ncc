@@ -3080,13 +3080,11 @@ static Node *to_assign(Node *binary) {
   Node *deref_l = new_unary(ND_DEREF, tmp_ref2, tok);
   Node *tmp_ref3 = new_var_node(tmp, tok);
   Node *deref_r = new_unary(ND_DEREF, tmp_ref3, tok);
-  Node *op_node;
-  if (binary->kind == ND_ADD)
-    op_node = new_add(deref_r, binary->rhs, tok);
-  else if (binary->kind == ND_SUB)
-    op_node = new_sub(deref_r, binary->rhs, tok);
-  else
-    op_node = new_binary(binary->kind, deref_r, binary->rhs, tok);
+  // binary->rhs is already scaled for pointer arithmetic (caller used
+  // new_add/new_sub before to_assign), so don't re-route through
+  // new_add/new_sub here — that would double-scale.  Mirrors canonical
+  // parse.c §4.5 to_assign (line 2294).
+  Node *op_node = new_binary(binary->kind, deref_r, binary->rhs, tok);
   Node *expr2 = new_binary(ND_ASSIGN, deref_l, op_node, tok);
 
   return new_binary(ND_COMMA, expr1, expr2, tok);
