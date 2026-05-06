@@ -1304,12 +1304,23 @@ static Token *function(Token *tok, Type *basety, Type *ty, VarAttr *attr) {
   // global by name lookup so codegen sees a single Obj.  Simplified
   // for now: always new_gvar, which will shadow any prior decl in
   // the symbol chain.  (Future: dedupe via push_scope's var lookup.)
+  // If a forward declaration of the same function already exists,
+  // pick up its align attribute so __alignof__ from this point on
+  // sees the declared alignment.  We don't otherwise dedupe Objs.
+  int prior_align = 0;
+  for (Obj *o = globals; o; o = o->next) {
+    if (o->is_function && !strcmp(o->name, name) && o->align > prior_align)
+      prior_align = o->align;
+  }
+
   Obj *fn = new_gvar(name, ty);
   fn->is_function = true;
   fn->is_definition = true;
   fn->is_static = attr->is_static;
   fn->is_inline = attr->is_inline;
   fn->is_variadic = ty->is_variadic;
+  if (attr->align) fn->align = attr->align;
+  if (prior_align > fn->align) fn->align = prior_align;
 
   // Save per-function state (§F.1 step 3).
   Obj  *saved_current_fn    = current_fn;
@@ -2396,10 +2407,12 @@ static Token *function_declaration(Token *tok, Type *basety, Type *first_ty,
     fn->is_definition = false;
     fn->is_static = attr->is_static;
     fn->is_inline = attr->is_inline;
+    if (attr->align) fn->align = attr->align;
 
     tok = skip_asm_label(tok);
     if (equal(tok, "__attribute__"))
       tok = attribute_list(tok->next, fn->ty, attr);
+    if (attr->align && fn->align < attr->align) fn->align = attr->align;
 
     if (equal(tok, ",")) { tok = tok->next; continue; }
     return skip(tok, ";");
