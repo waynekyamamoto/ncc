@@ -1726,12 +1726,35 @@ static bool try_eval_addr_v2(Node *e, char **out_label, int64_t *out_addend) {
       // &*x == x
       return try_eval_addr_v2(inner->lhs, out_label, out_addend);
     }
-    if (inner->kind == ND_MEMBER && inner->member &&
-        inner->lhs && inner->lhs->kind == ND_VAR && inner->lhs->var &&
-        !inner->lhs->var->is_local) {
-      *out_label = inner->lhs->var->name;
-      *out_addend = inner->member->offset;
-      return true;
+    // &<lvalue>.field / &<lvalue>->field — walk the ND_MEMBER chain
+    // (and any intermediate ND_DEREF), summing field offsets, and
+    // resolve the bottom either as a gvar (relocation) or via
+    // try_eval_addr_v2 (e.g. `&(arr + k)->field`).
+    if (inner->kind == ND_MEMBER) {
+      int64_t off = 0;
+      Node *p = inner;
+      while (p && p->kind == ND_MEMBER) {
+        if (!p->member) return false;
+        off += p->member->offset;
+        p = p->lhs;
+      }
+      // p is now the base of the chain — could be ND_VAR (struct
+      // gvar lvalue), ND_DEREF (struct via pointer), or other.
+      if (p && p->kind == ND_VAR && p->var && !p->var->is_local) {
+        *out_label = p->var->name;
+        *out_addend = off;
+        return true;
+      }
+      if (p && p->kind == ND_DEREF) {
+        char *lbl = NULL;
+        int64_t base_addend = 0;
+        if (try_eval_addr_v2(p->lhs, &lbl, &base_addend)) {
+          *out_label = lbl;
+          *out_addend = base_addend + off;
+          return true;
+        }
+      }
+      return false;
     }
     return false;
   }
