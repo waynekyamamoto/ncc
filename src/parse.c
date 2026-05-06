@@ -1363,8 +1363,12 @@ static Token *function(Token *tok, Type *basety, Type *ty, VarAttr *attr) {
 
   // §F.3 — K&R-style parameter declarations (between `)` and `{`).
   // For each declaration, look up the parameter name in fn->params
-  // and update its type / align.  Excess K&R declarators (no
-  // matching parameter) are an error per the spec.
+  // and update its type / align.  Also patch the matching slot in
+  // fn->ty->params so call sites see the K&R-declared type (without
+  // this patch, the call's arg is cast to whatever default-int type
+  // the identifier-list initially produced — typically `int`, which
+  // truncates `long long` args via `sxtw`).  Excess K&R declarators
+  // (no matching parameter) are an error per the spec.
   while (!equal(tok, "{")) {
     VarAttr kr_attr = {0};
     Type *kr_basety = declspec(&tok, tok, &kr_attr);
@@ -1375,10 +1379,11 @@ static Token *function(Token *tok, Type *basety, Type *ty, VarAttr *attr) {
       Type *kr_ty = declarator(&tok, tok, kr_basety);
       if (!kr_ty->name)
         error_tok(tok, "K&R declarator requires a name");
+      char *kr_name = strndup_checked(kr_ty->name->loc, kr_ty->name->len);
       // Look up matching param.
       bool found = false;
       for (Obj *p = fn->params; p; p = p->next) {
-        if (!strcmp(p->name, strndup_checked(kr_ty->name->loc, kr_ty->name->len))) {
+        if (!strcmp(p->name, kr_name)) {
           p->ty = kr_ty;
           if (kr_attr.align) p->align = kr_attr.align;
           found = true;
@@ -1387,6 +1392,24 @@ static Token *function(Token *tok, Type *basety, Type *ty, VarAttr *attr) {
       }
       if (!found)
         error_tok(kr_ty->name, "parameter name not in K&R parameter list");
+      // Mirror the type into fn->ty->params so call sites cast to
+      // the K&R-declared type (not the implicit-int identifier-list
+      // placeholder).  Match by position-or-name: the type chain is
+      // built in the same order as fn->params, but identifier-list
+      // entries may not have ->name set (depends on declarator
+      // path).  Walk both chains in parallel and match by name when
+      // available, else by position.
+      Obj *po = fn->params;
+      Type *pt = fn->ty->params;
+      for (; po && pt; po = po->next, pt = pt->next) {
+        if (!strcmp(po->name, kr_name)) {
+          // Splice kr_ty into the position (keep next-link).
+          Type *saved_next = pt->next;
+          *pt = *kr_ty;
+          pt->next = saved_next;
+          break;
+        }
+      }
     }
     tok = skip(tok, ";");
   }
