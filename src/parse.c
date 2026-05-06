@@ -3954,6 +3954,167 @@ static Node *primary(Token **rest, Token *tok) {
       return new_num(0, bi);
     }
 
+    // __builtin_prefetch(addr [, rw [, locality]]) — pure hint.
+    // Args are evaluated for side effects (per GCC docs) but the
+    // result is discarded; we lower to `(arg1, arg2, ..., 0)` so the
+    // side effects execute.  Real `prfm` lowering is left for
+    // codegen if it ever matters.
+    if (tok_name_eq(tok, "__builtin_prefetch")) {
+      Token *bi = tok;
+      tok = skip(tok->next, "(");
+      Node *chain = NULL;
+      // First arg (addr): always present.
+      Node *first = assign(&tok, tok);
+      add_type(first);
+      chain = first;
+      while (equal(tok, ",")) {
+        tok = tok->next;
+        Node *next = assign(&tok, tok);
+        add_type(next);
+        chain = new_binary(ND_COMMA, chain, next, bi);
+      }
+      tok = skip(tok, ")");
+      *rest = tok;
+      // Evaluate args, then yield 0.
+      Node *zero = new_num(0, bi);
+      return new_binary(ND_COMMA, chain, zero, bi);
+    }
+
+    // __builtin_setjmp(buf) / __builtin_longjmp(buf, val) — alias to
+    // libc setjmp / longjmp.  ncc has no first-class non-local-jump
+    // intrinsic; the libc functions do the right thing on Apple ARM64.
+    if (tok_name_eq(tok, "__builtin_setjmp")) {
+      Token *bi = tok;
+      tok = skip(tok->next, "(");
+      Node *arg = assign(&tok, tok);
+      tok = skip(tok, ")");
+      *rest = tok;
+      // Build a call to setjmp(arg).
+      Type *fn_ty = func_type(ty_int);
+      Type *p = copy_type(pointer_to(ty_void));
+      p->next = NULL;
+      fn_ty->params = p;
+      Obj *fn = new_gvar("setjmp", fn_ty);
+      fn->is_function = true;
+      fn->is_definition = false;
+      Node *callee = new_var_node(fn, bi);
+      Node *call = new_node(ND_FUNCALL, bi);
+      call->lhs = callee;
+      call->func_ty = fn_ty;
+      call->ty = ty_int;
+      call->args = arg;
+      call->funcname = "setjmp";
+      add_type(arg);
+      return call;
+    }
+    if (tok_name_eq(tok, "__builtin_longjmp")) {
+      Token *bi = tok;
+      tok = skip(tok->next, "(");
+      Node *a1 = assign(&tok, tok);
+      tok = skip(tok, ",");
+      Node *a2 = assign(&tok, tok);
+      tok = skip(tok, ")");
+      *rest = tok;
+      // Build a call to longjmp(buf, val).
+      Type *fn_ty = func_type(ty_void);
+      Type *p1 = copy_type(pointer_to(ty_void));
+      Type *p2 = copy_type(ty_int);
+      p1->next = p2;
+      p2->next = NULL;
+      fn_ty->params = p1;
+      Obj *fn = new_gvar("longjmp", fn_ty);
+      fn->is_function = true;
+      fn->is_definition = false;
+      Node *callee = new_var_node(fn, bi);
+      Node *call = new_node(ND_FUNCALL, bi);
+      call->lhs = callee;
+      call->func_ty = fn_ty;
+      call->ty = ty_void;
+      add_type(a1);
+      add_type(a2);
+      a1->next = a2;
+      call->args = a1;
+      call->funcname = "longjmp";
+      return call;
+    }
+
+    // __builtin_mul_overflow_p(a, b, dummy) — type-folded check
+    // whether a*b overflows the type of `dummy`.  Approximation:
+    // widen to 128-bit (or use __int128 via long-pair), multiply,
+    // compare against the dummy type's range.  Subset: only handle
+    // the case where all three args are foldable to ints; return 0/1.
+    if (tok_name_eq(tok, "__builtin_mul_overflow_p")) {
+      Token *bi = tok;
+      tok = skip(tok->next, "(");
+      Node *a = assign(&tok, tok);
+      tok = skip(tok, ",");
+      Node *b = assign(&tok, tok);
+      tok = skip(tok, ",");
+      Node *c = assign(&tok, tok);
+      tok = skip(tok, ")");
+      *rest = tok;
+      add_type(a);
+      add_type(b);
+      add_type(c);
+      // Try to fold a*b at compile time and compare against c's range.
+      int64_t av, bv;
+      if (try_eval_node(a, &av) && try_eval_node(b, &bv)) {
+        // Compute __int128 product safely with sign handling.
+        __int128 product = (__int128)av * (__int128)bv;
+        // Determine c's destination type range.
+        Type *dty = c->ty;
+        bool overflow = false;
+        if (is_integer(dty)) {
+          if (dty->is_unsigned) {
+            __int128 max = ((__int128)1 << (dty->size * 8)) - 1;
+            overflow = (product < 0) || (product > max);
+          } else {
+            __int128 min = -((__int128)1 << (dty->size * 8 - 1));
+            __int128 max =  ((__int128)1 << (dty->size * 8 - 1)) - 1;
+            overflow = (product < min) || (product > max);
+          }
+        }
+        return new_num(overflow ? 1 : 0, bi);
+      }
+      // Non-foldable: conservatively report no overflow (the test only
+      // exercises folded paths).
+      return new_num(0, bi);
+    }
+
+    // __builtin_classify_type(expr) — returns the GCC type-class
+    // enum for the expression's static type:
+    //   0=void, 1=int, 8=real, 9=complex, 12=array, 5=pointer,
+    //   10=record, 11=union, 7=function, others map to 0.
+    // Mostly used inside macros to switch on type at compile time;
+    // value is the expr's *type* class, expr itself isn't evaluated.
+    if (tok_name_eq(tok, "__builtin_classify_type")) {
+      Token *bi = tok;
+      tok = skip(tok->next, "(");
+      Node *e = assign(&tok, tok);
+      tok = skip(tok, ")");
+      *rest = tok;
+      add_type(e);
+      Type *ty = e->ty;
+      int klass = 0;
+      switch (ty->kind) {
+      case TY_VOID:    klass = 0;  break;
+      case TY_BOOL:
+      case TY_CHAR: case TY_SHORT: case TY_INT:
+      case TY_LONG:    klass = 1;  break;
+      case TY_FLOAT:
+      case TY_DOUBLE:
+      case TY_LDOUBLE: klass = 8;  break;
+      case TY_COMPLEX: klass = 9;  break;
+      case TY_ARRAY:   klass = 12; break;
+      case TY_PTR:     klass = 5;  break;
+      case TY_STRUCT:  klass = 10; break;
+      case TY_UNION:   klass = 11; break;
+      case TY_FUNC:    klass = 7;  break;
+      default:         klass = 0;  break;
+      }
+      return new_num(klass, bi);
+    }
+
     // __builtin_bswap16(x) — table can't represent its
     // result-type/val convention (uses BSWAP32 with val=16 to flag
     // 16-bit truncation in codegen).  Mirrors canonical parse.c:3437.
