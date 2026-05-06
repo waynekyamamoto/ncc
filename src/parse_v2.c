@@ -4251,6 +4251,54 @@ bool try_eval_node(Node *node, int64_t *out) {
   case ND_BITNOT:
     if (!try_eval_node(node->lhs, &lv)) return false;
     *out = ~lv; return true;
+  case ND_ADDR: {
+    // offsetof-style fold: &((T*)0)->m, &((T*)0)->m1.m2, etc.
+    // Walk the ND_MEMBER / ND_DEREF chain, accumulating member offsets.
+    // The pointer at the bottom (e.g. (T*)0) must fold to a plain int.
+    Node *inner = node->lhs;
+    int64_t off = 0;
+    while (inner) {
+      if (inner->kind == ND_MEMBER && inner->member) {
+        off += inner->member->offset;
+        inner = inner->lhs;
+        continue;
+      }
+      if (inner->kind == ND_DEREF) {
+        int64_t base;
+        if (!try_eval_node(inner->lhs, &base)) return false;
+        *out = base + off;
+        return true;
+      }
+      return false;
+    }
+    return false;
+  }
+  case ND_MEMBER: {
+    // Direct ND_MEMBER (no surrounding ND_ADDR): an integer-valued
+    // load through `((T*)0)->field` style — its value is whatever's at
+    // the (constant) address, which we can't load at compile time.
+    // The only foldable case is when the parent struct lvalue is
+    // itself constant — same chain logic, but yielding the *lvalue
+    // address* rather than load.  Reuse the ND_ADDR path's structure
+    // by treating ND_MEMBER as an address-yielding expression here.
+    int64_t off = node->member ? node->member->offset : 0;
+    Node *p = node->lhs;
+    while (p) {
+      if (p->kind == ND_MEMBER && p->member) {
+        off += p->member->offset;
+        p = p->lhs;
+        continue;
+      }
+      if (p->kind == ND_DEREF) {
+        int64_t base;
+        if (!try_eval_node(p->lhs, &base)) return false;
+        *out = base + off;
+        return true;
+      }
+      return false;
+    }
+    return false;
+  }
   case ND_CAST: {
     // If the source is float-typed, fold the float and truncate to int.
     if (node->lhs && node->lhs->ty && is_flonum(node->lhs->ty) &&
