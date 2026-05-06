@@ -4002,8 +4002,17 @@ static Node *primary(Token **rest, Token *tok) {
       return first;
     }
 
-    // __builtin_constant_p(expr) — folds to 1 if try_eval_node
-    // succeeds on the operand, else 0.  04b §M.2.
+    // __builtin_constant_p(expr) — folds to 1 if `expr` is a
+    // compile-time-known constant, else 0.  In addition to plain
+    // integer const-exprs, GCC's contract says string literals also
+    // qualify (they're statically allocated and addressable at fixed
+    // offsets).  Mirror that here:
+    //   - try_eval_node succeeds → 1
+    //   - operand is an ND_VAR pointing at an anon gvar with init
+    //     data (i.e. a string literal we collapsed) → 1
+    //   - operand is ND_ADD(string_literal, const) etc. — recurse
+    //     through the well-known patterns
+    //   - otherwise → 0
     if (tok_name_eq(tok, "__builtin_constant_p")) {
       Token *bi = tok;
       tok = skip(tok->next, "(");
@@ -4011,7 +4020,17 @@ static Node *primary(Token **rest, Token *tok) {
       add_type(e);
       tok = skip(tok, ")");
       int64_t v;
-      Node *node = new_num(try_eval_node(e, &v) ? 1 : 0, bi);
+      bool is_const = try_eval_node(e, &v);
+      // Walk through casts to find a string-literal anchor.
+      Node *probe = e;
+      while (probe && probe->kind == ND_CAST) probe = probe->lhs;
+      if (!is_const && probe && probe->kind == ND_VAR && probe->var &&
+          !probe->var->is_local && probe->var->init_data &&
+          probe->var->ty && probe->var->ty->kind == TY_ARRAY &&
+          probe->var->ty->base && probe->var->ty->base->kind == TY_CHAR) {
+        is_const = true;
+      }
+      Node *node = new_num(is_const ? 1 : 0, bi);
       *rest = tok;
       return node;
     }
@@ -4228,7 +4247,14 @@ static Node *primary(Token **rest, Token *tok) {
       tok = skip(tok, ")");
       *rest = tok;
       Node *node = new_unary(unary_builtin_table[i].kind, arg, bi);
-      node->ty = ty_int;
+      // bswap32/bswap64 return the unsigned variant of their width.
+      // Other entries (clz/ctz/ffs/popcount/parity/clrsb) return int.
+      if (unary_builtin_table[i].kind == ND_BUILTIN_BSWAP64)
+        node->ty = ty_ulong;
+      else if (unary_builtin_table[i].kind == ND_BUILTIN_BSWAP32)
+        node->ty = ty_uint;
+      else
+        node->ty = ty_int;
       node->val = unary_builtin_table[i].is64 ? 1 : 0;
       return node;
     }
