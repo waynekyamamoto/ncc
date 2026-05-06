@@ -73,7 +73,7 @@ options 	OPEN_MAX=1024
 makeoptions	DEBUG="-g"
 makeoptions	COPY_SYMTAB=1
 
-config		netbsd		root on ? type ?
+config		netbsd		root on ld0a type ffs
 
 # --- Devices: just what QEMU virt presents -----------------------------------
 

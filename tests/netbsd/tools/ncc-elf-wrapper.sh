@@ -64,6 +64,13 @@ case "$SRC" in
     # early-MMU mapping window.
     exec "$CROSS_GCC" "$@"
     ;;
+  */chacha_ref.c|\
+  */chacha_selftest.c)
+    # ncc miscompiles chacha_ref.c (likely bit-rotation issue), causing the
+    # chacha self-test to fail and flood the console with hexdumps for minutes.
+    # Route to gcc until the ncc bug is diagnosed and fixed.
+    exec "$CROSS_GCC" "$@"
+    ;;
 esac
 
 case "$SRC" in

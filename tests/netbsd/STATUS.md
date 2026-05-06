@@ -1,12 +1,50 @@
 # NetBSD/aarch64 ncc port — overnight status
 
-Last updated: 2026-05-05.
+Last updated: 2026-05-06.
 
-## Current state (2026-05-05 session)
+## Current state (2026-05-06 session)
+
+**MILESTONE: ncc-built MINIMAL_VIRT64 kernel boots NetBSD to a root shell on Linux/QEMU.**
+
+```
+netbsd-qemu# uname -a
+NetBSD netbsd-qemu 10.1 NetBSD 10.1 (MINIMAL_VIRT64) #10: Tue May  5 22:07:26 UTC 2026  root@9e07ec26dfe1:/home/yamamoto/netbsd/obj/sys/arch/evbarm/compile/MINIMAL_VIRT64 evbarm
+netbsd-qemu# id
+uid=0(root) gid=0(wheel) groups=0(wheel),2(kmem),3(sys),4(tty),5(operator),20(staff),31(guest),34(nvmm)
+```
+
+Boot command:
+```bash
+qemu-system-aarch64 -M virt,gic-version=3 -cpu cortex-a72 -m 512 -smp 4 -nographic \
+  -kernel /home/yamamoto/netbsd/obj/sys/arch/evbarm/compile/MINIMAL_VIRT64/netbsd.img \
+  -drive file=/home/yamamoto/netbsd/netbsd-root.img,if=none,id=hd0,format=raw \
+  -device virtio-blk-device,drive=hd0
+```
+
+Disk image: `/home/yamamoto/netbsd/netbsd-root.img` — 512MB FFS, NetBSD 10.1 evbarm-aarch64 base+etc sets.
+Created with:
+```bash
+sudo tar -xJf base.tar.xz -C rootfs-staging/  # must extract as root (PAM requires root-owned /etc/pam.d/)
+sudo tar -xJf etc.tar.xz  -C rootfs-staging/
+# add rootfs-staging/etc/rc.conf (rc_configured=YES, postfix=NO, etc.)
+# add rootfs-staging/etc/fstab (/dev/ld0a / ffs rw,noatime 1 1)
+sudo nbmakefs -t ffs -s 512m -o version=2 netbsd-root.img rootfs-staging/
+sudo chmod 666 netbsd-root.img
+```
+
+### Session 6 findings (Linux port, 2026-05-06)
+
+- **chacha_ref.c miscompile**: ncc generates wrong code for chacha reference impl (likely a bit-rotation/XOR issue). Self-test floods console with hexdumps for minutes. Workaround: route `chacha_ref.c` and `chacha_selftest.c` through `aarch64--netbsd-gcc` via `ncc-elf-wrapper.sh`. NEON test still fails (expected, +nofp+nosimd).
+- **virtio-blk must use `-device virtio-blk-device`**: `-drive if=virtio` routes through virtio-pci which isn't in the kernel. Use `-drive if=none,id=hd0 -device virtio-blk-device,drive=hd0` to force MMIO.
+- **nbmakefs must run as root**: PAM (`login`) checks that `/etc/pam.d/login` is owned by root. `nbmakefs` run as non-root creates files owned by the current user → `pam_start failed`. Fix: `sudo tar` + `sudo nbmakefs`.
+- **mountall/swap2 failures**: Non-fatal. FFS image has no disklabel (no partition b for swap). `mountall` attempts rw remount which may fail if superblock isn't pristine. System reaches multiuser despite these warnings.
+- **postfix failure**: Non-fatal. Postfix checks ownership/setgid on its binaries; fails with extracted base set. Disabled via `rc.conf postfix=NO`.
+
+## Previous state (2026-05-05 session)
 
 **MILESTONE: ncc-built MINIMAL_VIRT64 kernel boots to `root device:` on Linux/QEMU. 6/6 boot checks pass.**
 
-Boot command (Linux):
+Boot command (Linux, no disk):
 ```bash
 qemu-system-aarch64 -M virt,gic-version=3 -cpu cortex-a72 -m 512 -smp 4 -nographic \
   -kernel /home/yamamoto/netbsd/obj/sys/arch/evbarm/compile/MINIMAL_VIRT64/netbsd.img
