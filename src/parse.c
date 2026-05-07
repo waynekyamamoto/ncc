@@ -3644,8 +3644,18 @@ static Node *init_compound_literal(Token **rest, Token *tok, Obj *var) {
       if (!first) tok = skip(tok, ",");
       first = false;
       if (equal(tok, "}")) break;
-      if (equal(tok, "{"))
-        error_tok(tok, "parse_v2: nested brace init in compound literal not supported");
+      // Nested brace / aggregate element — route through the
+      // recursive lvar helper.
+      if (equal(tok, "{") || ty->base->kind == TY_STRUCT ||
+          ty->base->kind == TY_UNION || ty->base->kind == TY_ARRAY) {
+        chain = lvar_init_at_offset(&tok, tok, ty->base, var,
+                                     i * ty->base->size, chain, open);
+        i++;
+        if (cap >= 0 && i >= cap) {
+          while (!equal(tok, "}") && !equal(tok, ",")) tok = tok->next;
+        }
+        continue;
+      }
       Node *e = assign(&tok, tok);
       add_type(e);
       Node *vref = new_var_node(var, open);
@@ -3686,8 +3696,16 @@ static Node *init_compound_literal(Token **rest, Token *tok, Obj *var) {
       }
       if (!m)
         error_tok(tok, "excess elements in struct compound literal");
-      if (equal(tok, "{"))
-        error_tok(tok, "parse_v2: nested brace init in compound literal not supported");
+      // Nested brace / aggregate / float member — route through the
+      // recursive lvar helper, which writes through `*(ty *)(&var +
+      // offset)` and handles arbitrary nesting.
+      if (equal(tok, "{") || m->ty->kind == TY_STRUCT ||
+          m->ty->kind == TY_UNION || m->ty->kind == TY_ARRAY) {
+        chain = lvar_init_at_offset(&tok, tok, m->ty, var,
+                                     m->offset, chain, open);
+        m = m->next;
+        continue;
+      }
       Node *e = assign(&tok, tok);
       Node *vref = new_var_node(var, open);
       Node *mn = new_unary(ND_MEMBER, vref, open);
@@ -3696,6 +3714,28 @@ static Node *init_compound_literal(Token **rest, Token *tok, Obj *var) {
       chain = new_binary(ND_COMMA, chain, as, open);
       m = m->next;
     }
+    tok = skip(tok, "}");
+  } else if (ty->kind == TY_UNION) {
+    // Compound literal of union type — designator or first member.
+    Member *m = ty->members;
+    if (equal(tok, ".")) {
+      tok = tok->next;
+      if (tok->kind != TK_IDENT)
+        error_tok(tok, "expected member name");
+      Member *target = find_member(ty, tok);
+      if (!target) error_tok(tok, "no such member");
+      tok = skip(tok->next, "=");
+      m = target;
+    } else if (tok->kind == TK_IDENT && equal(tok->next, ":")) {
+      Member *target = find_member(ty, tok);
+      if (!target) error_tok(tok, "no such member");
+      tok = skip(tok->next, ":");
+      m = target;
+    }
+    if (m && !equal(tok, "}")) {
+      chain = lvar_init_at_offset(&tok, tok, m->ty, var, m->offset, chain, open);
+    }
+    if (equal(tok, ",")) tok = tok->next;
     tok = skip(tok, "}");
   } else {
     // Scalar T x = {expr};
