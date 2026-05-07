@@ -1983,10 +1983,39 @@ static Token *parse_gvar_initializer(Token *tok, Obj *var) {
       first = false;
       if (equal(tok, "}")) break;
       if (equal(tok, ".")) {
+        // Chained designator: `.name1.name2.name3 = ...`.  Walk the
+        // chain, accumulating offsets, and dispatch the value via
+        // the recursive helper at the cumulative offset / leaf type.
+        // Single-hop case still routes through the simple m=target
+        // path below for back-compat with the existing element loop.
+        Token *probe = tok;
+        long chain_off = 0;
+        Type *chain_ty = ty;
+        Member *chain_target = NULL;
+        bool chained = false;
+        for (;;) {
+          probe = probe->next;
+          if (probe->kind != TK_IDENT) error_tok(probe, "expected member name");
+          chain_target = find_member(chain_ty, probe);
+          if (!chain_target) error_tok(probe, "no such member");
+          chain_off += chain_target->offset;
+          chain_ty = chain_target->ty;
+          probe = probe->next;
+          if (!equal(probe, ".")) break;
+          chained = true;
+        }
+        if (chained) {
+          // Multi-hop: dispatch the value via the recursive helper at
+          // the cumulative offset.  Set m = NULL to require a
+          // designator on the next element (no implicit advance).
+          tok = skip(probe, "=");
+          tok = gvar_subinit_recursive(tok, chain_ty, buf, chain_off, sz, &rcur);
+          m = NULL;
+          continue;
+        }
+        // Single-hop: keep the original semantics.
         tok = tok->next;
-        if (tok->kind != TK_IDENT) error_tok(tok, "expected member name");
         Member *target = find_member(ty, tok);
-        if (!target) error_tok(tok, "no such member");
         tok = skip(tok->next, "=");
         m = target;
       } else if (tok->kind == TK_IDENT && equal(tok->next, ":")) {
@@ -3034,12 +3063,37 @@ static Node *declaration(Token **rest, Token *tok, Type *basety, VarAttr *attr) 
             first2 = false;
             if (equal(tok, "}")) break;
             if (equal(tok, ".")) {
+              // Walk the `.name1.name2[.name3...]` chain.  Single-hop
+              // case keeps the original m=target shape; multi-hop
+              // dispatches the value at the cumulative offset via
+              // lvar_init_at_offset.
+              Token *probe = tok;
+              long chain_off = 0;
+              Type *chain_ty = ty;
+              Member *chain_target = NULL;
+              bool chained = false;
+              for (;;) {
+                probe = probe->next;
+                if (probe->kind != TK_IDENT)
+                  error_tok(probe, "expected member name after `.`");
+                chain_target = find_member(chain_ty, probe);
+                if (!chain_target) error_tok(probe, "no such member");
+                chain_off += chain_target->offset;
+                chain_ty = chain_target->ty;
+                probe = probe->next;
+                if (!equal(probe, ".")) break;
+                chained = true;
+              }
+              if (chained) {
+                tok = skip(probe, "=");
+                chain = lvar_init_at_offset(&tok, tok, chain_ty, var,
+                                             chain_off, chain, eq);
+                m = NULL;
+                continue;
+              }
               tok = tok->next;
-              if (tok->kind != TK_IDENT)
-                error_tok(tok, "expected member name after `.`");
               Member *target = find_member(ty, tok);
-              if (!target)
-                error_tok(tok, "no such member");
+              if (!target) error_tok(tok, "no such member");
               tok = skip(tok->next, "=");
               m = target;
             } else if (tok->kind == TK_IDENT && equal(tok->next, ":")) {
