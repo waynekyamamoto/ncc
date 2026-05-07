@@ -51,16 +51,18 @@ check() {
     fi
 }
 
-check "NetBSD/evbarm"          "kernel banner"
-check "Cortex-A72"             "cpu probe"
-check "GICv3"                  "interrupt controller"
-check "plcom0: console"        "PL011 UART"
-check "virtio"                 "virtio bus enumeration"
-check "root device:"           "root prompt reached"
+check "NetBSD/evbarm"               "kernel banner"
+check "Cortex-A72"                  "cpu probe"
+check "GICv3"                       "interrupt controller"
+check "plcom0: console"             "PL011 UART"
+check "virtio"                      "virtio bus enumeration"
+# Either signal is sufficient — "root device:" appears with `root on ?` configs;
+# "device ld0 .* not configured" appears with hardcoded `root on ld0a` configs
+# when no disk is attached. Both prove the kernel reached storage probe alive.
+check "root device:\|device ld0.*not configured" "storage probe reached"
 
 echo
 echo "=== summary: $PASS pass, $FAIL fail ==="
 
-# Boot is "successful enough" if we reach the root device prompt.
-grep -q "root device:" "$LOG" && exit 0
+grep -qE "root device:|device ld0.*not configured" "$LOG" && exit 0
 exit 1

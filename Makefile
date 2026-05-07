@@ -36,4 +36,33 @@ test: ncc
 	./ncc -o /tmp/test_hello /tmp/test_hello.c
 	/tmp/test_hello
 
-.PHONY: clean test
+# --------------------------------------------------------------------------
+# NetBSD/aarch64 kernel build with ncc.
+# See tests/netbsd/README.md for a quickstart.
+#
+# Two-step flow (same on Linux and macOS):
+#   make netbsd-tools   # one-time, ~30 min — builds the gcc cross-toolchain
+#   make netbsd         # builds the kernel with ncc (most kernel C files)
+#
+# Override defaults via env:
+#   NETBSD_DIR=/path/to/netbsd        (default ~/netbsd)
+#   NETBSD_KERNEL=GENERIC64           (default MINIMAL_VIRT64)
+# --------------------------------------------------------------------------
+
+NETBSD_DIR    ?= $(HOME)/netbsd
+NETBSD_KERNEL ?= MINIMAL_VIRT64
+
+netbsd-tools:
+	@NETBSD_DIR=$(NETBSD_DIR) bash tests/netbsd/tools/build-tools.sh
+
+netbsd:
+	@NETBSD_DIR=$(NETBSD_DIR) bash tests/netbsd/build.sh $(NETBSD_KERNEL)
+
+netbsd-boot:
+	@bash tests/netbsd/tools/boot-test.sh \
+	  $(NETBSD_DIR)/obj/sys/arch/evbarm/compile/$(NETBSD_KERNEL)/netbsd.img
+
+netbsd-clean:
+	rm -rf $(NETBSD_DIR)/obj/sys/arch/evbarm/compile/$(NETBSD_KERNEL)
+
+.PHONY: clean test netbsd netbsd-tools netbsd-boot netbsd-clean

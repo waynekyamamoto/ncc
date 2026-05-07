@@ -1,109 +1,132 @@
-# tests/netbsd — NetBSD/aarch64 build with ncc
+# tests/netbsd — NetBSD/aarch64 kernel built with ncc
 
-Build NetBSD-10 kernel for `evbarm64` with [ncc](../../) instead of gcc,
-and boot-test it under QEMU.
+Build the NetBSD-10 `evbarm64` kernel with [ncc](../../) for most kernel C
+files, and boot it under QEMU. Same flow on Linux and macOS.
 
-Same shape as `tests/sqlite/`, `tests/cpython/`, `tests/doom/`: this
-directory holds OUR build glue, configs, and stubs. The NetBSD kernel
-source itself lives outside the repo (it's 3.6 GB and not ours).
+## Prereqs
 
-## Status
+**Linux:**
+```bash
+sudo apt install build-essential bison flex byacc zlib1g-dev \
+                 ca-certificates git curl qemu-system-arm
+```
 
-The ncc-built `MINIMAL_VIRT64` kernel **boots to the `root device:`
-prompt** under QEMU virt — Phase 1 milestone reached on 2026-04-30.
-See [`STATUS.md`](STATUS.md) for the full build-iteration log + known
-issues, and [`reference-boot.log`](reference-boot.log) for the actual
-boot output that anchors the milestone.
+**macOS:** Xcode Command Line Tools (`xcode-select --install`),
+[Docker Desktop](https://www.docker.com/products/docker-desktop) running,
+and QEMU (`brew install qemu`). Docker is used internally so the cross-
+toolchain ends up as Linux ELF and matches the kernel-build container.
+
+## Quickstart — kernel only
+
+```bash
+# 0. NetBSD source (one time per machine):
+git clone --branch netbsd-10 https://github.com/NetBSD/src.git ~/netbsd/src
+
+# 1. Build ncc itself (one time per checkout):
+make
+scripts/bootstrap_validate.sh        # produces ./ncc2
+
+# 2. Build the cross-toolchain (one time per machine, ~30 min, gcc-built):
+make netbsd-tools
+
+# 3. Build the kernel with ncc (every iteration, ~5–10 min):
+make netbsd
+
+# 4. Smoke-test the boot (no disk):
+make netbsd-boot
+```
+
+Output: `~/netbsd/obj/sys/arch/evbarm/compile/MINIMAL_VIRT64/netbsd.img`.
+
+Overrides: `NETBSD_DIR=/path/to/netbsd`, `NETBSD_KERNEL=GENERIC64`.
+
+## Boot to a login prompt
+
+`make netbsd-boot` only proves the kernel runs to storage probe. To get a
+real shell you need a root disk image. Build a minimal one once:
+
+```bash
+cd ~/netbsd
+
+# Download the NetBSD 10.1 binary sets:
+curl -O https://cdn.netbsd.org/pub/NetBSD/NetBSD-10.1/evbarm-aarch64/binary/sets/base.tar.xz
+curl -O https://cdn.netbsd.org/pub/NetBSD/NetBSD-10.1/evbarm-aarch64/binary/sets/etc.tar.xz
+
+# Extract as root (PAM checks /etc/pam.d/login is root-owned):
+sudo rm -rf rootfs-staging && sudo mkdir rootfs-staging
+sudo tar -xpJf base.tar.xz -C rootfs-staging/
+sudo tar -xpJf etc.tar.xz  -C rootfs-staging/
+
+# Minimal rc.conf + fstab:
+echo 'rc_configured=YES'              | sudo tee -a rootfs-staging/etc/rc.conf
+echo 'postfix=NO'                     | sudo tee -a rootfs-staging/etc/rc.conf
+echo '/dev/ld0a / ffs rw,noatime 1 1' | sudo tee    rootfs-staging/etc/fstab
+
+# Pack into an FFS image (nbmakefs must run as root to preserve ownership):
+sudo ~/netbsd/tooldir/bin/nbmakefs -t ffs -s 512m -o version=2 \
+  ~/netbsd/netbsd-root.img rootfs-staging/
+sudo chmod 666 ~/netbsd/netbsd-root.img
+```
+
+Then boot:
+
+```bash
+qemu-system-aarch64 -M virt,gic-version=3 -cpu cortex-a72 -m 512 -smp 4 -nographic \
+  -kernel ~/netbsd/obj/sys/arch/evbarm/compile/MINIMAL_VIRT64/netbsd.img \
+  -drive file=$HOME/netbsd/netbsd-root.img,if=none,id=hd0,format=raw \
+  -device virtio-blk-device,drive=hd0
+```
+
+Login: `root`, no password. Exit QEMU: `Ctrl-A x`.
+
+A fancier alternative — 4 GB image with a user account, static networking,
+and pkgsrc tools (git/curl/openssl) pre-baked — lives in `build-rootfs.sh`.
+Use it if you need network or packages inside the VM.
+
+## What gets built by what
+
+ncc only compiles the kernel's C. Everything else is gcc:
+
+| Layer | Built by |
+|---|---|
+| Cross-toolchain (`aarch64--netbsd-gcc`, `nbmake-evbarm`, `nbmakefs`, `dbsym`) | host gcc, via NetBSD's `build.sh tools` |
+| Kernel C — most files | **ncc** (`-target elf`) |
+| Kernel `.S` files + link step + 4 specific C files | cross-gcc |
+| Userland (`/bin`, `/sbin`, libc, …) | NetBSD release engineers' gcc — extracted from `base.tar.xz` |
+
+The four C files still routed to gcc, tracked in `tools/ncc-elf-wrapper.sh`:
+
+| File | Why |
+|---|---|
+| `crypto/chacha/chacha_{ref,impl,selftest}.c` | ncc miscompile — bit-rotation / XOR codegen bug |
+| `kern/kern_ksyms_buf.c` | ncc OOMs on the giant `db_symtab[]` initializer |
+| `crypto/chacha/arch/arm/{chacha_neon,aes_neon,aes_neon_subr}.c` | NEON intrinsics — gcc/clang extension, not ISO C |
+
+The first two are open ncc bugs. The NEON files stay shunted unless ncc
+grows ARM SIMD intrinsic support.
+
+## Single-file compile (debugging)
+
+```bash
+NCC=$(pwd)/ncc2 \
+NETBSD_SRC=$HOME/netbsd/src \
+BUILD_DIR=$HOME/netbsd/obj/sys/arch/evbarm/compile/MINIMAL_VIRT64 \
+bash tests/netbsd/tools/ncc-kern.sh -c $HOME/netbsd/src/sys/kern/foo.c -o /tmp/foo.o
+```
 
 ## Layout
 
-```
-tests/netbsd/
-├── build.sh              # entry point — build [+ optional boot-test]
-├── README.md             # this file
-├── STATUS.md             # running progress log (build attempts, fixes, gaps)
-├── reference-boot.log    # successful boot output to root device: prompt
-├── Dockerfile            # ubuntu:22.04 + build-essential + zlib (NetBSD tools)
-├── MINIMAL_VIRT64        # diagnostic kernel config that boots
-├── tools/
-│   ├── docker-kernel-build.sh   # runs nbmake-evbarm64 inside Docker
-│   ├── ncc-elf-wrapper.sh       # CC wrapper: -target elf, stub substitution
-│   ├── gcc-elf-wrapper.sh       # gcc reference wrapper (parallel structure)
-│   ├── ncc-kern.sh              # single-file kernel compile (for debugging)
-│   └── boot-test.sh             # QEMU boot, grep for milestone banners
-└── stubs/
-    ├── cfattach_stubs.c  # SoC drivers excluded from QEMU virt
-    ├── neon_stub.c       # NEON crypto exports (ncc has no NEON intrinsics)
-    └── empty_stub.c      # generic empty .o
-```
-
-The NetBSD source/build tree lives at `~/netbsd/{src,obj,tooldir}` (or
-wherever `$NETBSD_DIR` points). It's a separate checkout of
-[NetBSD/src](https://github.com/NetBSD/src) — too big to commit in this
-repo, kept outside per the same pattern as `tests/cpython/` (which
-references `/tmp/Python-3.12.3`).
-
-The `xv6` name in some scripts (e.g. `XV6_DIR`, `/xv6`) is a legacy
-artifact — that path inside Docker bind-mounts the ncc repo, not xv6.
-
-## Quick start
-
-Assuming `~/netbsd/src/`, `~/netbsd/obj/`, and `~/netbsd/tooldir/`
-already exist (NetBSD source cloned and `build.sh tools` run once):
-
-```bash
-# Build MINIMAL_VIRT64 + boot-test it
-./build.sh MINIMAL_VIRT64 boot
-
-# Or the full GENERIC64 (does not boot today; here for reference)
-./build.sh GENERIC64
-```
-
-`build.sh` auto-detects the ncc repo location, syncs the kernel config
-from this directory into the NetBSD source tree's `conf/` dir, builds
-the Docker image on first use, and runs the build.
-
-## Initial NetBSD setup (one-time)
-
-If you don't have a NetBSD source/build tree yet:
-
-```bash
-mkdir -p ~/netbsd && cd ~/netbsd
-git clone --branch netbsd-10 https://github.com/NetBSD/src.git
-cd src
-./build.sh -j$(sysctl -n hw.ncpu) -O ../obj -T ../tooldir tools
-```
-
-(Builds the cross-toolchain — takes ~30 minutes.)
-
-## Single-file compile (for debugging)
-
-```bash
-NCC=/path/to/ncc \
-NETBSD_SRC=$HOME/netbsd/src \
-BUILD_DIR=$HOME/netbsd/obj/sys/arch/evbarm/compile/MINIMAL_VIRT64 \
-bash tools/ncc-kern.sh -c $HOME/netbsd/src/sys/kern/some_file.c -o /tmp/some_file.o
-```
-
-Useful when isolating a single failing translation unit.
-
-## What the stubs are for
-
-To get past kernel features ncc doesn't support yet, and to drop SoC
-drivers irrelevant to QEMU virt:
-
-- **`neon_stub.c`** — empty-body NEON exports (chacha + aes). Risk: if
-  QEMU is configured with NEON and the kernel selects it, crypto
-  returns garbage. Boot to `root device:` does not depend on crypto.
-- **`cfattach_stubs.c`** — 67 cfattach struct stubs + helper-fn stubs
-  for SoC drivers (Tegra, Rockchip, Apple, Sunxi, …). Lets the kernel
-  link; those drivers obviously don't function on virt.
-- **`empty_stub.c`** — empty translation unit. Substituted for files
-  ncc OOMs on (`syscalls_autoload.c`) or that contain only NEON code
-  we don't want.
+- `build.sh`, `tools/build-tools.sh` — entry points; dispatch on `uname`
+- `tools/native-kernel-build.sh`, `tools/docker-kernel-build.sh` — per-platform internals
+- `tools/ncc-elf-wrapper.sh` — `CC` wrapper: `-target elf`, gcc shunts, stub substitution
+- `tools/boot-test.sh` — QEMU smoke test
+- `MINIMAL_VIRT64` — the diagnostic kernel config that boots
+- `Dockerfile` — Ubuntu 22.04 build image (used on macOS only)
+- `stubs/` — empty `.o`s for SoC drivers and NEON crypto exports
+- `build-rootfs.sh` — provisions the 4 GB FFS root disk (orthogonal to `make netbsd`)
+- `STATUS.md`, `reference-boot.log` — running progress log + reference boot
 
 ## License
 
 Build glue and stubs in this directory are MIT (the ncc license).
-NetBSD kernel sources referenced by the build are NetBSD's
-(BSD 2-clause).
+NetBSD kernel sources referenced by the build are BSD 2-clause.
