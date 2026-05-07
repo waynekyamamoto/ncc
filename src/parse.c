@@ -2666,7 +2666,61 @@ static Node *stmt(Token **rest, Token *tok) {
       }
     }
 
-    // Skip the rest of the parenthesized body brace-balanced.
+    // Parse the output / input / clobber / label sections separated
+    // by `:`.  We don't honor the constraints, but we DO evaluate the
+    // operand expressions for their side effects (per GCC semantics:
+    // operand expressions evaluate exactly once).  Tests like
+    // 990130-1 rely on `asm("" : "+r"(*bar()))` calling bar exactly
+    // once.
+    Node *side_effects = NULL;
+    int section = 0;  // 0=template, 1=outputs, 2=inputs, 3=clobbers, 4=labels
+    while (equal(tok, ":") || equal(tok, "::")) {
+      if (equal(tok, "::")) section += 2;
+      else section += 1;
+      tok = tok->next;
+      if (section >= 4) {
+        // labels: list of identifiers (optional GNU asm-goto).  Just skip.
+        while (!equal(tok, ")") && tok->kind != TK_EOF)
+          tok = tok->next;
+        break;
+      }
+      if (section == 3) {
+        // clobbers: list of strings.  Skip.
+        while (tok->kind == TK_STR ||
+               equal(tok, ",")) {
+          tok = tok->next;
+        }
+        continue;
+      }
+      // outputs (section 1) / inputs (section 2): comma-separated
+      // operands.  Each operand: `[name]? "constraint" ( expr )`.
+      bool first_op = true;
+      while (!equal(tok, ":") && !equal(tok, ")") && tok->kind != TK_EOF) {
+        if (!first_op) tok = skip(tok, ",");
+        first_op = false;
+        if (equal(tok, ":") || equal(tok, ")")) break;
+        // Optional [name].
+        if (equal(tok, "[")) {
+          while (!equal(tok, "]") && tok->kind != TK_EOF) tok = tok->next;
+          tok = skip(tok, "]");
+        }
+        // Constraint string.
+        if (tok->kind == TK_STR) tok = tok->next;
+        else break;
+        // (expr).
+        tok = skip(tok, "(");
+        Node *e = expr(&tok, tok);
+        add_type(e);
+        tok = skip(tok, ")");
+        if (side_effects)
+          side_effects = new_binary(ND_COMMA, side_effects, e, asm_tok);
+        else
+          side_effects = e;
+      }
+    }
+
+    // Drain any remaining content brace-balanced (paranoia for
+    // unrecognized syntax).
     int depth = 1;
     while (depth > 0 && tok->kind != TK_EOF) {
       if (equal(tok, "(")) depth++;
@@ -2676,10 +2730,16 @@ static Node *stmt(Token **rest, Token *tok) {
     tok = skip(tok, ")");
     tok = skip(tok, ";");
 
-    Node *node = new_node(ND_ASM, asm_tok);
-    node->asm_str = tmpl;
+    Node *asm_node = new_node(ND_ASM, asm_tok);
+    asm_node->asm_str = tmpl;
     *rest = tok;
-    return node;
+    if (!side_effects) return asm_node;
+    // Build a block: { eval side effects; asm; }
+    Node *block = new_node(ND_BLOCK, asm_tok);
+    Node *expr_stmt = new_unary(ND_EXPR_STMT, side_effects, asm_tok);
+    expr_stmt->next = asm_node;
+    block->body = expr_stmt;
+    return block;
   }
 
   // switch (cond) stmt (04c §C.2).
