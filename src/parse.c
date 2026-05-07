@@ -3793,11 +3793,33 @@ static Node *init_compound_literal(Token **rest, Token *tok, Obj *var) {
       if (!first) tok = skip(tok, ",");
       first = false;
       if (equal(tok, "}")) break;
-      // Designator: `.name = expr` or pre-C99 `name: expr`.
+      // Designator: `.name [.name ...] = expr` or pre-C99 `name: expr`.
       if (equal(tok, ".")) {
+        Token *probe = tok;
+        long chain_off = 0;
+        Type *chain_ty = ty;
+        Member *chain_target = NULL;
+        bool chained = false;
+        for (;;) {
+          probe = probe->next;
+          if (probe->kind != TK_IDENT)
+            error_tok(probe, "expected member name after `.`");
+          chain_target = find_member(chain_ty, probe);
+          if (!chain_target) error_tok(probe, "no such member");
+          chain_off += chain_target->offset;
+          chain_ty = chain_target->ty;
+          probe = probe->next;
+          if (!equal(probe, ".")) break;
+          chained = true;
+        }
+        if (chained) {
+          tok = skip(probe, "=");
+          chain = lvar_init_at_offset(&tok, tok, chain_ty, var,
+                                       chain_off, chain, open);
+          m = NULL;
+          continue;
+        }
         tok = tok->next;
-        if (tok->kind != TK_IDENT)
-          error_tok(tok, "expected member name after `.`");
         Member *target = find_member(ty, tok);
         if (!target) error_tok(tok, "no such member");
         tok = skip(tok->next, "=");
@@ -3830,23 +3852,46 @@ static Node *init_compound_literal(Token **rest, Token *tok, Obj *var) {
     }
     tok = skip(tok, "}");
   } else if (ty->kind == TY_UNION) {
-    // Compound literal of union type — designator or first member.
+    // Compound literal of union type — designator (single or chained)
+    // or first member.
     Member *m = ty->members;
+    long extra_off = 0;
+    Type *leaf_ty = NULL;
     if (equal(tok, ".")) {
-      tok = tok->next;
-      if (tok->kind != TK_IDENT)
-        error_tok(tok, "expected member name");
-      Member *target = find_member(ty, tok);
-      if (!target) error_tok(tok, "no such member");
-      tok = skip(tok->next, "=");
-      m = target;
+      Token *probe = tok;
+      long chain_off = 0;
+      Type *chain_ty = ty;
+      Member *chain_target = NULL;
+      bool chained = false;
+      for (;;) {
+        probe = probe->next;
+        if (probe->kind != TK_IDENT)
+          error_tok(probe, "expected member name");
+        chain_target = find_member(chain_ty, probe);
+        if (!chain_target) error_tok(probe, "no such member");
+        chain_off += chain_target->offset;
+        chain_ty = chain_target->ty;
+        probe = probe->next;
+        if (!equal(probe, ".")) break;
+        chained = true;
+      }
+      tok = skip(probe, "=");
+      if (chained) {
+        leaf_ty = chain_ty;
+        extra_off = chain_off;
+        m = NULL;  // signal: use leaf_ty / extra_off below
+      } else {
+        m = chain_target;
+      }
     } else if (tok->kind == TK_IDENT && equal(tok->next, ":")) {
       Member *target = find_member(ty, tok);
       if (!target) error_tok(tok, "no such member");
       tok = skip(tok->next, ":");
       m = target;
     }
-    if (m && !equal(tok, "}")) {
+    if (leaf_ty && !equal(tok, "}")) {
+      chain = lvar_init_at_offset(&tok, tok, leaf_ty, var, extra_off, chain, open);
+    } else if (m && !equal(tok, "}")) {
       chain = lvar_init_at_offset(&tok, tok, m->ty, var, m->offset, chain, open);
     }
     if (equal(tok, ",")) tok = tok->next;
