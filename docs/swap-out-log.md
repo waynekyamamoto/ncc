@@ -604,3 +604,98 @@ Provenance: chibicc/parse.c → ncc/src/parse.c → docs/specs/04*.md →
 new src/parse.c.  Same pattern as Phases 1/2/3.  Bytes from
 chibicc/parse.c no longer remain in `src/`.
 
+---
+
+## Autonomous session — 2026-05-06 (`auto-session-2026-05-06-1552`)
+
+4-hour autonomous run starting from `dae1251` (post-swap-in).
+Target: drive down the 115-test torture gap documented in
+`docs/parse_v2_torture_gap.md`.  All work landed on
+`auto-session-2026-05-06-1552` (not pushed).
+
+**Result**: 849/995 → 888/995 (+39 PASS, zero regressions).
+13 commits, all bootstrap-fixed-point-preserving.  Validation
+pyramid still clean: bootstrap stage1==stage2 (md5
+`bc5bfef8149e9054f358d81b1abce1f0`), SQLite 20/20, doom 83/83.
+
+**Bug-class fixes** (in commit order):
+
+1. `c02f7df` — Five new builtins: `__builtin_prefetch` (lower to
+   side-effect-evaluation comma chain), `__builtin_setjmp` /
+   `__builtin_longjmp` (synthesize calls to libc), `__builtin_mul_overflow_p`
+   (compile-time fold via __int128), `__builtin_classify_type`
+   (return GCC type-class enum). +5 PASS.
+2. `5127647` — `__builtin_return_address(0)` and
+   `__builtin_frame_address(0)` codegen used `gen_expr(node->lhs)`
+   but parse stored the depth in `node->val` → SIGSEGV in the
+   compiler.  Replace with compile-time-unrolled walk keyed on
+   node->val.  +4 PASS.
+3. `73af2b7` — Pre-C99 `name: value` designator form (instead of
+   `.name = value`) accepted at every initializer site (gvar /
+   lvar / compound literal / recursive helpers), plus a missing
+   TY_UNION arm in lvar brace-init dispatch.  +3 PASS.
+4. `1bdb0c1` — `__builtin_constant_p` now folds to 1 for string
+   literals (was 0).  `__builtin_bswap32` / `bswap64` returned
+   `ty_int` from the unary-builtin table → bswap64 result got
+   truncated through `sxtw`; set proper `ty_uint` / `ty_ulong`.
+   +2 PASS.
+5. `ed615fe` — `__attribute__((alias("name")))` wired through.
+   Codegen already supported it; parse-side just dropped the
+   target name.  +3 PASS.
+6. `91f44d1` — K&R-style function definitions fixed.  The
+   identifier-list `(value)` produces `value: int` in
+   fn->ty->params; the K&R fix-up loop only patched fn->params
+   (Obj list).  Now mirror into fn->ty->params so call sites
+   cast args to the K&R-declared type instead of truncating long
+   long via `sxtw`.  +9 PASS.
+7. `1a3c136` — `try_eval_addr_v2` walks ND_MEMBER chains for
+   `&gvar.field.field` patterns and folds through ND_DEREF for
+   `&((gvar+k))->field`.  +1 PASS.
+8. `e5d7b4b` — Function `__attribute__((aligned(N)))` → fn->align,
+   propagated from forward declarations into definitions.  +1 PASS.
+9. `22956d8` — `init_compound_literal` routes nested-aggregate
+   slots through `lvar_init_at_offset` (was rejecting nested
+   braces with "not yet implemented").  +2 PASS.
+10. `6b6c015` — `asm()` operand expressions now actually evaluate.
+    Previous parser skipped the body brace-balanced.  Now: parse
+    sections (outputs/inputs/clobbers/labels), extract operand
+    exprs into a comma chain, lower as `{ side effects; ND_ASM; }`.
+    +1 PASS.
+11. `ed75b6e` + `eb4850b` — Chained designators `.a.b.c = value`
+    in gvar struct, lvar struct, and compound literal struct/union
+    handlers.  Walk the chain accumulating offsets, dispatch
+    through the recursive helpers at the cumulative offset/leaf
+    type.  +2 PASS.
+12. `e2ddcc8` — Doc refresh.
+
+**Validation post-session**:
+
+| Check | Result |
+|---|---|
+| `scripts/bootstrap_validate.sh` | FIXED POINT (md5 `bc5bfef8149e9054f358d81b1abce1f0`) |
+| `tests/torture/run.sh` | 888/995 PASS (CF=43, RT=33, SKIP=31) |
+| `tests/sqlite/build.sh` | 20/20 SQL tests PASS |
+| `build_doom_ncc2.sh` | 83/83 C files compile + link |
+
+**Remaining 76-test gap** — dominated by feature debt:
+- nested function (10)
+- &&label / computed goto (12)
+- _Complex / __complex__ (8)
+- bitfield runtime (12)
+- vector type (7+4)
+- VLA runtime (6+1)
+- inline asm template constraints (1: 20030222-1)
+- brace elision (2: 20021118-1, 991201-1)
+- flexible-array string init (1: 20010924-1)
+- _Complex compound-literal address (1: 20050929-1)
+- llabs builtin (1)
+- chained-const-pointer runtime (1: pr103209)
+- types_compatible_p (1: needs deep type-equiv)
+
+Not pushed.  Branch `auto-session-2026-05-06-1552` ahead of
+`swap-out` by 13 commits.  Recommended next start point: merge
+the session branch into swap-out (or cherry-pick), update
+phase-4-closed bookkeeping, then either tackle the deep
+features (nested fn, _Complex, bitfields) or move on to Phase 5
+(codegen).
+
