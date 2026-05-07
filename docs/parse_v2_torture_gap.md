@@ -1,18 +1,33 @@
 # parse_v2 torture gap
 
-ncc-v2 currently passes 849/995 GCC torture tests; canonical ncc passes 964/995.
-This doc enumerates the 115-test gap as known feature debt, grouped by the
-underlying C/GCC feature that would unblock the bucket.  Each entry is tagged
-(C) compile-fail or (R) runtime-fail.
+ncc currently passes 888/995 GCC torture tests; canonical (pre-swap)
+chibicc-lineage ncc passed 964/995.  This doc enumerates the 76-test
+gap as known feature debt, grouped by the underlying C/GCC feature
+that would unblock the bucket.  Each entry is tagged (C) compile-fail
+or (R) runtime-fail.
 
 When a fix lands, tick off the entries it covers.  When the doc reaches zero
-entries, ncc-v2 == canonical at the torture level (modulo skipped tests).
+entries, ncc == prior chibicc-lineage canonical at the torture level
+(modulo skipped tests).
 
-Last refreshed 2026-05-06 against `f7d0e6e` (offsetof const-fold;
-SQLite 20/20).  14 tests closed since first generation at `42fd9a7`:
-20010325-1, 20071120-1, 20090113-2, 20090113-3, 921019-1, 921113-1,
-980223, alias-1, alias-access-path-1, align-2, lto-tbaa-1, memchr-1,
-packed-aligned, pr10352-1.
+Last refreshed in autonomous session `auto-session-2026-05-06-1552`
+against branch HEAD.  53 tests closed in total (14 in earlier
+sessions + 39 in this autonomous session) since first generation at
+`42fd9a7`.  This session's closes (39 tests):
+
+  20000808-1, 20010122-1, 20030323-1, 20030408-1, 20030811-1,
+  20050613-1, 20071029-1, 20071202-1, 20180131-1, 20181120-1,
+  920501-9, 921112-1, 921124-1, 931005-1, 941015-1, 950221-1,
+  990130-1, 991228-1, alias-2, alias-3, alias-4, align-3, bcp-1,
+  bswap-1, built-in-setjmp, builtin-prefetch-{1..6}, cmpdi-1,
+  compndlit-1, const-addr-expr-1, conversion, frame-address,
+  pr105984, pr108498-2, pr114207.
+
+Earlier closes (14 tests):
+
+  20010325-1, 20071120-1, 20090113-2, 20090113-3, 921019-1, 921113-1,
+  980223, alias-1, alias-access-path-1, align-2, lto-tbaa-1, memchr-1,
+  packed-aligned, pr10352-1.
 
 ## nested function (10)
 
