@@ -42,6 +42,7 @@ fi
 # quoting nightmares.
 docker run --rm -i \
   -e "KERNEL=$KERNEL" \
+  -e "NETBSD_DIR=/netbsd" \
   -v "$XV6_DIR":/xv6 \
   -v "$NETBSD_DIR":/netbsd \
   "$DOCKER_IMAGE" bash -s <<'PAYLOAD'
@@ -51,15 +52,18 @@ cd /xv6
 make clean >/dev/null
 make CC=gcc CFLAGS="-Wall -std=c11 -g -O2 -Wno-unused-parameter -Wno-switch -D_GNU_SOURCE" >/dev/null 2>&1
 ls -l /xv6/ncc
-# NOTE: ncc cannot yet self-bootstrap on Linux. /usr/include/limits.h uses
-# #include_next (an ncc-unsupported GCC extension) and /usr/include/stdio.h
-# uses __gnuc_va_list (also unrecognized). The kernel build itself is
-# unaffected because nbmake invokes ncc with -nostdinc + --sysroot=, so
-# system headers aren't read. Re-enable the bootstrap step here once ncc
-# grows #include_next and the gcc-extension typedefs.
 
 echo "=== Cross-as symlink ==="
 ln -sf /netbsd/tooldir/bin/aarch64--netbsd-as /usr/local/bin/aarch64-elf-as
+
+echo "=== Bootstrapping ncc2 (Linux self-host) ==="
+# The kernel-build wrapper (tests/netbsd/tools/ncc-elf-wrapper.sh) invokes
+# $NCC_REPO/ncc2, the self-hosted stage. Linux self-bootstrap was solved
+# 2026-05-04 (db875b3 + dbd9ab4 + 09bc101); run it so ncc2 is a Linux ELF.
+# Must come AFTER the cross-as symlink — bootstrap_validate.sh runs ncc
+# which assembles via aarch64-elf-as.
+bash scripts/bootstrap_validate.sh
+ls -l /xv6/ncc2
 
 echo "=== Regenerating build dir from current $KERNEL config ==="
 # Without this, nbmake just rebuilds .o's against the build dir's
